@@ -1,0 +1,9 @@
+<library path="waveshare_servos">
+  <class name="waveshare_servos/WaveshareServos"
+         type="waveshare_servos::WaveshareServos"
+         base_class_type="hardware_interface::SystemInterface">
+    <description>
+      a ros2_control package for Waveshare ST bus servo motors
+    </description>
+  </class>
+</library>
