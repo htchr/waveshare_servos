@@ -19,6 +19,7 @@ joint_trajectory_position_controller:
 
     command_interfaces:
       - position
+      - velocity
     
     state_interfaces:
       - position

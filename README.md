@@ -6,14 +6,10 @@ Specifically designed for [Waveshare ST3025 servo motors](https://www.waveshare.
 
 ## TODO
 
-- velocity command interface 
-- currently the position interface cannot move counter-clockwise past 0
-- position motors should expose position, velocity, and acceleration command interfaces for smoother motion using the joint_trajectory_controller
-    - these controls are available in the sync write position function but requires some restructuring 
+- set id node
+- set 0-point node
 - software tests
 - hardware tests with multiple motors
-- ping all motors IDs in the on_init function
-- add simulation capabilities
 
 # License
 

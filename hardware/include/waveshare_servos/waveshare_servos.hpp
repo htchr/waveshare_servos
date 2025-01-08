@@ -70,12 +70,14 @@ private:
     SMS_STS sm_st;
     double KT_ = 9.0; // torque constant (kg*cm / A)
     int steps_ = 4096;
-    u16 max_speed_ = 3400;
-    u8 max_acc_ = 150;
+    u16 max_speed_ = 6000; // 6000;
+    u8 max_acc_ = 150; // 150;
     // id group variables
     std::vector<u8> all_ids_;
 	std::vector<u8> pos_ids_;
 	std::vector<u8> vel_ids_;
+    std::vector<int> pos_is_;
+    std::vector<int> vel_is_;
     // command interface variables
     std::vector<double> pos_cmds_;
     std::vector<double> vel_cmds_;
@@ -84,14 +86,16 @@ private:
     std::vector<double> vel_states_;
     std::vector<double> torq_states_;
     std::vector<double> temp_states_;
+    // vector for position offsets
+    std::vector<double> pos_offsets_;
     // array variables for motors
-    u8* pos_ids_pnt_;
-    u8* vel_ids_pnt_;
-    s16* pos_ar_;
-    u16* pos_speed_ar_;
-    u8* pos_acc_ar_;
-    s16* vel_speed_ar_;
-    u8* vel_acc_ar_;
+    u8*  p_ids_pnt_;
+    u8*  v_ids_pnt_;
+    s16* p_pos_ar_;
+    u16* p_vel_ar_;
+    u8*  p_acc_ar_;
+    s16* v_vel_ar_;
+    u8*  v_acc_ar_;
 };
 
 } // namespace waveshare_servos
