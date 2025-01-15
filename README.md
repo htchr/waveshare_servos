@@ -84,7 +84,6 @@ ros2 run waveshare_servos calibrate_midpoint --ros-args -p id:=<id>
 
 ## TODO
 
-- set 0-point node
 - software tests
 - hardware tests with multiple motors
 
