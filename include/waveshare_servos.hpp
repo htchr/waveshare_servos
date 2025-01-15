@@ -11,7 +11,7 @@
 #include "rclcpp/macros.hpp"
 #include "rclcpp_lifecycle/node_interfaces/lifecycle_node_interface.hpp"
 #include "rclcpp_lifecycle/state.hpp"
-#include "waveshare_servos/visibility_controls.h"
+#include "visibility_controls.h"
 #include "SCServo.h"
 
 namespace waveshare_servos

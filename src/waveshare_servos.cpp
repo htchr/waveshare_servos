@@ -1,4 +1,4 @@
-#include "waveshare_servos/waveshare_servos.hpp"
+#include "waveshare_servos.hpp"
 
 #include <vector>
 #include <algorithm>
@@ -90,6 +90,7 @@ hardware_interface::CallbackReturn WaveshareServos::on_init(
 				"a joint has the wrong type, it should be vel or pos");
 			return hardware_interface::CallbackReturn::ERROR;
 		}
+		// save pose offsets to work around motor movement limitations
 		auto offset = joint.parameters.find("offset");
     	if (offset != joint.parameters.end())
     	{
@@ -190,7 +191,7 @@ std::vector<hardware_interface::CommandInterface> WaveshareServos::export_comman
 hardware_interface::CallbackReturn WaveshareServos::on_activate(
 	const rclcpp_lifecycle::State & /*previous_state*/)
 {
-	// set position commands to current positions
+	// set position commands to current positions before any movement to not move on start
 	for (size_t i = 0; i < all_ids_.size(); i++)
   	{
     	double init_raw_pos = get_position(all_ids_[i]);
@@ -202,7 +203,7 @@ hardware_interface::CallbackReturn WaveshareServos::on_activate(
 hardware_interface::CallbackReturn WaveshareServos::on_deactivate(
 	const rclcpp_lifecycle::State & /*previous_state*/)
 {
-	// set velocities to 0
+	// set velocities to 0 on close, doesn't work on ctrl-C
 	for (size_t i = 0; i < vel_cmds_.size(); i++)
 	{
     	vel_cmds_[i] = 0.0;
