@@ -64,7 +64,7 @@ ros2 topic pub --once /joint_trajectory_velocity_controller/joint_trajectory \
 
 Also included are some helper functions wrapped in ros2 nodes for ease-of-use.
 
-### Change motor ID
+### Change Motor ID
 
 To control multiple motors, they will need different IDs.
 
@@ -72,6 +72,14 @@ To set a new ID, plug in 1 motor at a time (make sure to turn off power in betwe
 
 ```bash
 ros2 run waveshare_servos set_id --ros-args -p start_id:=<old> -p new_id:=<new>
+```
+
+### Set Midpoint
+
+The following command will set the middle position (tick 2048, pi radians, 180 degrees) of a given motor:
+
+```bash
+ros2 run waveshare_servos calibrate_midpoint --ros-args -p id:=<id>
 ```
 
 ## TODO
