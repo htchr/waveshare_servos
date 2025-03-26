@@ -70,7 +70,7 @@
         </visual>
     </link>
 
-    <xacro:include filename="$(find waveshare_servos)/ros2_control/example.ros2_control.xacro"/>
+    <xacro:include filename="$(find waveshare_servos)/description/ros2_control/example.ros2_control.xacro"/>
 
     <xacro:example_ws_ros2_control name="example_ws_ros2_control" prefix="$(arg prefix)"/>
 
