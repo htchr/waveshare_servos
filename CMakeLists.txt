@@ -71,7 +71,7 @@ install(
   DESTINATION include/waveshare_servos
 )
 install(
-  DIRECTORY description/launch description/ros2_control description/urdf
+  DIRECTORY description/ros2_control description/urdf
   DESTINATION share/waveshare_servos
 )
 install(
