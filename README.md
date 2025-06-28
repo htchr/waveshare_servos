@@ -10,7 +10,7 @@ This hardware interface is developed for ros2 Humble.
 
 Testing was done with the bus servo adapter plugged into a Jetson Orin Nano via USB.
 
-The Jetson runs ros2 Humble and Isaac ros insidie a Docker container.
+The Jetson runs ros2 Humble and Isaac ros inside a Docker container.
 
 It should work with any system using [ros2_control](https://github.com/ros-controls/ros2_control).
 
