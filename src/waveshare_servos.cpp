@@ -139,7 +139,7 @@ hardware_interface::CallbackReturn WaveshareServos::on_configure(
 	for (u8 i = 0; i < pos_ids_.size(); i++)
 	{
 		sm_st.Mode(pos_ids_[i], 0); 
-		p_acc_ar_[i] = 1; // smoother motion with no acceleration
+		p_acc_ar_[i] = max_acc_;
 	}
 	for (u8 i = 0; i < vel_ids_.size(); i++)
 	{
