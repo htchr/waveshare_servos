@@ -71,8 +71,11 @@ install(
   DESTINATION include/waveshare_servos
 )
 install(
-  DIRECTORY description/ros2_control description/urdf
-  DESTINATION share/waveshare_servos
+  DIRECTORY 
+    description/ros2_control 
+    description/urdf
+  DESTINATION share/${PROJECT_NAME}/description
+  FILES_MATCHING PATTERN "*.xacro"
 )
 install(
   DIRECTORY bringup/launch bringup/config
