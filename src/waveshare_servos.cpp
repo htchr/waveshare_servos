@@ -146,6 +146,14 @@ hardware_interface::CallbackReturn WaveshareServos::on_configure(
 		sm_st.Mode(vel_ids_[i], 1);
 		v_acc_ar_[i] = max_acc_;
 	}
+
+        // Create ROS node for current publishing
+        current_node_ = rclcpp::Node::make_shared("waveshare_current_node");
+
+        current_pub_ =
+            current_node_->create_publisher<std_msgs::msg::Float64MultiArray>(
+                "/motor_currents", 10);
+
 	return hardware_interface::CallbackReturn::SUCCESS;
 }
 
@@ -225,6 +233,13 @@ hardware_interface::return_type WaveshareServos::read(
 		torq_states_[i] = get_torque(all_ids_[i]);
 		temp_states_[i] = get_temperature(all_ids_[i]);
 	}
+
+        // Publish motor currents
+        std_msgs::msg::Float64MultiArray msg;
+        msg.data = torq_states_;
+        current_pub_->publish(msg);
+        rclcpp::spin_some(current_node_);
+
 	return hardware_interface::return_type::OK;
 }
 

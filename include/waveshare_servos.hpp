@@ -4,6 +4,7 @@
 #include <vector>
 #include <string>
 
+#include "std_msgs/msg/float64_multi_array.hpp"
 #include "hardware_interface/handle.hpp"
 #include "hardware_interface/hardware_info.hpp"
 #include "hardware_interface/system_interface.hpp"
@@ -13,6 +14,7 @@
 #include "rclcpp_lifecycle/state.hpp"
 #include "visibility_controls.h"
 #include "SCServo.h"
+#include "rclcpp/rclcpp.hpp"
 
 namespace waveshare_servos
 {
@@ -86,6 +88,8 @@ private:
     std::vector<double> vel_states_;
     std::vector<double> torq_states_;
     std::vector<double> temp_states_;
+    rclcpp::Node::SharedPtr current_node_;
+    rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr current_pub_;
     // vector for position offsets
     std::vector<double> pos_offsets_;
     // array variables for motors
