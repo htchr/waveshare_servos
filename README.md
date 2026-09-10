@@ -4,27 +4,27 @@ The `ros2_control` implementation for Waveshare ST series servo motors.
 
 Specifically designed for [Waveshare ST3025 servo motors](https://www.waveshare.com/product/st3025-servo.htm) and their [Bus Servo Adapter](https://www.waveshare.com/product/bus-servo-adapter-a.htm), but should work with all of their ST series motors and controllers.
 
+
 ## Set Up
 
-This hardware interface is developed for ros2 Humble.
+This hardware interface is developed for ros2 Jazzy.  
+Previous work for ros2 Humble is saved as a checkpoint on the ["humble" branch](https://github.com/htchr/waveshare_servos/tree/humble).
 
-Testing was done with the bus servo adapter plugged into a Jetson Orin Nano via USB.
-
-The Jetson runs ros2 Humble and Isaac ros inside a Docker container.
+Testing has been done with the bus servo adapter connected via USB to a Jetson Orin Nano or x86 Ubuntu desktop.  
+The Jetson ran ros2 Jazzy and Isaac ros inside a Docker container.  
+The desktop ran ros2 Jazzy using the devcontainer in this repo.  
 
 It should work with any system using [ros2_control](https://github.com/ros-controls/ros2_control).
 
-1. Ensure the container can control the USB port
+### Included Devcontainer
 
-    ```bash
-    sudo chmod 666 /dev/ttyACM0
-    ```
+1. Install the "Remote Development" extension pack for VS Code
+2. Open the directory in VS Code
+3. Select "Reopen in container"
 
-    ```bash
-    sudo usermod -a -G dialout admin
-    ```
+### Direct Install
 
-2. Clone the package into your `src` directory:
+1. Clone the package into your `src` directory:
 
     ```bash
     git clone https://github.com/htchr/waveshare_servos.git
@@ -34,7 +34,15 @@ It should work with any system using [ros2_control](https://github.com/ros-contr
 
 4. Source your workspace.
 
+
 ## Usage
+
+If you use USB, make sure your user is in the `dialout` group and the port has the correct permissions
+
+```bash
+sudo chmod 666 /dev/ttyACM0
+sudo usermod -a -G dialout $USER
+```
 
 Reference the `example.launch.py`, `example_controllers.yaml`, and `example.ros2_control.xacro` files to reference how to use this hardware interface in another robot system.
 

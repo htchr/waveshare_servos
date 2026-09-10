@@ -1,0 +1,20 @@
+{
+  "name": "waveshare_dev",
+  "dockerFile": "../docker/Dockerfile",
+  "context": "..",
+  "runArgs": [
+    "--privileged",
+    "--network=host",
+    "-e", "DISPLAY=${localEnv:DISPLAY}"
+  ],
+  "workspaceMount": "source=${localWorkspaceFolder},target=/home/ubuntu/waveshare_ws/src/waveshare_servos,type=bind",
+  "workspaceFolder": "/home/ubuntu/waveshare_ws/src/waveshare_servos",
+  "mounts": [
+    "source=/etc/timezone,target=/etc/timezone,type=bind",
+    "source=/etc/localtime,target=/etc/localtime,type=bind",
+    "source=/tmp/.X11-unix,target=/tmp/.X11-unix,type=bind",
+    "source=/dev,target=/dev,type=bind",
+    "source=/etc/udev,target=/etc/udev,type=bind"
+  ],
+  "postStartCommand": "bash -lc '/home/ubuntu/waveshare_ws/src/waveshare_servos/docker/setup.sh'"
+}
