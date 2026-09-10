@@ -6,6 +6,7 @@
  */
 
 #include "SCSerial.h"
+#include <errno.h>
 
 SCSerial::SCSerial()
 {
@@ -147,15 +148,27 @@ int SCSerial::readSCS(unsigned char *nDat, int nLen)
 
     //使用select实现串口的多路通信
 	while(1){
+		FD_ZERO(&fs_read);
+		FD_SET(fd,&fs_read);
 		fs_sel = select(fd+1, &fs_read, NULL, NULL, &time);
-		if(fs_sel){
-			rvLen += read(fd, nDat+rvLen, nLen-rvLen);
-			//printf("nLen = %d rvLen = %d\n", nLen, rvLen);
+		if(fs_sel>0){
+			// select() reporting an error used to fall in here too, and read()'s -1 was added
+			// straight to the index -- which walks the write below the caller's buffer
+			int n = read(fd, nDat+rvLen, nLen-rvLen);
+			if(n>0){
+				rvLen += n;
+			}else if(n<0 && (errno==EAGAIN || errno==EWOULDBLOCK || errno==EINTR)){
+				continue;
+			}else{
+				return rvLen;
+			}
 			if(rvLen<nLen){
 				continue;
 			}else{
 				return rvLen;
 			}
+		}else if(fs_sel<0 && errno==EINTR){
+			continue;
 		}else{
 			//printf("serial read fd read return 0\n");
 			return rvLen;
@@ -184,14 +197,32 @@ void SCSerial::rFlushSCS()
 
 void SCSerial::wFlushSCS()
 {
-	if(txBufLen){
-		txBufLen = write(fd, txBuf, txBufLen);
-		txBufLen = 0;
+	// The port is opened non-blocking, so write() may accept only part of the packet. The
+	// original code assigned that partial count to txBufLen and then threw it away, silently
+	// truncating the frame -- the servo drops it on the checksum and the command never arrives.
+	int sent = 0;
+	int retries = 0;
+	while(sent < txBufLen){
+		int n = write(fd, txBuf+sent, txBufLen-sent);
+		if(n > 0){
+			sent += n;
+			retries = 0;
+		}else if(n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)){
+			if(++retries > 1000){
+				break;
+			}
+		}else{
+			break;
+		}
 	}
+	txBufLen = 0;
 }
 
 void SCSerial::end()
 {
-	fd = -1;
-	close(fd);
+	// close the descriptor, then invalidate it -- the original order closed -1 and leaked the port
+	if(fd != -1){
+		close(fd);
+		fd = -1;
+	}
 }

@@ -56,13 +56,13 @@ public:
         const rclcpp_lifecycle::State & previous_state) override;
 
 private:
-    // helper motor functions
-    double get_position(int ID);
-    double get_velocity(int ID);
-    double get_torque(int ID);
-    double get_temperature(int ID);
-    void write_pos();
-    void write_vel();
+    // one round trip that refreshes every state interface of joint i from the servo's
+    // feedback block; returns false if the servo did not answer
+    bool feedback(int i);
+    // set the servo's operating mode, unlocking the EPROM only if it needs changing
+    bool set_mode(u8 id, u8 mode);
+    // (re)build the present-only command groups and their command arrays
+    void build_groups();
 
     // motor variables
     int baudrate_ = 1000000;
@@ -72,6 +72,12 @@ private:
     int steps_ = 4096;
     u16 max_speed_ = 6000; // 6000;
     u8 max_acc_ = 150; // 150;
+    // A servo answers in well under a millisecond at 1 Mbaud. The library's stock 100 ms
+    // timeout turned every absent servo into a tenth of a second of dead time in every
+    // control cycle, which is what held the loop down to ~1.1 Hz.
+    unsigned long io_timeout_ms_ = 20;
+    int ping_attempts_ = 3;
+    int max_read_fails_ = 50;
     // id group variables
     std::vector<u8> all_ids_;
 	std::vector<u8> pos_ids_;
@@ -88,14 +94,23 @@ private:
     std::vector<double> temp_states_;
     // vector for position offsets
     std::vector<double> pos_offsets_;
+    // which servos answered Ping; absent ones are never put on the bus
+    std::vector<bool> present_;
+    std::vector<int> read_fails_;
+    std::vector<u8> last_error_;
+    // command groups containing only servos that are present, with the joint index each maps to
+    std::vector<u8>  p_ids_;
+    std::vector<int> p_js_;
+    std::vector<u8>  v_ids_;
+    std::vector<int> v_js_;
+    // last non-zero control period, used to pace the goal speed
+    double last_period_ = 0.01;
     // array variables for motors
-    u8*  p_ids_pnt_;
-    u8*  v_ids_pnt_;
-    s16* p_pos_ar_;
-    u16* p_vel_ar_;
-    u8*  p_acc_ar_;
-    s16* v_vel_ar_;
-    u8*  v_acc_ar_;
+    s16* p_pos_ar_ = nullptr;
+    u16* p_vel_ar_ = nullptr;
+    u8*  p_acc_ar_ = nullptr;
+    s16* v_vel_ar_ = nullptr;
+    u8*  v_acc_ar_ = nullptr;
 };
 
 } // namespace waveshare_servos
