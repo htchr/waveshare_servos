@@ -96,6 +96,47 @@ hardware_interface::CallbackReturn WaveshareServos::on_init(
     	{
       		pos_offsets_[i] = std::stod(offset->second);  
     	}
+		// save the position command limits: write() keeps every goal inside them, since nothing
+		// upstream does by default (the controller manager only clamps with enforce_command_limits)
+		double pos_min = -std::numeric_limits<double>::infinity();
+		double pos_max = std::numeric_limits<double>::infinity();
+		for (const hardware_interface::InterfaceInfo & ci : joint.command_interfaces)
+		{
+			if (ci.name != hardware_interface::HW_IF_POSITION)
+			{
+				continue;
+			}
+			try
+			{
+				if (!ci.min.empty())
+				{
+					pos_min = std::stod(ci.min);
+				}
+				if (!ci.max.empty())
+				{
+					pos_max = std::stod(ci.max);
+				}
+			}
+			catch (const std::exception &)
+			{
+				RCLCPP_FATAL(rclcpp::get_logger("waveshare_servos"),
+					"joint '%s' has a position min or max that is not a number", joint.name.c_str());
+				return hardware_interface::CallbackReturn::ERROR;
+			}
+		}
+		if (!(pos_min <= pos_max))
+		{
+			RCLCPP_FATAL(rclcpp::get_logger("waveshare_servos"),
+				"joint '%s' has a position min greater than its max", joint.name.c_str());
+			return hardware_interface::CallbackReturn::ERROR;
+		}
+		if (std::isfinite(pos_min) || std::isfinite(pos_max))
+		{
+			RCLCPP_INFO(rclcpp::get_logger("waveshare_servos"),
+				"joint '%s' position commands clamped to [%g, %g] rad", joint.name.c_str(), pos_min, pos_max);
+		}
+		pos_mins_.emplace_back(pos_min);
+		pos_maxs_.emplace_back(pos_max);
 		i++;
 	}
 	// init vectors for state interfaces
@@ -106,6 +147,8 @@ hardware_interface::CallbackReturn WaveshareServos::on_init(
 	// create vectors for command interfaces
 	pos_cmds_.resize(all_ids_.size(), std::numeric_limits<double>::quiet_NaN());
 	vel_cmds_.resize(all_ids_.size(), std::numeric_limits<double>::quiet_NaN());
+	// no joint is held outside its limits until on_activate finds one there
+	hold_pos_.resize(all_ids_.size(), std::numeric_limits<double>::quiet_NaN());
 	return hardware_interface::CallbackReturn::SUCCESS;
 }
 
@@ -293,6 +336,7 @@ hardware_interface::CallbackReturn WaveshareServos::on_activate(
 	for (size_t i = 0; i < all_ids_.size(); i++)
   	{
 		vel_cmds_[i] = 0.0;
+		hold_pos_[i] = std::numeric_limits<double>::quiet_NaN();
 		if (present_[i])
 		{
 			// A servo whose torque has been latched off -- by a protection trip, or by whatever
@@ -302,6 +346,18 @@ hardware_interface::CallbackReturn WaveshareServos::on_activate(
 		if (present_[i] && feedback(i))
 		{
 			pos_cmds_[i] = pos_states_[i];
+			// A joint that starts outside its limits (moved by hand with the torque off, say) is not
+			// run to the nearest one: write() holds it where it is until it is commanded to a
+			// position inside them. Allow a step of encoder rounding.
+			const double step = 2 * M_PI / steps_;
+			if (pos_states_[i] < pos_mins_[i] - step || pos_states_[i] > pos_maxs_[i] + step)
+			{
+				hold_pos_[i] = pos_states_[i];
+				RCLCPP_WARN(rclcpp::get_logger("waveshare_servos"),
+					"joint '%s' starts at %.3f rad, outside its limits [%.3f, %.3f]; holding it there "
+					"until it is commanded to a position inside them", info_.joints[i].name.c_str(),
+					pos_states_[i], pos_mins_[i], pos_maxs_[i]);
+			}
 		}
 		else
 		{
@@ -426,6 +482,19 @@ hardware_interface::return_type WaveshareServos::write(
 		if (!std::isfinite(cmd))
 		{
 			cmd = std::isfinite(pos_states_[j]) ? pos_states_[j] : 0.0;
+		}
+		// Keep the goal inside the joint's limits. The servo's own angle limits cannot stand in for
+		// them: they are raw encoder steps (0..4095 by default) and know nothing of the offset.
+		// A joint that started outside them is the exception: it stays where it started until it
+		// is commanded to a position inside them, instead of being run to the nearest limit.
+		if (std::isfinite(hold_pos_[j]) && (cmd < pos_mins_[j] || cmd > pos_maxs_[j]))
+		{
+			cmd = hold_pos_[j];
+		}
+		else
+		{
+			hold_pos_[j] = std::numeric_limits<double>::quiet_NaN();
+			cmd = std::clamp(cmd, pos_mins_[j], pos_maxs_[j]);
 		}
 		const double goal_steps = (cmd + pos_offsets_[j]) * steps_ / (2 * M_PI);
 		p_pos_ar_[k] = static_cast<s16>(std::lround(std::clamp(goal_steps, -32767.0, 32767.0)));

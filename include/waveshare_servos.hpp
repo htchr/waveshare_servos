@@ -94,6 +94,12 @@ private:
     std::vector<double> temp_states_;
     // vector for position offsets
     std::vector<double> pos_offsets_;
+    // position command limits from the ros2_control min/max params, +/-inf where none is given
+    std::vector<double> pos_mins_;
+    std::vector<double> pos_maxs_;
+    // where a joint that started outside those limits is held until it is commanded to a
+    // position inside them; NaN for every other joint
+    std::vector<double> hold_pos_;
     // which servos answered Ping; absent ones are never put on the bus
     std::vector<bool> present_;
     std::vector<int> read_fails_;
