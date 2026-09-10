@@ -45,6 +45,7 @@ def generate_launch_description():
             PathJoinSubstitution(
                 [
                     FindPackageShare("waveshare_servos"),
+                    "description",
                     "urdf",
                     "example.urdf.xacro",
                 ]
