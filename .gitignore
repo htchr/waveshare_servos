@@ -1,0 +1,104 @@
+# --- Claude Code / local notes ---
+CLAUDE.md
+context/
+.claude/
+
+# --- colcon / ament build artifacts ---
+# (normally at the workspace root, but ignored here in case of in-package builds)
+build/
+install/
+log/
+devel/
+logs/
+COLCON_IGNORE
+AMENT_IGNORE
+.catkin_tools/
+.colcon_install_layout
+
+# --- CMake ---
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+cmake_install.cmake
+install_manifest.txt
+symlink_install_manifest.txt
+CTestTestfile.cmake
+compile_commands.json
+Makefile
+
+# --- Compiled objects / binaries / libraries ---
+*.o
+*.obj
+*.lo
+*.slo
+*.a
+*.la
+*.lai
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.out
+*.app
+*.gch
+*.pch
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# --- Test / coverage output ---
+Testing/
+test_results/
+*.gcda
+*.gcno
+*.gcov
+coverage.xml
+.coverage
+
+# --- ROS runtime artifacts ---
+*.bag
+rosbag2_*/
+*.db3
+*.mcap
+*.pid
+
+# --- Editors / IDEs ---
+.vscode/
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+*~
+.cache/
+.clangd/
+.ccls-cache/
+*.kdev4
+.qtc_clangd/
+
+# --- OS cruft ---
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+desktop.ini
+
+# --- Misc ---
+*.log
+*.tmp
+*.bak
+*.orig
+*.rej
+core
