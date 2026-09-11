@@ -19,9 +19,11 @@ RUN sudo apt update && sudo apt install -y \
     git \
     python3-pip
 
-RUN pip install --break-system-packages better-actuator-models
-
 RUN rosdep update
+
+WORKDIR /home/ubuntu/
+RUN git clone https://github.com/Rhoban/bam.git
+RUN pip install --break-system-packages ./bam
 
 RUN echo "source /opt/ros/${ROS_DISTRO}/setup.bash" >> ~/.bashrc && \
     echo "[ -f /home/ubuntu/waveshare_ws/install/setup.bash ] && source /home/ubuntu/waveshare_ws/install/setup.bash" >> ~/.bashrc
