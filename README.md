@@ -25,13 +25,14 @@ It should work with any system using [ros2_control](https://github.com/ros-contr
 ### Direct Install
 
 1. Clone the package into your `src` directory:
-
     ```bash
     git clone https://github.com/htchr/waveshare_servos.git
     ```
-
+2. Install the dependencies
+    ```bash
+    rosdep install --from-paths ./src --ignore-src -r -y
+    ```
 3. Build your workspace.
-
 4. Source your workspace.
 
 
@@ -60,13 +61,31 @@ ros2 topic pub --once /joint_trajectory_position_controller/joint_trajectory \
   "{header: {stamp: {sec: 0, nanosec: 0}, frame_id: ''}, joint_names: ['<joint_name>'], points: [{positions: [<position>], time_from_start: {sec: 1, nanosec: 0}}]}"
 ```
 
-Move a velocity-controlled servo with:
+Move the velocity-controlled servos with:
 
 ```bash
-ros2 topic pub --once /joint_trajectory_velocity_controller/joint_trajectory \
-  trajectory_msgs/msg/JointTrajectory \
-  "{header: {stamp: {sec: 0, nanosec: 0}, frame_id: ''}, joint_names: ['<joint_name>'], points: [{velocities: [<velocities>], time_from_start: {sec: 1, nanosec: 0}}]}"
+ros2 topic pub --once /joint_velocity_controller/commands \
+  std_msgs/msg/Float64MultiArray \
+  "{data: [<velocities>]}"
 ```
+
+The message carries no joint names.
+`data` holds one velocity (rad/s) per joint, in the order of the `joints` list of `joint_velocity_controller` in `example_controllers.yaml` -- not servo id order or URDF order.
+For example, with
+
+```yaml
+joint_velocity_controller:
+  ros__parameters:
+    joints:
+      - joint4
+      - joint3
+```
+
+`{data: [1.0, -0.5]}` turns `joint4` at 1.0 rad/s and `joint3` at -0.5 rad/s.
+Check the order on a running system with `ros2 param get /joint_velocity_controller joints`.
+
+Each servo keeps turning at its commanded velocity until a new command arrives; send a zero for every joint (e.g. `{data: [0.0, 0.0]}`) to stop them.
+A command whose length does not match the `joints` list stops all the velocity-controlled servos and deactivates the controller; reactivate it with `ros2 control switch_controllers --activate joint_velocity_controller`.
 
 ## Additional Tools
 
@@ -90,10 +109,11 @@ The following command will set the middle position (tick 2048, pi radians, 180 d
 ros2 run waveshare_servos calibrate_midpoint --ros-args -p id:=<id>
 ```
 
+
 ## TODO
 
 - software tests
-- hardware tests with multiple motors
+
 
 ## License
 
