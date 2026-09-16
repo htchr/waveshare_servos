@@ -19,7 +19,7 @@
  * library cannot have, but the consuming code must have inorder to link.
  */
 
-#ifndef WAVESHARE_SERVOS__VISIBILITY_CONTROL_H_
+#ifndef WAVESHARE_SERVOS__VISIBILITY_CONTROL_H_  // NOLINT(build/header_guard)
 #define WAVESHARE_SERVOS__VISIBILITY_CONTROL_H_
 
 // This logic was borrowed (then namespaced) from the examples on the gcc wiki:
@@ -53,4 +53,4 @@
 #define WAVESHARE_SERVOS_PUBLIC_TYPE
 #endif
 
-#endif  // WAVESHARE_SERVOS__VISIBILITY_CONTROL_H_
+#endif  // WAVESHARE_SERVOS__VISIBILITY_CONTROL_H_  // NOLINT(build/header_guard)

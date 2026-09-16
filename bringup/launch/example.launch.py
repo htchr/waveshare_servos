@@ -28,89 +28,93 @@ def generate_launch_description():
     declared_arguments = []
     declared_arguments.append(
         DeclareLaunchArgument(
-            "gui",
-            default_value="true",
-            description="Start RViz2 automatically with this launch file.",
+            'gui',
+            default_value='true',
+            description='Start RViz2 automatically with this launch file.',
         )
     )
 
     # Initialize Arguments
-    gui = LaunchConfiguration("gui")
+    gui = LaunchConfiguration('gui')
 
     # Get URDF via xacro
     robot_description_content = Command(
         [
-            PathJoinSubstitution([FindExecutable(name="xacro")]),
-            " ",
+            PathJoinSubstitution([FindExecutable(name='xacro')]),
+            ' ',
             PathJoinSubstitution(
                 [
-                    FindPackageShare("waveshare_servos"),
-                    "description",
-                    "urdf",
-                    "example.urdf.xacro",
+                    FindPackageShare('waveshare_servos'),
+                    'description',
+                    'urdf',
+                    'example.urdf.xacro',
                 ]
             ),
         ]
     )
-    robot_description = {"robot_description": robot_description_content}
+    robot_description = {'robot_description': robot_description_content}
 
     robot_controllers = PathJoinSubstitution(
         [
-            FindPackageShare("waveshare_servos"),
-            "config",
-            "example_controllers.yaml",
+            FindPackageShare('waveshare_servos'),
+            'config',
+            'example_controllers.yaml',
         ]
     )
     rviz_config_file = PathJoinSubstitution(
-        [FindPackageShare("waveshare_servos"), "description/rviz", "example_ws.rviz"]
+        [FindPackageShare('waveshare_servos'), 'description/rviz', 'example_ws.rviz']
     )
 
     control_node = Node(
-        package="controller_manager",
-        executable="ros2_control_node",
+        package='controller_manager',
+        executable='ros2_control_node',
         parameters=[robot_controllers],
-        output="log",
+        output='log',
         remappings=[
-            ("~/robot_description", "/robot_description"),
+            ('~/robot_description', '/robot_description'),
         ],
     )
     robot_state_pub_node = Node(
-        package="robot_state_publisher",
-        executable="robot_state_publisher",
-        output="both",
+        package='robot_state_publisher',
+        executable='robot_state_publisher',
+        output='both',
         parameters=[robot_description],
     )
     rviz_node = Node(
-        package="rviz2",
-        executable="rviz2",
-        name="rviz2",
-        output="log",
-        arguments=["-d", rviz_config_file],
+        package='rviz2',
+        executable='rviz2',
+        name='rviz2',
+        output='log',
+        arguments=['-d', rviz_config_file],
         condition=IfCondition(gui),
     )
-    
-    joint_state_publisher_node = Node(
-        package="joint_state_publisher_gui",
-        executable="joint_state_publisher_gui",
+
+    joint_state_publisher_node = Node(  # noqa: F841
+        package='joint_state_publisher_gui',
+        executable='joint_state_publisher_gui',
         condition=IfCondition(gui),
     )
 
     joint_state_broadcaster_spawner = Node(
-        package="controller_manager",
-        executable="spawner",
-        arguments=["joint_state_broadcaster", "--controller-manager", "/controller_manager"],
+        package='controller_manager',
+        executable='spawner',
+        arguments=['joint_state_broadcaster', '--controller-manager', '/controller_manager'],
     )
 
     pos_controller_spawner = Node(
-        package="controller_manager",
-        executable="spawner",
-        arguments=["joint_trajectory_position_controller", "--controller-manager", "/controller_manager"],
+        package='controller_manager',
+        executable='spawner',
+        arguments=[
+            'joint_trajectory_position_controller',
+            '--controller-manager',
+            '/controller_manager',
+        ],
     )
-    
+
     vel_controller_spawner = Node(
-        package="controller_manager",
-        executable="spawner",
-        arguments=["joint_velocity_controller", "--controller-manager", "/controller_manager"],
+        package='controller_manager',
+        executable='spawner',
+        arguments=['joint_velocity_controller', '--controller-manager', '/controller_manager'],
     )
 
     # Delay rviz start after `joint_state_broadcaster`
@@ -147,8 +151,8 @@ def generate_launch_description():
         delay_joint_state_broadcaster_after_robot_controller_spawner,
     ]
 
-    print(f"Nodes: {nodes}")
-    print(f"robot_description: {robot_description}")
-    print(f"robot_controllers: {robot_controllers}")
+    print(f'Nodes: {nodes}')
+    print(f'robot_description: {robot_description}')
+    print(f'robot_controllers: {robot_controllers}')
 
     return LaunchDescription(declared_arguments + nodes)
