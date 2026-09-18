@@ -1,16 +1,24 @@
 <?xml version="1.0"?>
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro">
 
-    <xacro:macro name="example_ws_ros2_control" params="name prefix">
+    <xacro:macro name="example_ws_ros2_control"
+                 params="name prefix port:=/dev/ttyACM0 baudrate:=1000000">
 
         <ros2_control name="${name}" type="system">
             <hardware>
                 <plugin>waveshare_servos/WaveshareServos</plugin>
-                <param name="example_param_hw_start_duration_sec">0</param>
-                <param name="example_param_hw_stop_duration_sec">3.0</param>
-                <param name="example_param_hw_slowdown">100</param>
+                <param name="port">${port}</param>
+                <param name="baudrate">${baudrate}</param>
+                <!-- Optional, shown with their defaults and deliberately left out so this example
+                     exercises them -
+                     io_timeout_ms 20, ping_attempts 3, max_read_fails 50,
+                     allow_missing_servos false, protocol sms_sts, encoder_steps 4096,
+                     current_per_count_a 0.006, torque_constant_nm_per_a 0.8825985 -->
             </hardware>
         
+            <!-- State interfaces are free-form - declare any subset of position, velocity,
+                 effort, current, voltage, temperature, load and status, in any order. `torque` is
+                 a deprecated alias of `effort` that keeps reporting kg cm instead of N m. -->
             <joint name="${prefix}joint1">
                 <param name="id">1</param>
                 <param name="type">pos</param>
@@ -25,7 +33,7 @@
                 </command_interface>
                 <state_interface name="position"/>
                 <state_interface name="velocity"/>
-                <state_interface name="torque"/>
+                <state_interface name="effort"/>
                 <state_interface name="temperature"/>
             </joint>
 
@@ -43,7 +51,7 @@
                 </command_interface>
                 <state_interface name="position"/>
                 <state_interface name="velocity"/>
-                <state_interface name="torque"/>
+                <state_interface name="effort"/>
                 <state_interface name="temperature"/>
             </joint>
 
@@ -56,11 +64,35 @@
                 </command_interface>
                 <state_interface name="position"/>
                 <state_interface name="velocity"/>
-                <state_interface name="torque"/>
+                <state_interface name="effort"/>
                 <state_interface name="temperature"/>
             </joint>
 
-        </ros2_control> 
+            <!-- The second wheel, id 4, the same shape as joint3 - the example declares four
+                 joints because the reference bench carries four servos (ids 1-4), and a
+                 three-joint example on a four-servo bus leaves one servo unread and unwritten.
+                 A mirrored wheel pair is what `inverted` exists for - the right-hand wheel of a
+                 differential drive would add a param inverted of true, which flips its two
+                 command interfaces together with its position, velocity and load states, so that
+                 one positive velocity drives the pair forward. It is deliberately left off here,
+                 because the URDF beside this file is a serial chain rather than a mirrored pair,
+                 so an inverted joint4 would spin its servo opposite to the model RViz draws, and
+                 this file is what a new user copies first. See the bench description under
+                 test/hil/descriptions for `inverted` exercised on hardware. -->
+            <joint name="${prefix}joint4">
+                <param name="id">4</param>
+                <param name="type">vel</param>
+                <command_interface name="velocity">
+                    <param name="min">-9.2</param>
+                    <param name="max">9.2</param>
+                </command_interface>
+                <state_interface name="position"/>
+                <state_interface name="velocity"/>
+                <state_interface name="effort"/>
+                <state_interface name="temperature"/>
+            </joint>
+
+        </ros2_control>
 
     </xacro:macro>
 

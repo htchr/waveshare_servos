@@ -70,6 +70,26 @@
         </visual>
     </link>
 
+    <!-- The second wheel. Every joint of the ros2_control block has to exist here too, so joint4
+         gets a link of its own. -->
+    <joint name="joint4" type="continuous">
+        <axis xyz="0 0 1"/>
+        <limit effort="1000.0" lower="-3.14" upper="3.14" velocity="1.0"/>
+        <origin xyz="0 0 0.1"/>
+        <parent link="link4"/>
+        <child link="link5"/>
+    </joint>
+
+    <link name="link5">
+        <visual>
+            <origin xyz="0 0 0.05"/>
+            <geometry>
+                <cylinder length="0.1" radius="0.1"/>
+            </geometry>
+            <material name="white"/>
+        </visual>
+    </link>
+
     <xacro:include filename="$(find waveshare_servos)/description/ros2_control/example.ros2_control.xacro"/>
 
     <xacro:example_ws_ros2_control name="example_ws_ros2_control" prefix="$(arg prefix)"/>

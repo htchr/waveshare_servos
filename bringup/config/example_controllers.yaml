@@ -43,3 +43,4 @@ joint_velocity_controller:
   ros__parameters:
     joints:
       - joint3
+      - joint4

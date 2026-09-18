@@ -1,0 +1,127 @@
+<?xml version="1.0"?>
+<!-- The bench check's description (PHASE2_SPEC 12.5). One file with arguments, because the ten
+     scenarios differ only in allow_missing_servos, the absent servo, inverted, the two
+     per-joint limits and whether every state interface is declared.
+     joint1/joint2 are the arm servos (ids 1 and 2, pos, offset 1.570796); joint3/joint4 are the
+     wheels (ids 3 and 4, vel, unwrap explicitly true); joint5 is the deliberately absent id 9. -->
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="waveshare_bench">
+  <xacro:arg name="port" default="/dev/ttyACM0"/>
+  <xacro:arg name="allow_missing" default="false"/>
+  <xacro:arg name="phantom" default="false"/>
+  <xacro:arg name="nine" default="false"/>
+  <xacro:arg name="inverted2" default="false"/>
+  <xacro:arg name="inverted4" default="false"/>
+  <xacro:arg name="speed1" default=""/>
+  <xacro:arg name="speed3" default=""/>
+  <xacro:arg name="speed4" default=""/>
+  <xacro:arg name="accel4" default=""/>
+
+  <link name="base_link"/>
+  <xacro:macro name="arm_link" params="name">
+    <joint name="${name}" type="revolute">
+      <axis xyz="0 0 1"/>
+      <limit effort="1.0" lower="-1.570796" upper="1.570796" velocity="9.2"/>
+      <parent link="base_link"/>
+      <child link="l_${name}"/>
+    </joint>
+    <link name="l_${name}"/>
+  </xacro:macro>
+  <xacro:macro name="wheel_link" params="name">
+    <joint name="${name}" type="continuous">
+      <axis xyz="0 0 1"/>
+      <limit effort="1.0" velocity="9.2038847"/>
+      <parent link="base_link"/>
+      <child link="l_${name}"/>
+    </joint>
+    <link name="l_${name}"/>
+  </xacro:macro>
+  <xacro:arm_link name="joint1"/>
+  <xacro:arm_link name="joint2"/>
+  <xacro:wheel_link name="joint3"/>
+  <xacro:wheel_link name="joint4"/>
+  <xacro:if value="${'$(arg phantom)' == 'true'}">
+    <xacro:wheel_link name="joint5"/>
+  </xacro:if>
+
+  <!-- With nine:=true every interface of PHASE2_SPEC 7.2 is declared, in that order, the
+       deprecated torque alias included (H9). Otherwise the six H7 needs are declared. -->
+  <xacro:macro name="states">
+    <state_interface name="position"/>
+    <state_interface name="velocity"/>
+    <state_interface name="effort"/>
+    <state_interface name="current"/>
+    <xacro:if value="${'$(arg nine)' == 'true'}">
+      <state_interface name="voltage"/>
+      <state_interface name="temperature"/>
+    </xacro:if>
+    <state_interface name="load"/>
+    <state_interface name="status"/>
+    <xacro:if value="${'$(arg nine)' == 'true'}">
+      <state_interface name="torque"/>
+    </xacro:if>
+  </xacro:macro>
+
+  <xacro:macro name="wheel" params="name id inverted speed accel">
+    <joint name="${name}">
+      <param name="id">${id}</param>
+      <param name="type">vel</param>
+      <param name="unwrap">true</param>
+      <!-- str(): xacro turns the literal false into a python bool, which would print False -->
+      <param name="inverted">${'true' if str(inverted).lower() == 'true' else 'false'}</param>
+      <xacro:if value="${speed != ''}">
+        <param name="max_speed">${speed}</param>
+      </xacro:if>
+      <xacro:if value="${accel != ''}">
+        <param name="max_accel">${accel}</param>
+      </xacro:if>
+      <command_interface name="velocity">
+        <param name="min">-9.2038847</param>
+        <param name="max">9.2038847</param>
+      </command_interface>
+      <xacro:states/>
+    </joint>
+  </xacro:macro>
+
+  <ros2_control name="bench" type="system">
+    <hardware>
+      <plugin>waveshare_servos/WaveshareServos</plugin>
+      <param name="port">$(arg port)</param>
+      <param name="baudrate">1000000</param>
+      <param name="allow_missing_servos">$(arg allow_missing)</param>
+    </hardware>
+
+    <joint name="joint1">
+      <param name="id">1</param>
+      <param name="type">pos</param>
+      <param name="offset">1.570796</param>
+      <param name="inverted">false</param>
+      <xacro:if value="${'$(arg speed1)' != ''}">
+        <param name="max_speed">$(arg speed1)</param>
+      </xacro:if>
+      <command_interface name="position">
+        <param name="min">-1.570796</param>
+        <param name="max">1.570796</param>
+      </command_interface>
+      <xacro:states/>
+    </joint>
+
+    <joint name="joint2">
+      <param name="id">2</param>
+      <param name="type">pos</param>
+      <param name="offset">1.570796</param>
+      <param name="inverted">$(arg inverted2)</param>
+      <command_interface name="position">
+        <param name="min">-1.570796</param>
+        <param name="max">1.570796</param>
+      </command_interface>
+      <xacro:states/>
+    </joint>
+
+    <xacro:wheel name="joint3" id="3" inverted="false" speed="$(arg speed3)" accel=""/>
+    <xacro:wheel name="joint4" id="4" inverted="$(arg inverted4)" speed="$(arg speed4)"
+                 accel="$(arg accel4)"/>
+    <xacro:if value="${'$(arg phantom)' == 'true'}">
+      <xacro:wheel name="joint5" id="9" inverted="false" speed="" accel=""/>
+    </xacro:if>
+  </ros2_control>
+</robot>

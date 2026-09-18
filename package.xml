@@ -18,6 +18,14 @@
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>
   <test_depend>ros2_control_test_assets</test_depend>
+
+  <!-- test/hil/hil_record.py, the recorder of the hil_check bench test. It imports these only
+       when that test actually runs against hardware; every other test needs none of them. -->
+  <test_depend>control_msgs</test_depend>
+  <test_depend>rclpy</test_depend>
+  <test_depend>sensor_msgs</test_depend>
+  <test_depend>std_msgs</test_depend>
+  <test_depend>trajectory_msgs</test_depend>
   
   <exec_depend>controller_manager</exec_depend>
   <exec_depend>joint_state_broadcaster</exec_depend>

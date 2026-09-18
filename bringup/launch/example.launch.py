@@ -20,6 +20,7 @@ from launch.event_handlers import OnProcessExit
 from launch.substitutions import Command, FindExecutable, LaunchConfiguration, PathJoinSubstitution
 
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
 
 
@@ -52,7 +53,12 @@ def generate_launch_description():
             ),
         ]
     )
-    robot_description = {'robot_description': robot_description_content}
+    # The rendered URDF is XML, not YAML. Without an explicit ``value_type=str`` launch tries to
+    # YAML-parse it and aborts the whole launch the moment the document contains anything YAML
+    # considers syntax (a colon in an XML comment is enough).
+    robot_description = {
+        'robot_description': ParameterValue(robot_description_content, value_type=str)
+    }
 
     robot_controllers = PathJoinSubstitution(
         [

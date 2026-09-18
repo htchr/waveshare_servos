@@ -48,8 +48,21 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   target_compile_options(scservo PRIVATE -Wno-vla)
 endif()
 
+# The package's only door to the serial bus: the vendored packet layer plus exclusive access to
+# the tty. Driver-owned, so it is linted and gets the package-wide warnings in full -- no -Wno-vla,
+# it contains no variable length array. Like scservo it is neither installed nor exported; the
+# plugin links it privately and the pty test links it directly.
+add_library(servo_bus STATIC src/servo_bus.cpp)
+set_target_properties(servo_bus PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_compile_features(servo_bus PUBLIC cxx_std_17)
+target_include_directories(servo_bus PUBLIC
+  $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
+)
+target_link_libraries(servo_bus PUBLIC scservo)
+
 # ros2_control hardware plugin
 add_library(waveshare_servos SHARED
+  src/units.cpp
   src/waveshare_servos.cpp
 )
 target_compile_features(waveshare_servos PUBLIC cxx_std_17)
@@ -64,7 +77,7 @@ target_link_libraries(waveshare_servos
     rclcpp::rclcpp
     rclcpp_lifecycle::rclcpp_lifecycle
   PRIVATE
-    scservo
+    servo_bus
 )
 
 # Tools
@@ -75,7 +88,7 @@ add_executable(calibrate_midpoint src/calibrate_midpoint.cpp)
 target_link_libraries(calibrate_midpoint PRIVATE scservo rclcpp::rclcpp)
 
 if(WAVESHARE_SERVOS_WERROR_DEPRECATED AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-  foreach(driver_target IN ITEMS waveshare_servos set_id calibrate_midpoint)
+  foreach(driver_target IN ITEMS waveshare_servos servo_bus set_id calibrate_midpoint)
     target_compile_options(${driver_target} PRIVATE -Werror=deprecated-declarations)
   endforeach()
 endif()
@@ -163,17 +176,111 @@ if(BUILD_TESTING)
   # Loads the plugin through pluginlib from the ament index (the installed
   # package), so the test is not linked against it. It never configures the
   # plugin: the port is still hard-coded and configure would open it.
+  # test/test_helpers.hpp and test/test_support.hpp are the shared test helpers; the
+  # include directory is named so a test in a subdirectory can include them too.
   ament_add_gmock(test_load_waveshare_servos test/test_load_waveshare_servos.cpp)
   target_link_libraries(test_load_waveshare_servos
     hardware_interface::hardware_interface
     ros2_control_test_assets::ros2_control_test_assets
   )
+  target_include_directories(test_load_waveshare_servos PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/test
+  )
+
+  # The units are pure arithmetic: no ros2_control, no bus, no motors. src/units.cpp is compiled
+  # into the test rather than linked from the plugin, so the test needs none of its dependencies.
+  ament_add_gmock(test_units test/test_units.cpp src/units.cpp)
+  target_include_directories(test_units PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  # This target links nothing, so it inherits no standard: without this it would compile the shared
+  # src/units.cpp at whatever the compiler's default happens to be.
+  target_compile_features(test_units PRIVATE cxx_std_17)
+
+  # The unwrapper is header-only and pure: integer arithmetic over a tick sequence, with no
+  # ros2_control, no rclcpp, no bus and no motors. Only the include directory is needed -- there is
+  # no source file to compile in and nothing to link.
+  ament_add_gmock(test_position_unwrapper test/test_position_unwrapper.cpp)
+  target_include_directories(test_position_unwrapper PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  # This target links nothing, so it inherits no standard from a dependency.
+  target_compile_features(test_position_unwrapper PRIVATE cxx_std_17)
+
+  # The parameter getters are pure string handling: no ROS objects, no URDF, no bus, no motors.
+  # The link line is required, not optional: hardware_interface::stod and ::parse_bool are
+  # exported functions in libhardware_interface.so, not header-only. src/ is on the include path
+  # because src/param_parsing.hpp is driver-owned and deliberately not installed.
+  ament_add_gmock(test_param_parsing test/test_param_parsing.cpp)
+  target_link_libraries(test_param_parsing hardware_interface::hardware_interface)
+  target_include_directories(test_param_parsing PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
   # Compiles the public header the way a dependent package with its own
   # visibility_controls.h does. Links the plugin target for its include
   # directories and dependencies; the test calls no plugin code.
   ament_add_gmock(test_visibility_controls test/test_visibility_controls.cpp)
   target_link_libraries(test_visibility_controls waveshare_servos)
+
+  # Drives ServoBus through an openpty() pair so the vendored packet code runs unchanged: no
+  # ros2_control, no plugin, no motors. openpty has been in libc since glibc 2.34, so do NOT add
+  # `util` -- there is no libutil.so dev stub installed here and -lutil would fail to link.
+  ament_add_gmock(test_servo_bus test/test_servo_bus.cpp)
+  target_link_libraries(test_servo_bus servo_bus)
+  target_include_directories(test_servo_bus PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test)
+
+  # Drives the whole component lifecycle -- the plugin loaded through pluginlib from the ament
+  # index, behind a ResourceManager -- against the fake servo bus of test/fake_servo_bus.hpp on an
+  # openpty() pair. No motors, no adapter, no /dev/ttyACM0: every case passes its own
+  # <param name="port">. Like test_servo_bus it must NOT link `util`; openpty has been in libc
+  # since glibc 2.34 and there is no libutil.so dev stub installed here.
+  ament_add_gmock(test_lifecycle_over_pty test/test_lifecycle_over_pty.cpp)
+  target_link_libraries(test_lifecycle_over_pty
+    hardware_interface::hardware_interface
+    ros2_control_test_assets::ros2_control_test_assets
+  )
+  target_include_directories(test_lifecycle_over_pty PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/test
+  )
+
+  # Bench check. Runs only with WAVESHARE_HIL=1 and a real adapter; on any other
+  # machine it exits 77 and ctest records a skip. It drives the motors, so it is
+  # never part of a default build's expectations.
+  #
+  # Its two helper binaries speak to the tty without ROS, so the shell script can act while the
+  # port is free. hil_stop_wheels needs the vendored packet layer, which the scservo target
+  # already compiles with -Wno-vla for the VLA at src/SMS_STS.cpp:56; port_probe opens the tty
+  # and nothing else. NEITHER IS INSTALLED: they are test fixtures, not package tools.
+  add_executable(hil_stop_wheels test/hil/stop_wheels.cpp)
+  target_link_libraries(hil_stop_wheels scservo)
+
+  add_executable(hil_port_probe test/hil/port_probe.cpp)
+  target_compile_features(hil_port_probe PRIVATE cxx_std_17)
+
+  # The gate logic is the part of the bench check that can be proved without a bench: the
+  # self-test runs the three invariant gates over synthetic series with injected defects and
+  # needs no hardware, no ROS and no run directory (PHASE2_SPEC 11.2, 12.3).
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  ament_add_test(hil_gates_self_test
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test/hil/hil_gates.py"
+            --self-test
+    WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+    RESULT_FILE "${AMENT_TEST_RESULTS_DIR}/${PROJECT_NAME}/hil_gates_self_test.xunit.xml"
+    GENERATE_RESULT_FOR_RETURN_CODE_ZERO
+    TIMEOUT 60
+  )
+
+  file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/hil_check")
+  ament_add_test(hil_check
+    COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/test/hil_check.sh"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+    OUTPUT_FILE "${CMAKE_BINARY_DIR}/hil_check/hil_check.txt"
+    RESULT_FILE "${AMENT_TEST_RESULTS_DIR}/${PROJECT_NAME}/hil_check.xunit.xml"
+    ENV "WAVESHARE_HIL_STOP_WHEELS=$<TARGET_FILE:hil_stop_wheels>"
+        "WAVESHARE_HIL_PORT_PROBE=$<TARGET_FILE:hil_port_probe>"
+        "WAVESHARE_HIL_HELPERS=${CMAKE_CURRENT_SOURCE_DIR}/test/hil"
+    SKIP_RETURN_CODE 77
+    TIMEOUT 2400
+  )
+  # RUN_SERIAL because nothing else may touch the port; SKIP_RETURN_CODE 77 is what makes a
+  # motorless `colcon test` report a skip rather than a failure (it reaches ament_add_test too,
+  # so the xunit file says skipped as well); the label runs or excludes it with -L / -LE hil.
+  set_tests_properties(hil_check PROPERTIES RUN_SERIAL TRUE LABELS "hil")
 endif()
 
 # Exports

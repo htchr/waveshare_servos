@@ -1,0 +1,25 @@
+# Controller manager configuration for the bench check (PHASE2_SPEC 12.5).
+# hil_check.sh substitutes @WHEELS@ with the wheel joint list of the scenario's description:
+# [joint3, joint4], or [joint3, joint4, joint5] when the absent id 9 is declared.
+controller_manager:
+  ros__parameters:
+    update_rate: 100
+    enforce_command_limits: false
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+    arm:
+      type: joint_trajectory_controller/JointTrajectoryController
+    wheels:
+      type: velocity_controllers/JointGroupVelocityController
+
+arm:
+  ros__parameters:
+    joints: [joint1, joint2]
+    command_interfaces: [position]
+    state_interfaces: [position, velocity]
+    allow_partial_joints_goal: true
+    interpolate_from_desired_state: false
+
+wheels:
+  ros__parameters:
+    joints: @WHEELS@
