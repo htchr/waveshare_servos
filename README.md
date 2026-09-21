@@ -188,7 +188,7 @@ It is registered by `colcon test` like any other test and **skips itself** unles
 ```bash
 colcon test --packages-select waveshare_servos                       # hil_check: SKIPPED
 WAVESHARE_HIL=1 colcon test --packages-select waveshare_servos \
-  --ctest-args -R hil_check                                          # about 30 minutes of bus time
+  --ctest-args -R hil_check                                          # about 27 minutes of bus time: ~17 of scenarios plus the ten-minute soak
 ```
 
 It skips, with the reason printed, unless `WAVESHARE_HIL=1`, the port exists and is readable and writable, the user is not root, and `ros2` is on `PATH`.
@@ -213,6 +213,140 @@ That proves the **decode**. It does not prove what any bit means on this firmwar
 So **no status bit is named here without a primary source**: bits 0, 1, 2, 3 and 5 are named after FEETECH's own SDK, and bits 4, 6 and 7 are published as `bitN (meaning unverified)`.
 The current scale (`current_per_count_a`) cannot be validated without an ammeter either, so `effort` stays documented as approximate.
 
+## Sizing the bus
+
+Everything in this section was measured on the reference bench: four ST3025 servos, ids 1-4, on `/dev/ttyACM0` through the supplied Bus Servo Adapter at 1 000 000 baud, `update_rate: 100`, on a non-RT kernel with no FIFO scheduling privileges.
+These are that bench's numbers, not a promise about your robot. The cost model below is the part that is meant to travel; the totals are not.
+
+### What a cycle costs
+
+| per 100 Hz control cycle, four servos | before | after |
+|---|---|---|
+| `read()` -- position, velocity, load, voltage, temperature, current, status | 3.064 ms | **1.645 ms** |
+| `write()` -- two position goals and two wheel speeds | 1.447 ms | **0.014 ms** |
+| both, out of the 10 ms period | 4.51 ms (45 %) | **1.66 ms (16.6 %)** |
+
+Each column is the mean of three alternating runs of the same three bench scenarios, one arm after the other on the same afternoon: the left column is one `FeedBack()` round trip per joint plus an acknowledged per-wheel acceleration write, the right column is one `INST_SYNC_READ` covering all four servos plus two unacknowledged broadcast writes.
+The run-to-run spread inside each arm was 0.008 ms or less, so the difference is not noise.
+
+The read saving is a round trip removed per extra servo.
+The write saving is larger than it looks because the old path was not spending its time on the wire: the vendored `SyncWriteSpe` writes each wheel's acceleration register with a call that blocks waiting for that servo's status packet, and two of those were most of the 1.447 ms. The acceleration register is now written at four edges instead of every cycle, and what is left is two broadcast packets the kernel accepts in microseconds.
+
+The same numbers hold over a long window: three ten-minute soaks at 100 Hz, about 60 000 cycles each, averaged 1.647 ms read and 0.013 ms write -- one part in 1200 away from the nine-second measurement above.
+
+The published values did not change. Both read paths funnel through the same decoder, and a side-by-side capture found `position`, `velocity`, `load` and `current` bit-identical in 800 of 800 samples. `voltage` and `temperature` are the exception, and they are **not** bit-identical between two reads -- of either path. They dither by up to one ADC count, at the same rate between two reads of the *same* path as between the two paths, so it is the servo's converter and not the transport. Nothing here compares the two transports on those two interfaces, and no test in this package demands equality on them.
+
+### How the cost scales with servo count
+
+Measured per transaction, by least squares over one to four servos:
+
+```
+sync read of n servos        t(n) = 0.476 + 0.290 n   ms
+one FeedBack() per servo     t(n) = 0.750 n           ms
+```
+
+The crossover is n = 1.03, so the sync read wins from two servos up, and every servo after the first costs **0.29 ms** instead of 0.75 ms.
+Above four servos this is a model, not a measurement: it is a straight line through four points on one bench with one adapter, and nothing here has been run with more.
+
+Broadcast sync writes are unacknowledged, so they cost the caller almost nothing regardless of servo count -- 0.004 ms measured at a 100 Hz cadence -- but they do occupy the bus for `(8 + n * (nLen + 1)) * 10 us`, which is exactly wire time at 1 Mbaud, with `nLen` 7 bytes for a position record and 2 for a wheel speed.
+
+**How many joints fit at 100 Hz.** Allowing half the 10 ms period for bus work and scaling the model by the measured 1.19 tail factor:
+
+```
+1.19 * (0.476 + 0.290 n) + 0.02 <= 5   ->   n <= 12.8
+```
+
+So **twelve joints at 100 Hz with 50 % headroom**, on a p99 basis. On a mean basis the same budget allows fifteen or sixteen, and that is a mean-based figure -- do not size a robot with it.
+Two cross-checks agree that twelve is the honest number: pure wire time would allow sixteen, and the adapter's USB framing (below) puts a 4 ms floor under a twelve-servo cycle whatever the baud rate.
+For comparison, the per-servo path this replaces holds **five** joints in the same budget, so the change slightly more than doubles the joint count a 100 Hz loop can carry.
+
+**What is actually binding** is that 0.29 ms of marginal cost per servo. It is not the baud rate: the adapter is USB CDC and the host polls it once per 1 ms USB frame, so a back-to-back read loop bottoms out at 2.000 ms per cycle -- 499.7 Hz with four servos -- no matter what the line rate is. Raising the baud above 1 Mbaud would not move any number in this section, and this package does not recommend it.
+It is also not the packet size limits: a sync write chunks at 30 position records or 82 wheel-speed records per packet, and a bus that large is far past the timing ceiling above.
+
+### `io_timeout_ms`, and how often a transaction fails
+
+`io_timeout_ms` is the per-transaction budget the driver hands to the vendored serial layer (`SCSerial::IOTimeOut`). Legal range **2..1000**, default **5**.
+
+This is the first hardware parameter this README documents; the rest are listed with their defaults in `description/ros2_control/example.ros2_control.xacro:12-17`.
+
+**Breaking change in this release.** The lower bound moved from 1 to 2 and the default from 20 to 5. A description that sets `io_timeout_ms` to 1 no longer configures -- `on_init` fails with a message naming the new range. That is deliberate: at 1 ms a sync read of four servos does not merely time out, it occasionally returns *the previous cycle's* reply frames, with correct headers, correct ids in the correct slots, correct length bytes and correct checksums. Eight of 3000 reads did exactly that on this bench. No flush can prevent it, so the value is refused instead.
+
+**Size it for the burst, not for one transaction.** A single `FeedBack()` survives a 1 ms timeout comfortably; a sync read of four ids fails 98.55 % of the time at 1 ms and 0.00 % at 2 ms and above. The floor the driver checks against is roughly `0.48 + 0.29 * servos` milliseconds, scaled by about 1.2 for the tail, plus a millisecond:
+
+| servos | 1 | 4 | 8 | 9 | 10 | 12 | 16 | 30 |
+|---|---|---|---|---|---|---|---|---|
+| advisory floor (ms) | 2 | 3 | 5 | 5 | 6 | 6 | 8 | 12 |
+
+Below that floor the driver says so. A value you did not set is raised to the floor with one INFO; a value you did set is either warned about and demoted to the one-read-per-servo path, or refused outright if you pinned `feedback_mode` to `sync_read`. The 5 ms default is silent up to nine servos.
+
+**What a silent servo costs.** Exactly one full timeout per cycle -- once, not once per servo, and it does not matter where the dead id sits in the list. Against a 1.60 ms clean read:
+
+| `io_timeout_ms` | 2 | 3 | 5 | 10 | 20 |
+|---|---|---|---|---|---|
+| cost of one absent servo | +0.46 ms | +1.47 ms | +3.56 ms | +8.57 ms | +18.60 ms |
+| read cycle, relative | 1.29x | 1.92x | 3.23x | 6.31x | 12.44x |
+
+At 100 Hz that is the whole argument for a small value: with one servo dead, 5 ms keeps the loop running at about half rate, 10 ms stalls it, and the vendored library's own 100 ms default would stall it for ten cycles. A servo that is dead *at configure time* never enters the sync-read list at all and costs nothing; this is the price of one that goes quiet mid-run, for the `max_read_fails` cycles before it is dropped.
+
+**It costs nothing when the bus is healthy.** Mean read latency is flat at 1.60-1.63 ms for every timeout from 2 ms to 20 ms, so there is no reason to keep a large value "for safety". Running the shipped driver with the timeout put back to 20 ms moved the measured read average by 0.003 ms, against a run-to-run spread of 0.008 ms. A healthy sync read never comes near its deadline.
+
+**Sub-millisecond values are meaningless** on this adapter. It is USB CDC and the host polls it once per 1 ms frame: a 1 ms read window collects, on average, 0.0 of the 84 reply bytes, and all 84 are waiting 2 ms later. Design your timing constants on a 1 ms granularity.
+
+**How often a transaction fails, on this bench.**
+
+> Over three ten-minute soaks at 100 Hz -- four servos at 1 Mbaud, both wheels turning at 1 rad/s and the arm holding position, `io_timeout_ms: 5` -- the driver recorded **0 failed transactions in 182 994**, with a worst consecutive failing run of 0, no servo dropped, and zero failures on each of the four ids individually.
+>
+> Zero events is not a failure rate of zero. With nothing observed, the honest statement is an upper bound: by the rule of three, the failed-transaction rate on this bench is **below 17 per million at 95 % confidence** (3/182 994 = 16.4) -- under about six failures per hour of continuous operation at 100 Hz. The true rate may be far lower, and this measurement cannot tell you.
+
+A fourth clean ten-minute soak inside the full suite brings the pool to 0 failures in 244 158 transactions, which tightens the same bound to 13 per million (3/244 158 = 12.3). Measure it on your own bus with
+
+```bash
+WAVESHARE_HIL=1 WAVESHARE_HIL_SCENARIOS=H11 colcon test --packages-select waveshare_servos \
+  --ctest-args -R hil_check                                   # ten minutes, plus setup
+```
+
+and read the `H11.fail_rate` row; the driver also prints one `bus totals:` line per deactivation with the same counters and a per-servo breakdown.
+
+**What a failure actually does.** The driver keeps the last good sample for that joint rather than publishing the `-1` a timed-out read returns, counts the failure against that servo, and after `max_read_fails` consecutive failures drops the servo from the read cycle with one ERROR (`src/waveshare_servos.cpp:1732-1748`). See [Recovery after a servo is lost](#recovery-after-a-servo-is-lost) for what happens next and how to get the joint back.
+
+### Running the bus slower, or off the control thread
+
+`ros2_control` 4.48 can read and write the hardware at a lower rate than the controller manager's `update_rate`, and can run it on its own thread. Both are **attributes of the `<ros2_control>` element**, not `<param>` children of `<hardware>`, which is the mistake that costs an afternoon:
+
+```xml
+<!-- optional, ros2_control 4.48: read/write the hardware at a different rate than the
+     controller manager's update_rate, and/or on its own thread
+<ros2_control name="${name}" type="system" rw_rate="50" is_async="true">
+-->
+```
+
+This package sets neither, for the reasons below. `ros2 control list_hardware_components` prints `read/write rate:` and `is_async:` unconditionally; that is how you check an attribute took effect.
+
+Measured here at `update_rate: 100` with four servos:
+
+- `rw_rate="50"` does exactly what it says. Bus occupancy halves -- 49.98 against 99.96 transactions per second, so 8.2 % of wall clock instead of 16.5 % -- with the per-read cost unchanged at about 1.65 ms and no failed transactions. The unwrapper, the command pacing and the drop policy are unaffected.
+- `is_async="true"` changed no measurable number at four servos: read 1.648 ms against the synchronous 1.653 ms, `/joint_states` unchanged at 100 Hz. A 120 s recording of a wheel at 2 rad/s (12 251 samples) contained no repeated sample and no doubled position step, so nothing torn was observed -- but that is a negative result over one window, not a proof that the async wrapper copies the state arrays under a lock. An async component stops the wheels correctly on `SIGINT`, tested at 2 rad/s against a synchronous control run; `rw_rate` was not separately SIGINT-tested with a wheel turning, since it does not touch the shutdown path.
+
+The caveats are worth more than the results:
+
+- **`/joint_states` keeps publishing at the controller manager's `update_rate`.** A lower `rw_rate` does not slow the topic down; it makes each value repeat. Anything differentiating `position` numerically will read zero apparent motion on alternate samples.
+- **Pick an `rw_rate` that divides the `update_rate`.** `rw_rate="60"` against `update_rate: 100` is reported by `list_hardware_components` as `60 Hz` and actually runs at 50 Hz -- the controller manager decimates the loop by an integer, and nothing logs the difference. The CLI shows the rate you asked for, not the rate you got.
+- **A value above the `update_rate`, and `rw_rate="0"`, are silently treated as the `update_rate`.** No warning, no error, no mention in the log, so a typo is invisible except through `list_hardware_components`.
+- **This package's bench gates assume a 100 Hz component.** At `rw_rate="50"` with a wheel near 2 rad/s, `hil_check`'s velocity-consistency gate charges a 20 ms position step against a 10 ms allowance and starts failing; with `is_async="true"` set as well it fails on nearly every step, because the timestamp jitter that was providing the margin disappears. Below `update_rate/2` the stale-run rule starts excluding most of the recording instead. `rw_rate` is outside what this bench checks, which is why the package does not set it.
+- **An async component asks for a real-time thread.** Without RT privileges the controller manager warns once per component (`Could not enable FIFO RT scheduling policy`) and runs it at normal priority -- which is the configuration in which async jitter is least predictable. Set up RT scheduling if you use it.
+- `thread_priority` is deprecated in 4.48 in favour of `async_params`; do not copy it from older examples.
+
+On this driver `is_async` buys nothing, because `read()` is the only expensive thing in the control thread and no controller here was missing a deadline. Use it if you have something else in that thread; use `rw_rate` if the bus, not the CPU, is your bottleneck.
+
+### What this section does not cover
+
+Four things a reader could reasonably expect from the numbers above, and which nobody has measured:
+
+- **More than four servos.** The cost model, the twelve-joint ceiling and the timeout floor table are all fitted on one to four servos, on one bench, through one adapter. Nothing above four has been run. Treat the model as a model.
+- **A servo that loses power mid-run.** The wheel acceleration register is SRAM and a power cycle clears it. The driver writes it at four edges -- when the groups are built, on activation, when a servo starts answering again, and when a fault clears -- but whether those edges catch every real brown-out is untested, and so is whether this firmware comes back with torque enabled. A wheel that reboots and is not caught by one of those edges runs unramped, and nothing logs it.
+- **More than 30 position servos.** Their goal positions split across two packets about 2.5 ms apart. Whether that skew is visible in motion cannot be answered on a four-servo bench.
+- **`is_async` and torn samples.** The 120 s recording above found nothing torn, which is a negative result over one window and not a proof that the framework copies the driver's state arrays under a lock.
+
 
 ## Additional Tools
 
@@ -235,11 +369,6 @@ The following command will set the middle position (tick 2048, pi radians, 180 d
 ```bash
 ros2 run waveshare_servos calibrate_midpoint --ros-args -p id:=<id>
 ```
-
-
-## TODO
-
-- software tests
 
 
 ## License

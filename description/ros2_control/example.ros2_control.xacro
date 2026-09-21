@@ -4,6 +4,21 @@
     <xacro:macro name="example_ws_ros2_control"
                  params="name prefix port:=/dev/ttyACM0 baudrate:=1000000">
 
+        <!-- Optional, ros2_control 4.48 - read and write the hardware at its own rate, and/or on
+             its own thread. Both are ATTRIBUTES of this element, not <param> children of
+             <hardware>, and an attribute the parser does not know is dropped without a word, so a
+             typo looks like nothing happened. Pick an rw_rate that divides the update_rate: at
+             update_rate 100, rw_rate 60 is reported by `ros2 control list_hardware_components` as
+             60 Hz and actually runs at 50, while 0 or anything above update_rate is silently
+             treated as update_rate. /joint_states keeps publishing at update_rate either way - a
+             lower rw_rate does not slow the topic down, it makes each value repeat. This package
+             sets neither: rw_rate 50 halves bus occupancy but fails this package's own velocity
+             gate on a wheel near 2 rad/s, and is_async changed no measurable number at four
+             servos. See the README, "Running the bus slower, or off the control thread". To use
+             one, add the attribute to the live tag below; this copy is only the shape, and xacro
+             does not expand anything inside a comment.
+        <ros2_control name="..." type="system" rw_rate="50" is_async="true">
+        -->
         <ros2_control name="${name}" type="system">
             <hardware>
                 <plugin>waveshare_servos/WaveshareServos</plugin>
@@ -11,9 +26,10 @@
                 <param name="baudrate">${baudrate}</param>
                 <!-- Optional, shown with their defaults and deliberately left out so this example
                      exercises them -
-                     io_timeout_ms 20, ping_attempts 3, max_read_fails 50,
-                     allow_missing_servos false, protocol sms_sts, encoder_steps 4096,
-                     current_per_count_a 0.006, torque_constant_nm_per_a 0.8825985 -->
+                     io_timeout_ms 5, ping_attempts 3, max_read_fails 50,
+                     allow_missing_servos false, protocol sms_sts, feedback_mode auto,
+                     encoder_steps 4096, current_per_count_a 0.006,
+                     torque_constant_nm_per_a 0.8825985 -->
             </hardware>
         
             <!-- State interfaces are free-form - declare any subset of position, velocity,

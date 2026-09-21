@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <cinttypes>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -67,9 +68,9 @@ std::string holder_suffix(const std::string & port)
 // Every <param> name the <hardware> block may carry. Anything else is warned about and ignored:
 // rejecting would break every description that carries documentation params, and staying silent
 // would make a typo invisible.
-constexpr std::array<const char *, 10> kKnownHardwareParams = {
+constexpr std::array<const char *, 11> kKnownHardwareParams = {
   "port", "baudrate", "io_timeout_ms", "ping_attempts", "max_read_fails",
-  "allow_missing_servos", "protocol", "encoder_steps", "current_per_count_a",
+  "allow_missing_servos", "protocol", "feedback_mode", "encoder_steps", "current_per_count_a",
   "torque_constant_nm_per_a"};
 
 // Every <param> name a <joint> may carry. Like the hardware table above, an unknown name is
@@ -142,6 +143,7 @@ hardware_interface::CallbackReturn WaveshareServos::read_hardware_parameters()
   port_ = defaults::kPort;
   baudrate_ = defaults::kBaudrate;
   protocol_ = defaults::kProtocol;
+  feedback_mode_ = defaults::kFeedbackMode;
   io_timeout_ms_ = static_cast<uint32_t>(defaults::kIoTimeoutMs);
   ping_attempts_ = defaults::kPingAttempts;
   max_read_fails_ = defaults::kMaxReadFails;
@@ -225,15 +227,39 @@ hardware_interface::CallbackReturn WaveshareServos::read_hardware_parameters()
   }
   protocol_ = protocol;
 
-  // 0 would make every select() return at once and every transaction fail; 1000 ms is a
-  // control-loop sanity bound, not a kernel one.
+  // Lower-cased like protocol above, so 'Per_Servo' and 'per_servo' are one value and the
+  // configuration line has one spelling to print (PHASE3 2.71).
+  std::string feedback_mode = feedback_mode_;
+  st = params::get_string(p, "feedback_mode", feedback_mode);
+  if (rejected(st)) {
+    return fail(params::message(
+      st, subject_of("feedback_mode"), params::raw(p, "feedback_mode"),
+      "'auto', 'sync_read' or 'per_servo'"));
+  }
+  feedback_mode = hardware_interface::to_lower_case(feedback_mode);
+  if (feedback_mode != "auto" && feedback_mode != "sync_read" && feedback_mode != "per_servo") {
+    return fail(params::message(
+      params::Status::kMalformed, subject_of("feedback_mode"), params::raw(p, "feedback_mode"),
+      "a known feedback mode; expected 'auto', 'sync_read' or 'per_servo'"));
+  }
+  feedback_mode_ = feedback_mode;
+
+  // 1 ms is refused rather than warned about (PHASE3 R8): at 1 ms a sync read of four servos fails
+  // 98.55 % [P3 Q2] and, worse, 8 of 3000 "clean" reads completed faster than the 0.96 ms physical
+  // airtime -- the PREVIOUS cycle's frames, with correct headers, ids in their request-order
+  // slots, lengths and checksums [P3 Q4/Q6]. No flush can discard bytes that have not arrived, so
+  // that is a silently-wrong-data setting, not a slow one. 1000 ms is a control-loop sanity bound,
+  // not a kernel one. Whether the user chose the value decides what happens below the
+  // servo-count-aware floor further down, so the status is kept.
   int64_t io_timeout_ms = io_timeout_ms_;
-  st = params::get_int(p, "io_timeout_ms", 1, 1000, io_timeout_ms);
+  st = params::get_int(p, "io_timeout_ms", 2, 1000, io_timeout_ms);
   if (rejected(st)) {
     return fail(params::message(
       st, subject_of("io_timeout_ms"), params::raw(p, "io_timeout_ms"),
-      "an integer between 1 and 1000 (milliseconds)"));
+      "an integer between 2 and 1000 (milliseconds); 1 ms is not enough for a batched feedback "
+      "read, which needs about 0.48 ms plus 0.29 ms per servo"));
   }
+  const bool io_timeout_user_set = st == params::Status::kOk;
   io_timeout_ms_ = static_cast<uint32_t>(io_timeout_ms);
 
   int64_t ping_attempts = ping_attempts_;
@@ -294,15 +320,74 @@ hardware_interface::CallbackReturn WaveshareServos::read_hardware_parameters()
       "a number greater than 0 and at most 100 (newton metres per ampere)"));
   }
 
+  // PHASE3 2.82 (R10): io_timeout_ms carries the whole sync-read BURST, not one transaction, and
+  // the burst's cost grows with the number of servos in it -- 0.476 ms fixed plus 0.290 ms each
+  // [P1 Q3] -- so the bound is a function of the joint count rather than a constant, which is why
+  // it cannot live in the range check above. info_.joints is already populated here
+  // (SystemInterface::on_init runs before this is called), and the argument is the CHUNK size and
+  // not the joint count, because a longer id list is split into chunks of sync_read_max_ids
+  // (2.80). What happens below the floor depends on who chose the value and on which transport
+  // was asked for: the four rungs are per_servo (no question to answer), defaulted, user-set with
+  // 'sync_read' and user-set with 'auto'.
+  const size_t chunk_servos = std::min(info_.joints.size(), ServoBus::sync_read_max_ids);
+  const uint32_t floor_ms = ServoBus::min_io_timeout_ms(chunk_servos);
+  if (feedback_mode_ != "per_servo" && io_timeout_ms_ < floor_ms) {
+    if (!io_timeout_user_set) {
+      // Nobody chose this number, so raising it overrides nobody -- and it is what keeps a stock
+      // ten-joint description on the fast path instead of silently demoting it to four times the
+      // bus time. The 5 ms default is deliberately silent up to nine servos (5.19).
+      RCLCPP_INFO(get_logger(),
+        "io_timeout_ms raised from %u to %u ms for a sync read of %zu servos",
+        io_timeout_ms_, floor_ms, chunk_servos);
+      io_timeout_ms_ = floor_ms;
+    } else if (feedback_mode_ == "sync_read") {
+      // 'sync_read' means "never demote", so no degraded path is left: the only alternative to
+      // refusing is to run the transport the user explicitly ruled out.
+      return fail(
+        subject_of("io_timeout_ms") + " is '" + params::raw(p, "io_timeout_ms") + "', below the " +
+        std::to_string(floor_ms) + " ms a sync read of " + std::to_string(chunk_servos) +
+        " servos needs; feedback_mode is 'sync_read', which rules out the per-servo path that "
+        "would survive it, so raise io_timeout_ms to at least " + std::to_string(floor_ms) +
+        " or use 'auto'");
+    } else {
+      // The value is the user's, and it is also what one dead servo will cost per cycle [P3 Q3],
+      // so it is theirs to keep: the transport moves instead. A single FeedBack waits for one
+      // 21-byte reply and measured 0 failures in 2000 at every setting down to 1 ms [P3 Q2], so it
+      // is the path that still works down here. Frozen string L3 (PHASE3 0.4).
+      RCLCPP_WARN(get_logger(),
+        "io_timeout_ms %u is below the %u ms a sync read of %zu servos needs here; using one "
+        "feedback read per servo", io_timeout_ms_, floor_ms, chunk_servos);
+      feedback_mode_ = "per_servo";
+    }
+  }
+
+  // The other end of the same budget (PHASE3 2.85, R11). The threshold is max(8, floor) and not a
+  // flat 8 so that a bus big enough to legitimately need more -- min_io_timeout_ms(30) is 12 -- is
+  // never scolded for obeying the floor above. 8 is a 10 ms period minus the 2 ms drain a failed
+  // read pays on the error path. This says a setting is expensive, never that it is wrong: a
+  // slower loop or a deliberately patient bus is a real configuration.
+  const uint32_t stall_warn_ms = std::max(8u, floor_ms);
+  if (feedback_mode_ != "per_servo" && io_timeout_ms_ > stall_warn_ms) {
+    RCLCPP_WARN(get_logger(),
+      "io_timeout_ms is %u ms and a failed read pays the %u ms drain on top of it; that is what "
+      "one non-answering servo costs in every cycle that polls it (measured at 1.00-1.03x the "
+      "setting across 2..50 ms [P1 Q7]), and a 100 Hz loop has 10 ms in all. A slower loop or a "
+      "deliberately patient bus makes that legitimate; it is a problem only if a servo goes "
+      "silent and 100 Hz still has to be met",
+      io_timeout_ms_, static_cast<uint32_t>(ServoBus::sync_read_drain_ms));
+  }
+
   // The parsed configuration, once per component load. %.7g and not %g: %g prints 0.8825985 as
   // 0.882599. A repeated <param> silently keeps the last value, so this line is the user's only
-  // check of what the driver actually read.
+  // check of what the driver actually read -- and it reports the EFFECTIVE values, so a timeout
+  // raised or a mode latched by the ladder above appears here rather than the word that was
+  // parsed. It sits after the ladder for that reason.
   RCLCPP_INFO(get_logger(),
     "bus configuration: port '%s', %d baud, protocol '%s', io timeout %u ms, %d ping attempt(s), "
-    "drop a servo after %d consecutive read failures, allow_missing_servos %s, %d encoder steps "
-    "per revolution, %.7g A per current count, %.7g N m/A",
+    "drop a servo after %d consecutive read failures, allow_missing_servos %s, feedback_mode "
+    "'%s', %d encoder steps per revolution, %.7g A per current count, %.7g N m/A",
     port_.c_str(), baudrate_, protocol_.c_str(), io_timeout_ms_, ping_attempts_, max_read_fails_,
-    allow_missing_servos_ ? "true" : "false", encoder_steps_,
+    allow_missing_servos_ ? "true" : "false", feedback_mode_.c_str(), encoder_steps_,
     current_per_count_a_, torque_constant_nm_per_a_);
   return hardware_interface::CallbackReturn::SUCCESS;
 }
@@ -570,12 +655,13 @@ hardware_interface::CallbackReturn WaveshareServos::on_init(
     // here that is neither in the vendored sources nor measured, and a default through it would
     // silently change the acceleration of every robot that already works.
     //
-    // Coverage owed, not skipped: the converted counts have no load-time observable -- they only
-    // reach the wire through p_vel_ar_/p_acc_ar_ in send_commands() -- so the rejections and the
-    // two cap WARNs below pin the conversion and the clamping, and nothing here pins that the
-    // result is actually stored. The pty chunk (PHASE2_SPEC 10.3/10.4) owes an assertion that a
-    // joint declaring max_speed/max_accel puts the CONVERTED goal-speed and ACC bytes on the bus,
-    // not the 6000/150 defaults.
+    // Coverage owed, and now discharged: the converted counts have no load-time observable -- a
+    // position joint's reach the wire as the speed and acceleration fields of the GoalPosition
+    // records send_commands() builds, a wheel's acceleration through write_wheel_acceleration() --
+    // so the rejections and the two cap WARNs below pin the conversion and the clamping, and
+    // test_lifecycle_over_pty's the_acceleration_record_carries_the_per_joint_max_accel and
+    // configure_writes_each_wheel_acc_once pin that the CONVERTED values, not the 6000/150
+    // defaults, are what reach the bus.
     if (jp.find("max_speed") != jp.end()) {
       double max_speed = 0.0;
       st = params::get_double(
@@ -766,6 +852,17 @@ hardware_interface::CallbackReturn WaveshareServos::on_init(
   // read_hardware_parameters() resolved above.
   unwrap_.assign(joints_.size(), PositionUnwrapper(encoder_steps_));
   unwrap_gap_warns_.assign(joints_.size(), 0);
+  // The failed-transaction counters of PHASE3 3.34, sized with the other per-joint vectors and
+  // zeroed again by every on_activate, which is what makes one activation one measurement window.
+  read_attempts_.assign(joints_.size(), 0);
+  read_failures_.assign(joints_.size(), 0);
+  // The read group's three parallel vectors and its joint->slot map, reserved to the full joint
+  // count once. build_read_group() runs from read() on the drop edge, so it must not allocate
+  // there; reserving for every joint covers the largest group it can ever build (PHASE3 2.59).
+  r_ids_.reserve(joints_.size());
+  r_js_.reserve(joints_.size());
+  r_blocks_.reserve(joints_.size());
+  r_slot_.assign(joints_.size(), kNoSlot);
   // create vectors for command interfaces
   pos_cmds_.resize(joints_.size(), std::numeric_limits<double>::quiet_NaN());
   vel_cmds_.resize(joints_.size(), std::numeric_limits<double>::quiet_NaN());
@@ -954,20 +1051,184 @@ void WaveshareServos::build_groups()
       v_js_.emplace_back(i);
     }
   }
-  // arrays for servo commands
-  p_pos_ar_.assign(p_ids_.size(), 0);
-  p_vel_ar_.assign(p_ids_.size(), 0);
-  p_acc_ar_.assign(p_ids_.size(), 0);
-  v_vel_ar_.assign(v_ids_.size(), 0);
-  v_acc_ar_.assign(v_ids_.size(), 0);
-  // set motor modes: 0 = servo, 1 = closed loop wheel; set max acceleration
+  // one goal record per servo in each group, refilled every cycle by send_commands()
+  p_goals_.assign(p_ids_.size(), GoalPosition{});
+  v_goals_.assign(v_ids_.size(), GoalSpeed{});
+  // set motor modes: 0 = servo, 1 = closed loop wheel
   for (size_t k = 0; k < p_ids_.size(); k++) {
     set_mode(p_ids_[k], 0);
-    p_acc_ar_[k] = joints_[p_js_[k]].acc_counts;
   }
   for (size_t k = 0; k < v_ids_.size(); k++) {
     set_mode(v_ids_[k], 1);
-    v_acc_ar_[k] = joints_[v_js_[k]].acc_counts;
+    // Site 1 of PHASE3 1.24, and it must stay in this order: set_mode() writes register 33, and
+    // writing the mode register clears the torque-enable register 40 -- measured on the bench when
+    // the probe tripped over it and the servos free-wheeled. set_mode() does not restore torque;
+    // the driver is safe only because on_activate reaches EnableTorque after build_groups(), so
+    // nothing here may be reordered. The acceleration write itself touches neither 33 nor 40.
+    //
+    // Being inside build_groups() is what makes this site cover the dropped-then-recovered servo
+    // too: recovery is ping -> regrouped -> build_groups() (on_activate, below).
+    write_wheel_acceleration(v_js_[k]);
+  }
+  // Size the wrapper's packet scratch once per rebuild, so the first write() of an activation
+  // allocates nothing. Over-sizing is free; the wrapper clamps at its per-packet maxima, so a
+  // hundred-servo group reserves one chunk and not a hundred records (PHASE3 1.7).
+  bus_.reserve_goal_capacity(p_ids_.size(), v_ids_.size());
+  // Last, so the three groups are always built together and present_ is read once per rebuild by
+  // all three. The read group has its own builder rather than sharing this one because read()
+  // calls it on the drop edge and this function does bus traffic -- a set_mode() per id, and an
+  // EPROM unlock/write/lock whenever a mode differs (PHASE3 2.64).
+  build_read_group();
+}
+
+void WaveshareServos::build_read_group()
+{
+  r_ids_.clear();
+  r_js_.clear();
+  r_slot_.assign(joints_.size(), kNoSlot);
+  for (size_t i = 0; i < joints_.size(); i++) {
+    if (!present_[i]) {
+      continue;
+    }
+    r_slot_[i] = r_ids_.size();
+    r_ids_.emplace_back(joints_[i].id);
+    r_js_.emplace_back(i);
+  }
+  // assign(), not resize(): every slot starts valid == false, so a burst that never ran cannot
+  // leave a previous cycle's sample readable through a slot the new group happens to reuse.
+  r_blocks_.assign(r_ids_.size(), FeedbackBlock{});
+}
+
+bool WaveshareServos::probe_sync_read()
+{
+  // Step 0 of PHASE3 2.74, and unconditional: on_activate calls build_groups() only when a servo
+  // was recovered, so the read group cannot be assumed fresh at this point.
+  build_read_group();
+  sync_read_active_ = false;
+  // 'per_servo' answers the question without asking the bus, which is what makes it the A/B
+  // baseline of the bench comparison: not one INST_SYNC_READ is emitted, probe included (5.4).
+  // An empty group is the same answer for a different reason -- with nothing present, every joint
+  // takes read()'s absent-servo mirror and no transport is used at all (PHASE3 2.78).
+  if (feedback_mode_ == "per_servo" || r_ids_.empty()) {
+    return true;
+  }
+  // Judged against the servos that answered their SEEDING feedback() in the loop above, not
+  // against every id in the group: a servo that pings but does not read has already taken that
+  // loop's else branch, and condemning the whole transport for it would be wrong. measured_ is
+  // exactly that set (PHASE3 2.74 step 3). Probing with one servo, as jazzy.md item 4 literally
+  // suggests, is rejected: a firmware that answers a 1-id burst and mishandles a 4-id one is
+  // invisible to it, and the full probe costs one extra transaction once per activation.
+  std::vector<std::string> unanswered;
+  // Twice at most: one lost frame must not condemn the mode, and a second loss on the same
+  // activation is evidence rather than noise (PHASE3 2.74 step 5).
+  for (int attempt = 0; attempt < 2 && (attempt == 0 || !unanswered.empty()); attempt++) {
+    unanswered.clear();
+    bus_.sync_read_feedback(r_ids_, r_blocks_);
+    for (size_t k = 0; k < r_ids_.size(); k++) {
+      if (measured_[r_js_[k]] && !r_blocks_[k].valid) {
+        unanswered.emplace_back(std::to_string(static_cast<int>(r_ids_[k])));
+      }
+    }
+  }
+  if (unanswered.empty()) {
+    sync_read_active_ = true;
+    // Frozen string L1 (PHASE3 0.4). Once per activation and never per cycle: the mode is decided
+    // here and nowhere else, so there is nothing later to report (2.75).
+    RCLCPP_INFO(get_logger(),
+      "feedback for %zu servos travels in one sync read per cycle (INST_SYNC_READ)",
+      r_ids_.size());
+    return true;
+  }
+  const std::string ids = join(unanswered, ", ");
+  if (feedback_mode_ == "sync_read") {
+    // The value exists so that this case is loud. Demoting here would run the transport the user
+    // explicitly ruled out and would be measured as though it were the fast one (PHASE3 2.72).
+    RCLCPP_FATAL(get_logger(),
+      "sync read went unanswered by motor id(s) %s, which answered a feedback read moments "
+      "earlier, so the firmware ignores INST_SYNC_READ; feedback_mode is 'sync_read', which rules "
+      "out the per-servo path, so refusing to activate. Use 'auto' to fall back instead",
+      ids.c_str());
+    return false;
+  }
+  // Frozen string L2 (PHASE3 0.4). "Answered FeedBack but not INST_SYNC_READ" is exactly the
+  // firmware condition jazzy.md item 4 asks to verify, which is why the ids are named.
+  RCLCPP_WARN(get_logger(),
+    "sync read went unanswered by motor id(s) %s; falling back to one feedback read per servo "
+    "for this activation", ids.c_str());
+  return true;
+}
+
+void WaveshareServos::log_bus_totals()
+{
+  if (read_stats_reported_) {
+    return;
+  }
+  read_stats_reported_ = true;
+  // on_error is reachable from INACTIVE, where no cycle ever ran. An all-zero line there is noise
+  // a grep-based gate would have to learn to ignore, so say nothing (PHASE3 3.36).
+  if (read_cycles_ == 0) {
+    return;
+  }
+  // One transaction is one of the wrapper's own read entry points (PHASE3 5.14): the sync path
+  // issues one sync_read_feedback() per control cycle however many servos are on the bus, the
+  // per-servo path one read_feedback_one() per polled joint. Not read_cycles_, which would make
+  // the per-servo arm's denominator a quarter of its real traffic on this bench and its
+  // per-million rate four times the sync arm's for an identically healthy bus -- and those two
+  // arms are exactly what 5.6 runs and 5.26 prints side by side. hil_gates.py's H11 arithmetic
+  // (`expected = 100.0 * soak`, SOAK_MIN_TRANSACTIONS = 30000 as five minutes at 100 Hz) is
+  // written against the sync path, where the two quantities are the same number.
+  const double per_million = read_transactions_ ?
+    1e6 * static_cast<double>(read_transaction_failures_) /
+    static_cast<double>(read_transactions_) :
+    0.0;
+  // The bracketed tail is required, one pair per DECLARED servo in id order: jazzy.md:204 asks for
+  // the count per servo, and hil_gates.py parses it so a failing soak can say which ids the
+  // failures fell on. Id order, not URDF order, because that is the order a human reads a bus in.
+  // It is per JOINT and the aggregate above is per CYCLE, so the tail sums to `failed` only while
+  // no burst ever lost two frames at once; that is the point of printing both.
+  std::vector<size_t> by_id;
+  by_id.reserve(joints_.size());
+  for (size_t i = 0; i < joints_.size(); i++) {
+    by_id.push_back(i);
+  }
+  std::sort(
+    by_id.begin(), by_id.end(),
+    [this](size_t a, size_t b) {return joints_[a].id < joints_[b].id;});
+  std::string tail;
+  for (const size_t i : by_id) {
+    if (!tail.empty()) {
+      tail += ", ";
+    }
+    tail += "id" + std::to_string(joints_[i].id) + " " + std::to_string(read_failures_[i]);
+  }
+  // Frozen string L5 (PHASE3 0.4, 5.14). The grammar is what test/hil/hil_gates.py's BUS_TOTALS
+  // regex matches; it may not drift.
+  RCLCPP_INFO(get_logger(),
+    "bus totals: transactions %" PRIu64 ", failed %" PRIu64 " (%.1f per million), worst "
+    "consecutive %" PRIu32 ", dropped %" PRIu32 " [%s]",
+    read_transactions_, read_transaction_failures_, per_million, worst_consecutive_,
+    dropped_count_,
+    tail.c_str());
+}
+
+void WaveshareServos::write_wheel_acceleration(size_t i)
+{
+  // A servo that is not on the bus would cost one whole io_timeout_ms for a write nobody can ack,
+  // and a position joint carries its acceleration in every goal record already (PHASE3 1.21).
+  if (!present_[i] || joints_[i].type != JointType::velocity) {
+    return;
+  }
+  // acc_counts of 0 is written, never skipped: max_accel="0" is the documented "no ramp" opt-out
+  // (cpp:717-719), and skipping would leave whatever the servo held from its EPROM default or a
+  // previous run -- silently inverting the meaning of the parameter (PHASE3 1.23).
+  if (!bus_.write_acc(joints_[i].id, joints_[i].acc_counts)) {
+    // Not fatal, and no retry here: a failed write costs a full io_timeout_ms each time, and two
+    // of the four sites run inside read(). The next of the four sites is the retry (PHASE3 1.25).
+    // It is a WARN rather than an INFO because an unramped wheel is a physical surprise with no
+    // other symptom. The text is frozen (PHASE3 L4); 4.T55 matches it literally.
+    RCLCPP_WARN(get_logger(),
+      "could not write the acceleration register of motor id '%d'; it will run unramped",
+      joints_[i].id);
   }
 }
 
@@ -1100,6 +1361,31 @@ void WaveshareServos::push_states(size_t i, bool wait)
 hardware_interface::CallbackReturn WaveshareServos::on_activate(
   const rclcpp_lifecycle::State & /*previous_state*/)
 {
+  // One activation is one measurement window, so the failed-transaction counters start again
+  // here -- at the top, before the re-ping loop, so nothing this activation does falls outside
+  // the window it is charged to (PHASE3 3.35, 5.14). H9 cycles the component inactive->active and
+  // must not carry its counts across.
+  read_cycles_ = 0;
+  read_transactions_ = 0;
+  read_transaction_failures_ = 0;
+  read_stats_reported_ = false;
+  worst_consecutive_ = 0;
+  dropped_count_ = 0;
+  read_attempts_.assign(joints_.size(), 0);
+  read_failures_.assign(joints_.size(), 0);
+  // read_fails_ with them, because worst_consecutive_ is defined as the largest value it reaches
+  // since activation (R16) and a run that began in the previous window would otherwise be reported
+  // against this one. It is also the drop budget, and the drop's own ERROR text promises that
+  // re-activating the hardware looks for the servo again -- a budget carried across would spend
+  // what is left of it on the first failed read instead
+  // (re_activating_hands_a_still_silent_servo_its_whole_drop_budget_again). The two clears further
+  // down (a servo that pinged back, a servo whose seeding read answered) are left where they are:
+  // they are what PHASE2_SPEC 8.4/8.5 pin, and they are now reinforcement rather than the only
+  // reset. The third consequence is deliberate too: note_unwrap_gap()'s `missed` starts this
+  // window at 0 even for a servo that was silent right across the transition, which is correct
+  // because reset_unwrap() in the seeding loop below clears, in the same activation, the very
+  // accumulator that gap would have been charged against (PHASE2_SPEC 8.4).
+  read_fails_.assign(joints_.size(), 0);
   // Activation is off the real-time path, so it is the right place to look again for a servo
   // that was absent at configure time or was dropped after it stopped answering. Deactivating
   // and re-activating the hardware is therefore enough to recover one, with no restart.
@@ -1138,6 +1424,17 @@ hardware_interface::CallbackReturn WaveshareServos::on_activate(
       // A servo whose torque has been latched off -- by a protection trip, or by whatever
       // last talked to it -- accepts goal positions and quietly ignores them.
       bus_.EnableTorque(joints_[i].id, 1);
+      // Site 2 of PHASE3 1.24, after EnableTorque because register 41 is unaffected by the torque
+      // register either way and keeping EnableTorque on its own line keeps the H-gate log ordering
+      // readable. It covers what site 1 cannot: an activation with no recovered servo never calls
+      // build_groups(), and a wheel that power-cycled while the component was INACTIVE answers
+      // every ping and every read with its SRAM acceleration register lost [P2 Q2].
+      //
+      // An activation that DID recover a servo writes register 41 twice, once here and once in
+      // build_groups() above. That is accepted: the register is SRAM, so the second write costs
+      // 0.594 ms and nothing else (PHASE3 3.20), and no test may assert "exactly one" per
+      // activation -- only a delta across one transition.
+      write_wheel_acceleration(i);
     }
     if (present_[i] && feedback(i)) {
       pos_cmds_[i] = pos_states_[i];
@@ -1180,6 +1477,14 @@ hardware_interface::CallbackReturn WaveshareServos::on_activate(
     push_position_command(i);
     push_states(i, true);
   }
+  // Last, after the seeding loop, because this is the only placement that judges the transport
+  // against the servos that actually answered a feedback read: present_ and measured_ are both
+  // final here, and a servo that pings but does not read has already taken the else branch above
+  // (PHASE3 2.74, R6). It must never sit inside the loop -- EnableTorque and the seeding read are
+  // two lines of the same per-joint body, so a probe between them would run once per joint.
+  if (!probe_sync_read()) {
+    return hardware_interface::CallbackReturn::ERROR;
+  }
   return hardware_interface::CallbackReturn::SUCCESS;
 }
 
@@ -1189,6 +1494,13 @@ hardware_interface::CallbackReturn WaveshareServos::on_deactivate(
   // On SIGINT/SIGTERM the controller manager deactivates the hardware before it shuts it down,
   // so this also runs on ctrl-C.
   stop_and_park(false);
+  // After the park and not before it, so the parking round trips fall inside the window they were
+  // issued in rather than silently outside it (PHASE3 5.14).
+  log_bus_totals();
+  // The transport decision belongs to one activation. Clearing it here means the next on_activate
+  // probes again rather than inheriting a verdict taken against a bus that may have changed
+  // (PHASE3 2.73).
+  sync_read_active_ = false;
   return hardware_interface::CallbackReturn::SUCCESS;
 }
 
@@ -1347,6 +1659,23 @@ hardware_interface::return_type WaveshareServos::read(
   if (!(std::isfinite(period_s) && period_s > 0.0)) {
     period_s = last_period_;
   }
+  // One transaction for every present servo, before any per-joint work (PHASE3 2.62). All four
+  // samples now come out of one ~1.6 ms window instead of being spread over ~3.0 ms of sequential
+  // reads [P1 Q3], and the fault-clear EnableTorque in the loop below can no longer land between
+  // two servos' reads. The return value is not consulted: the per-slot `valid` flag is the only
+  // gate, because a burst that lost one frame still carries the other three (PHASE3 2.33, R3).
+  const bool burst_issued = sync_read_active_ && !r_ids_.empty();
+  if (burst_issued) {
+    bus_.sync_read_feedback(r_ids_, r_blocks_);
+    // One wrapper read entry point, whatever the servo count: the sync path's whole transaction
+    // (PHASE3 5.14). The per-servo path counts its own, one per polled joint, below.
+    read_transactions_++;
+  }
+  read_cycles_++;
+  // The burst is ONE transaction, so however many frames it lost it is charged one failure: the
+  // flag is raised by any polled joint and charged once after the loop, which is what keeps the
+  // rate at or below a million per million (PHASE3 5.14).
+  bool burst_failed = false;
   for (size_t i = 0; i < joints_.size(); i++) {
     if (!present_[i]) {
       // No servo on the bus for this joint. Mirror the command so the controllers see a
@@ -1368,10 +1697,34 @@ hardware_interface::return_type WaveshareServos::read(
       status_bytes_[i] = 0;
       continue;
     }
-    if (!feedback(i)) {
+    // After the absent branch's continue, so an absent joint never enters its own poll count
+    // (PHASE3 3.34, F14), never costs a transaction and never raises a failure either.
+    read_attempts_[i]++;
+    // On the per-servo path this joint's poll IS a transaction of its own -- one
+    // read_feedback_one() unicast -- so it enters the denominator here rather than sharing the
+    // burst's single entry above (PHASE3 5.14, R15).
+    if (!sync_read_active_) {
+      read_transactions_++;
+    }
+    if (!feedback_from_cycle(i)) {
       // The round trip failed. Keep the last good sample: publishing the -1 that a timed
       // out read returns would look like a real measurement 0.0015 rad from the origin.
+      read_failures_[i]++;
+      if (!sync_read_active_) {
+        // Its own transaction failed, and only its own: the other joints' unicast reads are
+        // unaffected by this one, which is the difference the shared burst cannot make.
+        read_transaction_failures_++;
+      } else if (burst_issued) {
+        // Charged once after the loop, and only against a burst that really went out, so
+        // `failed <= transactions` holds by construction rather than by the read group and
+        // present_ being rebuilt together -- which they are, but that is a second invariant.
+        burst_failed = true;
+      }
       read_fails_[i]++;
+      // read_fails_ is consecutive and any success clears it, so the peak has to be remembered as
+      // it happens: a bus that loses one reply in every other cycle would otherwise report a
+      // worst run of 1 forever (PHASE3 5.14).
+      worst_consecutive_ = std::max(worst_consecutive_, static_cast<uint32_t>(read_fails_[i]));
       if (read_fails_[i] == 1 || read_fails_[i] % 200 == 0) {
         RCLCPP_WARN(get_logger(),
           "read failed for motor id '%d' (%d in a row)", joints_[i].id, read_fails_[i]);
@@ -1381,11 +1734,22 @@ hardware_interface::return_type WaveshareServos::read(
         // protection trip, a pulled connector. Stop polling it: otherwise it costs a
         // full timeout in every control period from here on and drags the whole loop
         // down, which is the failure this driver started with. Deactivate and activate
-        // the hardware to look for it again.
+        // the hardware to look for it again. The budget is in cycles, not seconds: this is
+        // max_read_fails CONSECUTIVE failed reads, so the wall clock before a drop stretches with
+        // a lower rw_rate on the <ros2_control> tag -- half a second at 100 Hz, a full second at
+        // rw_rate="50". The policy is unchanged by that attribute; only its clock is (README,
+        // "Running the bus slower, or off the control thread").
         RCLCPP_ERROR(get_logger(),
           "motor id '%d' stopped answering after %d attempts; dropping it from the "
           "read cycle until the hardware is re-activated", joints_[i].id, read_fails_[i]);
         present_[i] = false;
+        dropped_count_++;
+        // The read group is rebuilt after the loop and not here: the joints after i have not been
+        // visited yet and still index r_slot_, so compacting now would re-point them at another
+        // servo's sample (PHASE3 2.65, 3.28). The WRITE groups are deliberately not rebuilt at
+        // all -- a broadcast sync write is never acked, so a dropped servo costs it three bytes,
+        // while a dead id in the read list costs a whole io_timeout_ms every cycle (F21).
+        read_group_dirty_ = true;
         reset_unwrap(i);
         if (joints_[i].unwrap) {
           // Keep the absent-branch mirror continuous with the last unwrapped reading. A `vel`
@@ -1406,6 +1770,16 @@ hardware_interface::return_type WaveshareServos::read(
     const int missed = read_fails_[i];
     read_fails_[i] = 0;
     note_unwrap_gap(i, missed, period_s);
+    if (missed > 0) {
+      // Site 3 of PHASE3 1.24. This joint answered again after at least one silent cycle, and the
+      // cheapest explanation that matters is a wheel that power-cycled and came back inside the
+      // drop budget: it reads fine and has silently lost its SRAM acceleration register [P2 Q2].
+      // A power cycle takes far longer than one control period, so it always shows up as a missed
+      // read -- which makes this the only place that catches the loss DURING an activation, now
+      // that nothing rewrites register 41 per cycle. One 0.594 ms unicast [P2 Q1] on a cycle that
+      // was already abnormal.
+      write_wheel_acceleration(i);
+    }
     // Every reply carries the servo's status byte -- overload, over-temperature, over-voltage
     // and friends. A latched protection trip is exactly the sort of thing that makes a servo stop
     // responding to goals. Use the byte feedback() captured rather than re-reading SCS::Error:
@@ -1421,8 +1795,21 @@ hardware_interface::return_type WaveshareServos::read(
       RCLCPP_INFO(get_logger(),
         "motor id '%d' cleared its fault; re-enabling torque", joints_[i].id);
       bus_.EnableTorque(joints_[i].id, 1);
+      // Site 4 of PHASE3 1.24 (R12). A protection trip that resets the servo's controller can
+      // clear SRAM with no missed read at all, so site 3 does not subsume this one; the inference
+      // that it does is not a measurement (UNMEASURED, PHASE3 section 8 Q3). The branch already
+      // pays the EnableTorque round trip above, so the insurance costs one more 0.594 ms write on
+      // an edge that is abnormal by definition.
+      write_wheel_acceleration(i);
     }
     last_error_[i] = status;
+  }
+  if (burst_failed) {
+    read_transaction_failures_++;
+  }
+  if (read_group_dirty_) {
+    build_read_group();
+    read_group_dirty_ = false;
   }
   // publish every joint's state, including the last good sample of a joint whose read failed
   for (size_t i = 0; i < joints_.size(); i++) {
@@ -1448,12 +1835,24 @@ void WaveshareServos::send_commands(const rclcpp::Duration & period)
   // so the goal speed is what decides whether a stream of setpoints comes out as continuous
   // motion or as a sequence of sprints and dwells. Pace it to arrive just as the next setpoint
   // is written.
+  //
+  // `period` is the controller manager's write period by default, and this component's own once an
+  // rw_rate on the <ros2_control> tag decimates the loop: ros2_control 4.48 then passes the time
+  // since this component's last write, so at half the rate dt doubles along with the chord each
+  // setpoint has to cover and the goal speed comes out the same rad/s. Use it; never substitute
+  // 1/update_rate. The 0.01 seed behind the guard is only reached by the park, which passes a zero
+  // period on purpose (README, "Running the bus slower, or off the control thread").
   double dt = period.seconds();
   if (std::isfinite(dt) && dt > 0.0) {
     last_period_ = dt;
   } else {
     dt = last_period_;
   }
+  // stop_and_park(true) compacts p_ids_/p_js_ in place before its single send, so the record array
+  // can be longer than the group it describes. Resizing here makes the pruned path correct by
+  // construction and never allocates in steady state (PHASE3 1.27).
+  p_goals_.resize(p_ids_.size());
+  v_goals_.resize(v_ids_.size());
   for (size_t k = 0; k < p_ids_.size(); k++) {
     const size_t j = p_js_[k];
     // Until the first controller update the command is still NaN; hold station rather than
@@ -1478,7 +1877,7 @@ void WaveshareServos::send_commands(const rclcpp::Duration & period)
     // the baseline's operator order
     const double goal_steps =
       (joints_[j].sign * cmd + joints_[j].offset) * encoder_steps_ / (2 * M_PI);
-    p_pos_ar_[k] = static_cast<s16>(std::lround(std::clamp(goal_steps, -32767.0, 32767.0)));
+    const s16 goal_ticks = static_cast<s16>(std::lround(std::clamp(goal_steps, -32767.0, 32767.0)));
     // Pace the chord this setpoint actually adds, plus whatever the servo still owes:
     // goal(k) - measured(k) is exactly chord + lag, so one term covers both. Deliberately
     // NOT the trajectory's instantaneous velocity -- on an accelerating segment that is
@@ -1502,9 +1901,12 @@ void WaveshareServos::send_commands(const rclcpp::Duration & period)
     // the start and the end of every trajectory, where the commanded velocity is zero.
     // Sending the goal position faster than the servo can reach it is harmless: the goal
     // position bounds the travel, so an over-large speed can only make it arrive early.
-    p_vel_ar_[k] = static_cast<u16>(
+    const u16 goal_speed = static_cast<u16>(
       std::clamp(speed, 1.0, static_cast<double>(joints_[j].max_speed_counts)));
-    p_acc_ar_[k] = joints_[j].acc_counts;
+    // The acceleration keeps travelling in byte 0 of the record, value 0 included: on the position
+    // path it costs nothing extra, so a position servo that restarts mid-run repairs its own
+    // register on the next cycle and needs none of the wheel policy (PHASE3 1.21).
+    p_goals_[k] = GoalPosition{p_ids_[k], goal_ticks, goal_speed, joints_[j].acc_counts};
   }
   for (size_t k = 0; k < v_ids_.size(); k++) {
     const size_t j = v_js_[k];
@@ -1512,17 +1914,32 @@ void WaveshareServos::send_commands(const rclcpp::Duration & period)
     const double speed = std::clamp(joints_[j].sign * vel * encoder_steps_ / (2 * M_PI),
       -static_cast<double>(joints_[j].max_speed_counts),
       static_cast<double>(joints_[j].max_speed_counts));
-    v_vel_ar_[k] = static_cast<s16>(std::lround(speed));
-    v_acc_ar_[k] = joints_[j].acc_counts;
+    // No acceleration here: register 41 is SRAM and is written at the four edges of PHASE3 1.24
+    // instead of once per cycle. That removal is the 0.567 ms per wheel per cycle Phase 3 item 1
+    // buys back [P2 Q1] -- 1.6x the estimate jazzy.md:202 made.
+    v_goals_[k] = GoalSpeed{v_ids_[k], static_cast<s16>(std::lround(speed))};
   }
-  // Both sync writes size a variable length array from the count, so never call them with none.
-  if (!p_ids_.empty()) {
-    bus_.SyncWritePosEx(p_ids_.data(), static_cast<u8>(p_ids_.size()),
-      p_pos_ar_.data(), p_vel_ar_.data(), p_acc_ar_.data());
-  }
-  if (!v_ids_.empty()) {
-    bus_.SyncWriteSpe(v_ids_.data(), static_cast<u8>(v_ids_.size()),
-      v_vel_ar_.data(), v_acc_ar_.data());
+  // One frame per group, chunked by the wrapper at 30 position records and 82 speed records so the
+  // unchecked 255-byte txBuf cannot overflow. An empty group puts nothing on the wire (PHASE3
+  // 1.16), so the two emptiness guards that used to protect the vendored helpers' zero-length VLAs
+  // are gone: one guard in one place cannot fall out of step with a second call site (R13).
+  const WriteResult positions = bus_.write_goal_positions(p_goals_);
+  const WriteResult speeds = bus_.write_goal_speeds(v_goals_);
+  if (!positions || !speeds) {
+    // Both refusals mean nothing reached the bus and every servo kept the previous cycle's goals
+    // -- on the velocity path, a turning wheel keeps turning -- so this is an ERROR and not a
+    // WARN. write() still returns OK: an ERROR return sends the component to on_error(), which
+    // parks and closes the port, and that is far too heavy for a closed port (already fatal
+    // elsewhere) or a bad id that on_init should have caught (PHASE3 1.27, R14). Throttled the
+    // same way read()'s failing-servo WARN is, because a refusal repeats every cycle until
+    // something else changes.
+    write_refusals_++;
+    if (write_refusals_ == 1 || write_refusals_ % 200 == 0) {
+      RCLCPP_ERROR(get_logger(), "sync write refused: positions %s, speeds %s (%d in a row)",
+        to_string(positions.status), to_string(speeds.status), write_refusals_);
+    }
+  } else {
+    write_refusals_ = 0;
   }
 }
 
@@ -1546,11 +1963,19 @@ void WaveshareServos::close_port()
   p_js_.clear();
   v_ids_.clear();
   v_js_.clear();
-  p_pos_ar_.clear();
-  p_vel_ar_.clear();
-  p_acc_ar_.clear();
-  v_vel_ar_.clear();
-  v_acc_ar_.clear();
+  // The wrapper's own packet scratch keeps its capacity: it holds no state between calls, and
+  // on_configure would only have to reserve it again (PHASE3 1.28).
+  p_goals_.clear();
+  v_goals_.clear();
+  // The read group goes with them, and so does the transport flag: a cleanup must not leave the
+  // driver believing a sync path is live over an empty group (PHASE3 2.70, 3.23). r_slot_ is
+  // assigned rather than cleared so it stays one entry per joint, which is what read() indexes.
+  r_ids_.clear();
+  r_js_.clear();
+  r_blocks_.clear();
+  r_slot_.assign(joints_.size(), kNoSlot);
+  read_group_dirty_ = false;
+  sync_read_active_ = false;
 }
 
 void WaveshareServos::log_open_failure(const OpenResult & result) const
@@ -1652,6 +2077,10 @@ hardware_interface::CallbackReturn WaveshareServos::on_error(
   // UNCONFIGURED and can be configured again (any other return finalizes it).
   RCLCPP_ERROR(get_logger(), "error in state '%s'; stopping the servos and closing the port",
     previous_state.label().c_str());
+  // Before park_and_close(), which is where the port goes: an activation that ends in an error is
+  // the one whose failure counts are most worth having, and read_stats_reported_ keeps an
+  // error-then-shutdown sequence to one line (PHASE3 3.36, R16).
+  log_bus_totals();
   park_and_close();
   return hardware_interface::CallbackReturn::SUCCESS;
 }
@@ -1687,29 +2116,58 @@ FeedbackScales WaveshareServos::scales_of(size_t i) const
 bool WaveshareServos::feedback(size_t i)
 {
   // One round trip fills the servo's whole feedback block (registers 56..70), so all nine state
-  // values come from a single transaction instead of one blocking read each. The ReadX(-1)
-  // accessors below read that cached block and never touch the bus
-  // (src/SMS_STS.cpp:135,157,177,197,212,242), which is why they are only ever called here,
-  // immediately after FeedBack() returned something other than -1.
-  const JointConfig & c = joints_[i];
-  if (bus_.FeedBack(c.id) == -1) {
+  // values come from a single transaction instead of one blocking read each.
+  //
+  // read_feedback_one() issues Read(id, 56, ., 15), which is byte for byte what FeedBack(id)
+  // issues (src/SMS_STS.cpp:123, sizeof(Mem) == 15) -- the wire is unchanged (PHASE3 F5). What
+  // changed is that the wrapper decodes the block with the same decoder the sync path uses
+  // instead of with the ReadX(-1) accessors, which retires the Err-gated sign trap from both
+  // paths: those accessors suppress every sign decode when SCS::Err is set by an unrelated
+  // earlier call (src/SMS_STS.cpp:146,168,188,254). With no ReadX(-1) call left anywhere in the
+  // package, SMS_STS::Mem going stale cannot hurt either (PHASE3 R15, 2.61a).
+  FeedbackBlock b;
+  if (!bus_.read_feedback_one(joints_[i].id, b)) {
     return false;
   }
-  // The status byte first, before anything else can touch the bus: Ping() overwrites SCS::Error
-  // with the responder id (src/SCS.cpp:261) and every Ack() overwrites it (src/SCS.cpp:292).
+  apply_feedback(i, b);
+  return true;
+}
+
+bool WaveshareServos::feedback_from_cycle(size_t i)
+{
+  if (!sync_read_active_) {
+    return feedback(i);
+  }
+  const size_t k = r_slot_[i];
+  // kNoSlot cannot reach here for a present joint -- present_ and the read group are rebuilt
+  // together -- but a missing slot has to read as "did not answer" rather than as slot 0's data,
+  // which is the one way a joint could publish another servo's sample (PHASE3 3.27).
+  if (k == kNoSlot || !r_blocks_[k].valid) {
+    return false;
+  }
+  apply_feedback(i, r_blocks_[k]);
+  return true;
+}
+
+void WaveshareServos::apply_feedback(size_t i, const FeedbackBlock & b)
+{
+  // The shared tail of both transports, and the reason they publish the same nine doubles for the
+  // same fifteen bytes by construction rather than by inspection (PHASE3 2.60, 2.63, F9).
+  // moving_raw is decoded by the wrapper because the block carries it and is dropped here: no
+  // tenth state interface is added by Phase 3 (PHASE3 2.12, F8).
   FeedbackSample s;
-  s.status = bus_.Error;
-  s.position_ticks = bus_.ReadPos(-1);
-  s.speed_ticks = bus_.ReadSpeed(-1);
-  s.load_raw = bus_.ReadLoad(-1);
-  s.current_counts = bus_.ReadCurrent(-1);
-  s.voltage_raw = bus_.ReadVoltage(-1);
-  s.temperature_raw = bus_.ReadTemper(-1);
+  s.status = b.status;
+  s.position_ticks = b.position_ticks;
+  s.speed_ticks = b.speed_ticks;
+  s.load_raw = b.load_raw;
+  s.current_counts = b.current_counts;
+  s.voltage_raw = b.voltage_raw;
+  s.temperature_raw = b.temperature_raw;
   status_bytes_[i] = s.status;
-  // The only call site of unwrap_ticks(), and it is reached only after FeedBack() returned
-  // something other than -1: the accumulator is advanced by a sample that actually arrived and by
-  // nothing else, so a frozen publication is a frozen interface and not a frozen count
-  // (PHASE2_SPEC 8.9). It is the identity for a joint that does not unwrap.
+  // The only call site of unwrap_ticks(), and it is reached only for a sample that really
+  // arrived -- the `valid` flag is the only gate: the accumulator is advanced by an arrived
+  // sample and by nothing else, so a frozen publication is a frozen interface and not a frozen
+  // count (PHASE2_SPEC 8.9, PHASE3 F17). It is the identity for a joint that does not unwrap.
   const int64_t uticks = unwrap_ticks(i, static_cast<int32_t>(s.position_ticks));
   const JointStates v = decode(s, uticks, scales_of(i));
   // A plain copy. Every unit conversion and every `sign` lives in decode(), so there is exactly
@@ -1726,7 +2184,6 @@ bool WaveshareServos::feedback(size_t i)
   status_states_[i] = v.status;
   torq_states_[i] = v.torque;
   measured_[i] = true;
-  return true;
 }
 
 }  // namespace waveshare_servos

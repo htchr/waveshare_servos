@@ -34,7 +34,7 @@ VQ = 50 * TICK                                   # 0.07670 rad/s, reported-veloc
 CURRENT_PER_COUNT_A = 0.006                      # param_parsing.hpp kCurrentPerCountA
 TORQUE_CONSTANT_NM_PER_A = 0.8825985             # param_parsing.hpp kTorqueConstantNmPerA
 NM_PER_KGFCM = 0.0980665                         # units.hpp kNmPerKgfCm
-IO_TIMEOUT_MS = 20
+IO_TIMEOUT_MS = 5                                # param_parsing.hpp kIoTimeoutMs (PHASE3 5.19)
 PING_ATTEMPTS = 3
 MAX_READ_FAILS = 50
 ALLOW_MISSING_SERVOS = False
@@ -222,6 +222,68 @@ T90_FAST_MAX = 0.70        # s, t90 at acc=150; see the derivation above
 # eight of them above even the old 4.0 - or the least-squares slope metric above.  Not a tighter
 # number on this threshold.
 T90_RATIO_MIN = 2.5        # t90(acc=10)/t90(acc=150); see the derivation above
+
+# Cost bounds at four servos, 100 Hz, 1 Mbaud (Phase 3). Before Phase 3 the read cycle was four
+# sequential FeedBack() round trips -- 3.072 ms measured at this cadence, probe 3 Q1b -- and the
+# driver measured 3.0646 ms (phase2 hil_out4 H1.read_ms), i.e. the driver adds nothing above the
+# bus. Phase 3 makes it one sync read of four ids.
+#
+# MEASURED, not predicted (PHASE3 5.11's binding rule, applied at 5.31 step 11): the mean H1 read
+# average of the three candidate A/B runs is 1.64538 ms (phase3_evidence/cand_r1 1.64125,
+# cand_r2 1.64664, cand_r3 1.64823), against the 1.734 ms probe 3 Q1 predicted. The rule is
+# ceil_to_0.05(mean + 0.35): 1.64538 + 0.35 = 1.99538 -> 2.00. The 0.35 is 15x the 0.023 ms
+# HEAD-vs-HEAD spread of 30 identical-code Phase 1 runs -- the only run-to-run variation ever
+# measured in this statistic here. NOT a tail factor: this bounds a MEAN. The recomputed value is
+# SMALLER than the 2.15 this constant shipped with, so it is tightened, not relaxed. These are
+# BENCH bounds for four servos, not a promise about any other robot.
+READ_MS_AVG_MAX = 2.00
+# The max is cumulative since activation and is dominated by the non-RT kernel, not by the bus:
+# 30 runs of IDENTICAL Phase 1 code spanned 3.64..4.98 ms at a 3.06 mean, an excursion of up to
+# 1.92 ms over a ~2000-cycle window. Re-derived on the measured mean rather than the predicted
+# one: 1.64538 + 1.92 = 3.5654, rounded up to 3.60 (it was 1.73 + 1.92 -> 4.00). Every gated
+# candidate window clears it with 0.94 ms to spare -- the worst read max any sync-read H1 or H9
+# produced is 2.6571 ms (cand_full_r1 H1), over a 2.17..2.66 ms span across nine such windows.
+# SCOPE: a ~2000-cycle window, i.e. the 9 s / 12 s captures of H1 and H9 ONLY. It does not
+# transfer to the soak, whose window is 30x longer -- see h11 (PHASE3 5.15), which deliberately
+# does not gate on it.
+READ_MS_MAX_MAX = 3.60
+# Write: 1.4521 ms before (hil_out4), of which SyncWriteSpe for two wheels is 1.152 ms at this
+# cadence (probe 2 Q1b). MEASURED (5.11's binding rule): the three candidate A/B runs mean
+# 0.013578 ms (cand_r1 0.01402, cand_r2 0.01341, cand_r3 0.01331) -- 22x below the 0.30 ms the
+# spec predicted, because what Phase 3 removed was two blocking Ack() round trips inside
+# SyncWriteSpe, not airtime, so there is no residual driver-side cost to leave room for.
+# ceil_to_0.05(0.013578 + 0.30) = 0.35, again tighter than the 0.60 shipped.
+WRITE_MS_AVG_MAX = 0.35
+# Worst write excursion above the mean seen in Phase 1/2 is 0.88 ms (2.3240 - 1.4475, recon
+# hil_and_docs.md 4.1, hil_cand_r3_b S2 enforce true). 0.30 + 0.88 = 1.18, rounded up to 1.50.
+# NOT re-derived on the measured mean, deliberately: 5.11's binding rule covers the two avg
+# constants only, and unlike the read max the write max is not stationary enough to bound. Across
+# the nine gated sync-read windows it spans 0.0434..0.6287 ms, a 14x spread (worst: cand_t20_r1
+# H9), and the three ten-minute soaks span 0.0645..0.4539 ms. 0.013578 + 0.88 would give 0.90,
+# which the worst observed value already reaches 70 % of. The same principle 5.11 states for
+# raising a bound applies to lowering one: do not fit a threshold to a tail nobody has
+# characterised (PHASE3 section 8 Q10). Same ~2000-cycle scope caveat as READ_MS_MAX_MAX.
+WRITE_MS_MAX_MAX = 1.50
+
+# The soak of PHASE3 5.13. Probe 3 Q1 saw 0 failures in 60 000 sync reads over ten minutes at
+# 100 Hz; with zero events the honest statement is an upper bound, and the rule of three gives
+# 3/60000 = 50 per million at 95 % confidence. The gate therefore asserts only that this bench is
+# no worse than the bound its own measurement could resolve. It is a RATE, not a count, so a
+# shortened soak (WAVESHARE_HIL_SOAK_S) uses the same threshold.
+SOAK_FAIL_PER_MILLION_MAX = 50.0
+# Below this the rule of three cannot resolve 50 per million at all (3/30000 = 100), so the row
+# SKIPs rather than passing vacuously. 30 000 transactions is five minutes at 100 Hz.
+SOAK_MIN_TRANSACTIONS = 30000
+# Probe 3 Q1 measured a longest consecutive failing run of 0 over 60 000 cycles. Two allows an
+# isolated hiccup and still fires 25x before max_read_fails (50) would drop a servo.
+SOAK_WORST_CONSECUTIVE_MAX = 2
+# PHASE3 5.13 makes a turning wheel part of the soak's definition -- "a stationary bus is not the
+# bus a robot runs on" -- but the scenario asks for it with one unchecked `topic pub`, and no other
+# H11 row can tell a spinning bus from a stopped one (a constant position with a zero velocity
+# satisfies g1a/g1b/g1c/g2 exactly, and the failed-transaction rate of a stopped bus is not the
+# number jazzy.md item 3 asks for). Half of the commanded 1.0 rad/s: six reported-velocity quanta
+# (VQ = 0.0767 rad/s) above zero, and far enough below 1.0 to survive any plausible load droop.
+SOAK_WHEEL_MIN_RAD_S = 0.5
 
 NAN = float('nan')
 PI = math.pi
@@ -484,6 +546,40 @@ def cycle_ms(text, which):
     return median([float(a) for a, _ in found]) / 1e3, max(float(b) for _, b in found) / 1e3
 
 
+BUS_TOTALS = re.compile(
+    r'bus totals: transactions (\d+), failed (\d+) \([\d.]+ per million\), '
+    r'worst consecutive (\d+), dropped (\d+)')
+# The per-servo tail the driver is required to print (PHASE3 5.14, frozen string L5). The rate row
+# bounds the aggregate, so this is parsed for two reasons only: so a FAIL can say which ids the
+# failures fell on, and so H11.per_servo can assert the tail is there at all (5.30 row 23 -- an
+# aggregate alone does not satisfy jazzy.md item 3's "per servo").
+BUS_TOTALS_TAIL = re.compile(r'\bid(\d+) (\d+)')
+
+
+def bus_totals(text):
+    """Return the LAST (transactions, failures, worst_consecutive, dropped) the driver printed."""
+    found = BUS_TOTALS.findall(text)
+    if not found:
+        return None
+    return tuple(int(x) for x in found[-1])
+
+
+def bus_totals_tail(text):
+    """Return the LAST totals line's [(id, failures), ...] pairs, or [] when it carries none."""
+    lines = [line for line in text.splitlines() if BUS_TOTALS.search(line)]
+    if not lines:
+        return []
+    # Only what follows the last '[' on that line: the aggregate ahead of it carries bare numbers
+    # too, and a tail-shaped match found there would be a count nobody printed.
+    _, bracket, tail = lines[-1].rpartition('[')
+    return [(int(i), int(n)) for i, n in BUS_TOTALS_TAIL.findall(tail)] if bracket else []
+
+
+def fail_per_million(transactions, failures):
+    """Failures per million transactions, or NaN when nothing was attempted."""
+    return NAN if not transactions else 1e6 * failures / transactions
+
+
 def kv(**facts):
     """Render row facts as stable key=value text."""
     return ' '.join('%s=%s' % (k, '%.4f' % x if isinstance(x, float) else x)
@@ -601,7 +697,8 @@ def h1(R, S, C):
          tol='100+-2', n=len(t))
     R.ck('gap', max_gap(t) <= 0.050, hz_gap_s=max_gap(t), bound=0.050)
     diag = S.txt('diagnostics.txt')
-    for which, avg_bound, max_bound in (('read', 4.0, 6.0), ('write', 2.0, 4.0)):
+    for which, avg_bound, max_bound in (('read', READ_MS_AVG_MAX, READ_MS_MAX_MAX),
+                                        ('write', WRITE_MS_AVG_MAX, WRITE_MS_MAX_MAX)):
         avg, worst = cycle_ms(diag, which)
         C['h1_%s_ms' % which] = avg
         if math.isnan(avg):
@@ -1046,14 +1143,32 @@ def h9(R, S, C):
     R.ck('phantom', not wrong, ', '.join(wrong) or 'finite, and zero where it must be (status '
          'alone may be NaN)')
     diag = S.txt('diagnostics.txt')
-    read_avg, write_avg = cycle_ms(diag, 'read')[0], cycle_ms(diag, 'write')[0]
+    read_avg, read_max = cycle_ms(diag, 'read')
+    write_avg, write_max = cycle_ms(diag, 'write')
     stamps = series(rec, real[0])[0]
     if math.isnan(read_avg):
         R.row('cost', 'SKIP', 'no read_cycle.execution_time in /diagnostics')
     else:
-        R.ck('cost', read_avg < 4.0 and write_avg < 2.0 and abs(rate_hz(stamps) - 100.0) <= 2.0,
-             '[no-regression]', read_ms=read_avg, write_ms=write_avg, hz=rate_hz(stamps),
-             interfaces_per_joint=9)
+        # The two max terms are NEW in Phase 3 (5.11): this row asserted averages only before, so
+        # H9 has never checked a maximum. H9's diagnostics capture is 6 s, the same ~2000-cycle
+        # window the two *_MAX_MAX bounds were derived over, so the scope matches -- unlike h11,
+        # which deliberately leaves its maxima ungated.
+        #
+        # The rate term is the known-weak one, and it predates Phase 3. rate_hz() reads
+        # /joint_states header stamps AS RECEIVED BY hil_record.py, so a recorder that misses
+        # messages reads as a control loop that missed cycles. Measured on a healthy bench: a
+        # single ~0.34 s recorder hole drags this term to 95.6 Hz and FAILs the row while the
+        # controller manager's own periodicity.average in the same /diagnostics file reads
+        # 100.0008 Hz and its periodicity.min never fell below 91 Hz -- i.e. no cycle ever ran
+        # long. It happened on both arms (phase3_evidence/SUITE_DIFF.md, cand_r2 and
+        # base_full_r1). The fix, when someone wants it, is to gate on periodicity.average from
+        # /diagnostics, which is what the CM publishes for exactly this purpose; it is left alone
+        # here because Phase 3 does not re-base a pre-existing term it did not cause.
+        R.ck('cost', read_avg < READ_MS_AVG_MAX and write_avg < WRITE_MS_AVG_MAX and
+             read_max < READ_MS_MAX_MAX and write_max < WRITE_MS_MAX_MAX and
+             abs(rate_hz(stamps) - 100.0) <= 2.0,
+             '[no-regression]', read_ms=read_avg, write_ms=write_avg, read_max=read_max,
+             write_max=write_max, hz=rate_hz(stamps), interfaces_per_joint=9)
     plus, minus = [], []
     for j in ('joint3', 'joint4'):
         t, y = iface(rec, j, 'current')
@@ -1107,8 +1222,91 @@ def h10(R, S, C):
          longest_bound=0.40, not_near_a_transition=late)
 
 
+def h11(R, S, C):
+    port_rows(R, S)
+    R.ck('active', S.flag('controllers_active') and S.fact('hw_state') == 'active' and
+         S.logged('unable to ping') == 0, active=S.fact('controllers_active'),
+         hw_state=S.fact('hw_state'), unable_to_ping=S.logged('unable to ping'))
+    totals = bus_totals(S.log)
+    if totals is None:
+        # All four, not three: a row that is simply absent is invisible in the report, and
+        # H11.no_drop and H11.per_servo are both Phase 3 gates (5.30 rows 10 and 23).
+        R.row('transactions', 'SKIP', 'no "bus totals:" line; the stack was killed, not stopped')
+        R.row('fail_rate', 'SKIP', 'no "bus totals:" line')
+        R.row('no_drop', 'SKIP', 'no "bus totals:" line')
+        R.row('per_servo', 'SKIP', 'no "bus totals:" line')
+    else:
+        n, bad, worst, dropped = totals
+        pairs = bus_totals_tail(S.log)
+        named = ('[%s]' % ', '.join('id%d %d' % pair for pair in pairs) if pairs
+                 else '[no per-servo tail]')
+        soak = S.number('soak_s', NAN)
+        expected = 100.0 * soak                       # the bench runs every scenario at 100 Hz
+        R.ck('transactions', n >= 0.95 * expected, seen=n, expected=expected, soak_s=soak)
+        if n < SOAK_MIN_TRANSACTIONS:
+            R.row('fail_rate', 'SKIP', kv(transactions=n, need=SOAK_MIN_TRANSACTIONS))
+        else:
+            rate = fail_per_million(n, bad)
+            # The tail rides in the detail, not in a fact: it is here so a FAIL says which ids the
+            # failures fell on, which is the first question a non-zero rate raises (5.18).
+            R.ck('fail_rate', rate <= SOAK_FAIL_PER_MILLION_MAX and
+                 worst <= SOAK_WORST_CONSECUTIVE_MAX, named, transactions=n, failed=bad,
+                 per_million=rate, bound=SOAK_FAIL_PER_MILLION_MAX, worst_consecutive=worst,
+                 worst_bound=SOAK_WORST_CONSECUTIVE_MAX)
+        R.ck('no_drop', dropped == 0 and S.logged('stopped answering') == 0, dropped=dropped,
+             drop_lines=S.logged('stopped answering'))
+        # 5.30 row 23: jazzy.md item 3 asks for the count PER SERVO, so the bracketed tail of L5 is
+        # required, not a courtesy. Presence only, and deliberately not "one pair per declared
+        # servo": nothing this checker can see says how many servos the run declared, and a gate
+        # that guesses that would fail a healthy bench. A missing tail is unambiguous.
+        R.ck('per_servo', bool(pairs), named, servos=len(pairs))
+    rec = S.rec('steady_soak')
+    names = joints_of(rec)
+    stamps = series(rec, names[0])[0] if names else []
+    diag = S.txt('diagnostics.txt')
+    read_avg, read_max = cycle_ms(diag, 'read')
+    write_avg, write_max = cycle_ms(diag, 'write')
+    if math.isnan(read_avg):
+        R.row('cost', 'SKIP', 'no read_cycle.execution_time in /diagnostics')
+    else:
+        # Averages and rate only. The maxima ride along as facts because they are cumulative
+        # since activation, i.e. the extreme of ~60 000 cycles here against the ~2000 the
+        # READ_MS_MAX_MAX / WRITE_MS_MAX_MAX bounds were derived over (5.15). Gating them here
+        # would fail a healthy bench and then pressure H1's bound upwards.
+        R.ck('cost', read_avg < READ_MS_AVG_MAX and write_avg < WRITE_MS_AVG_MAX and
+             abs(rate_hz(stamps) - 100.0) <= 2.0, '[no-regression]', read_ms=read_avg,
+             write_ms=write_avg, hz=rate_hz(stamps), read_max_ungated=read_max,
+             write_max_ungated=write_max)
+    R.ck('gap', max_gap(stamps) <= 0.050, hz_gap_s=max_gap(stamps), bound=0.050)
+    # The soak's LOAD, which nothing else here checks. hil_check.sh asks for it with one
+    # fire-and-forget `topic pub` whose return value it discards, so a publish that times out
+    # waiting for a matching subscription -- a spawner race, a daemon hiccup, a wheels controller
+    # that is up but not yet matched -- leaves both wheels at 0 rad/s for the full ten minutes, and
+    # every other row still passes. That soak's failed-transaction rate is then measured on a load
+    # PHASE3 5.13 forbids and reported by 5.18 under conditions that did not hold. `all`, not a
+    # mean of the two: one wheel turning is not the recorded load either. A NaN mean (no samples
+    # for that joint) fails the comparison, which is the right direction -- no evidence of motion
+    # is not evidence of motion.
+    turning = [mean(series(rec, joint)[2]) for joint in ('joint3', 'joint4')]
+    R.ck('wheels_turning', all(abs(w) >= SOAK_WHEEL_MIN_RAD_S for w in turning),
+         joint3=turning[0], joint4=turning[1], bound=SOAK_WHEEL_MIN_RAD_S)
+    R.row('cost_max', 'NOTE', kv(read_max=read_max, write_max=write_max) +
+          ' cumulative since activation over the whole soak; UNMEASURED as a bound -- three '
+          'clean soaks are needed to characterise a 60000-cycle extreme')
+    # One dict comprehension, not a comprehension over (name, value) pairs and not dict() over a
+    # generator: flake8-comprehensions rejects both of those (C416, C402) and lint is a test here.
+    hot = {j: max(iface(rec, j, 'temperature')[1], default=NAN) for j in names}
+    R.row('temperature', 'NOTE', kv(**hot) +
+          ' evidence, never a gate: no thermal baseline for a ten-minute spin has been measured')
+    for joint in ('joint3', 'joint4'):
+        gate_rows(R, joint, *series(rec, joint), unwrap=True)
+    for joint in ('joint1', 'joint2'):
+        gate_rows(R, joint, *series(rec, joint))
+
+
 CHECKERS = (('H1', h1), ('H2', h2), ('H3', h3), ('H4', h4), ('H5A', h5a), ('H5B', h5b),
-            ('H5C', h5c), ('H6', h6), ('H7', h7), ('H8', h8), ('H9', h9), ('H10', h10))
+            ('H5C', h5c), ('H6', h6), ('H7', h7), ('H8', h8), ('H9', h9), ('H10', h10),
+            ('H11', h11))
 
 
 def run(run_dir, allowed, seconds, port_free):
@@ -1219,6 +1417,25 @@ def _self_test():
            not flips('effort') and not flips('current') and not flips('torque'),
            'INVERTED_FLIPS drives the H7 rows')
 
+    # The soak parser of PHASE3 5.14/15, clean and defective, the way every other gate here is
+    # proved: a gate that cannot fire is not a gate.
+    clean = ('[INFO] bus totals: transactions 60000, failed 0 (0.0 per million), '
+             'worst consecutive 0, dropped 0 [id1 0]\n')
+    expect(bus_totals(clean) == (60000, 0, 0, 0), 'bus_totals reads the driver totals line')
+    expect(bus_totals('nothing here') is None, 'bus_totals returns None with no totals line')
+    two = clean + clean.replace('transactions 60000', 'transactions 7')
+    expect(bus_totals(two) == (7, 0, 0, 0), 'bus_totals takes the last window, not the first')
+    expect(fail_per_million(60000, 0) == 0.0 <= SOAK_FAIL_PER_MILLION_MAX,
+           'a clean soak passes the failed-transaction bound')
+    expect(fail_per_million(60000, 6) > SOAK_FAIL_PER_MILLION_MAX,
+           'injected 100-per-million failure rate caught by the soak bound')
+    expect(math.isnan(fail_per_million(0, 0)), 'an empty soak is NaN, not a division by zero')
+    # The bracketed tail of L5 is required, not decorative (PHASE3 5.14, 5.30 row 23), so the
+    # parser behind H11.per_servo is proved on a line that has one and a line that does not.
+    expect(bus_totals_tail(two) == [(1, 0)], 'bus_totals_tail reads the last line per-servo tail')
+    expect(bus_totals_tail(clean.replace(' [id1 0]', '')) == [],
+           'a totals line that dropped its per-servo tail is caught')
+
     _self_test_checkers(expect)
 
     print('hil_gates --self-test: %d check(s) failed' % len(failures) if failures
@@ -1228,7 +1445,7 @@ def _self_test():
 
 def _self_test_checkers(expect):
     """
-    Drive h1..h10 and the whole evaluator over a synthetic run tree (hil_fixture.py).
+    Drive h1..h11 and the whole evaluator over a synthetic run tree (hil_fixture.py).
 
     The primitives above cannot see a defect that stops a checker from running at all -- a local
     rebinding a module-level helper, a missing key, a new file label that is never written. That
@@ -1258,6 +1475,7 @@ def _self_test_checkers(expect):
                 continue
             expect(bool(report.rows), '%s runs over the fixture and emits %d row(s)'
                    % (name, len(report.rows)))
+        _self_test_soak_load(expect, root)
         quiet, code = io.StringIO(), None
         try:
             with contextlib.redirect_stdout(quiet):
@@ -1275,6 +1493,51 @@ def _self_test_checkers(expect):
                % (','.join(missing) or 'none'))
     finally:
         shutil.rmtree(root, ignore_errors=True)
+
+
+def _self_test_soak_load(expect, root):
+    """
+    Prove H11.wheels_turning fires, by re-running h11 over the fixture with the wheels stopped.
+
+    The rest of _self_test_checkers deliberately ignores verdicts, but this one row exists only to
+    catch a condition every other H11 row is blind to (PHASE3 5.13's turning wheels), so "the
+    checker ran" is no evidence at all: the row has to be shown passing on the moving fixture and
+    failing on a copy of it with joint3/joint4 held still. Copied into a sibling directory rather
+    than mutated in place -- run() drives the fixture again afterwards, and it walks CHECKERS
+    rather than the directory listing, so the extra directory is inert.
+    """
+    import shutil
+
+    stopped = os.path.join(root, 'H11_wheels_stopped')
+    shutil.rmtree(stopped, ignore_errors=True)
+    shutil.copytree(os.path.join(root, 'H11'), stopped)
+    path = os.path.join(stopped, 'steady_soak.json')
+    recording = _load(path) or {}
+    for sample in recording.get('joint_states', []):
+        for joint in ('joint3', 'joint4'):
+            if joint in sample[2]:
+                sample[3][sample[2].index(joint)] = 0.0     # position: parked, not advancing
+                sample[4][sample[2].index(joint)] = 0.0     # velocity: reported as stopped
+    with open(path, 'w') as handle:
+        json.dump(recording, handle)
+
+    def verdicts(name):
+        report = Report(())
+        report.prefix = 'H11'
+        h11(report, Scenario(root, name), {})
+        return {row['key']: row['verdict'] for row in report.rows}
+
+    moving, still = verdicts('H11'), verdicts('H11_wheels_stopped')
+    expect(moving.get('H11.wheels_turning') == 'PASS',
+           'a soak with the wheels turning passes wheels_turning')
+    expect(still.get('H11.wheels_turning') == 'FAIL',
+           'a stationary soak caught by wheels_turning')
+    # The reason the row had to exist, asserted rather than claimed in a comment. Naming the other
+    # failures keeps this readable when it is a *different* row that broke.
+    others = sorted(key for key, verdict in still.items()
+                    if verdict == 'FAIL' and key != 'H11.wheels_turning')
+    expect(not others, '... and it is the only H11 row that can see a stationary soak '
+                       '(other FAILs: %s)' % (','.join(others) or 'none'))
 
 
 def main(argv):

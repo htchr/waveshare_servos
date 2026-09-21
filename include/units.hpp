@@ -109,18 +109,29 @@ inline double status_to_double(uint8_t status)
   return static_cast<double>(status);
 }
 
-// One servo's feedback block, as the ReadX(-1) accessors hand it back after a single FeedBack().
+// One servo's feedback block (registers 56..70) on its way into decode(), in raw servo units.
+// WaveshareServos::apply_feedback() is the ONLY thing that fills it, on both transports: the
+// sync-read burst and the per-servo unicast read decode the same fifteen bytes with the same
+// ServoBus decoder, so the two publish the same nine doubles by construction (PHASE3 2.36, F9).
+// No `ReadX(-1)` accessor and no `FeedBack()` call is left on any driver path; the field comments
+// name the accessor whose exact bit layout each value still keeps, because that equality is what
+// PHASE3 F10 pins, not the call that produced it.
 struct FeedbackSample
 {
-  // Every member is defaulted: chunk 6 fills this struct field by field, and a field left unset on
-  // some path has to read 0 rather than whatever was on the stack -- no warning catches that one.
-  int position_ticks = 0;     // ReadPos(-1)      (decode() takes the unwrapped count instead)
-  int speed_ticks = 0;        // ReadSpeed(-1),   sign-magnitude on bit 15
-  int load_raw = 0;           // ReadLoad(-1),    sign-magnitude on bit 10
-  int current_counts = 0;     // ReadCurrent(-1), sign on bit 15; never set by this firmware (3.2)
-  int voltage_raw = 0;        // ReadVoltage(-1)
-  int temperature_raw = 0;    // ReadTemper(-1)
-  uint8_t status = 0;         // SCS::Error, captured right after FeedBack()
+  // Every member is defaulted: apply_feedback() fills this struct field by field, and a field left
+  // unset on some path has to read 0 rather than whatever was on the stack -- no warning catches
+  // that one.
+  int position_ticks = 0;     // reg 56, as ReadPos(-1)      (decode() takes the unwrapped count)
+  int speed_ticks = 0;        // reg 58, as ReadSpeed(-1),   sign-magnitude on bit 15
+  int load_raw = 0;           // reg 60, as ReadLoad(-1),    sign-magnitude on bit 10
+  int current_counts = 0;     // reg 69, as ReadCurrent(-1), sign on bit 15; unset by this firmware
+  int voltage_raw = 0;        // reg 62, as ReadVoltage(-1)
+  int temperature_raw = 0;    // reg 63, as ReadTemper(-1)
+  // Byte 4 of the frame that carried the fifteen bytes above -- the sync path copies it out of the
+  // burst and the per-servo path takes SCS::Error straight after its Read(), which is the same
+  // byte. Never a later re-read of the shared SCS::Error, so joint i's fault edge cannot depend on
+  // what joint i-1's branch did (PHASE3 2.49, F18).
+  uint8_t status = 0;
 };
 
 // The per-joint constants decode() needs. Defaults are the Phase 1 values.

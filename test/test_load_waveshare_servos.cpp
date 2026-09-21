@@ -48,7 +48,10 @@ using waveshare_servos_test::bench_joints;
 using waveshare_servos_test::command;
 using waveshare_servos_test::example_description;
 using waveshare_servos_test::example_joints;
+using waveshare_servos_test::example_velocity_joint;
 using waveshare_servos_test::joint_param;
+using waveshare_servos_test::joint_xml;
+using waveshare_servos_test::kUrdfJoint4;
 using waveshare_servos_test::kBenchName;
 using waveshare_servos_test::kEmptyParam;
 using waveshare_servos_test::kExampleName;
@@ -573,9 +576,10 @@ namespace
 // value is the compiled-in default, and the two doubles print with %.7g (%g would round
 // 0.8825985 to 0.882599).
 constexpr char kDefaultConfigurationLine[] =
-  "bus configuration: port '/dev/ttyACM0', 1000000 baud, protocol 'sms_sts', io timeout 20 ms, "
+  "bus configuration: port '/dev/ttyACM0', 1000000 baud, protocol 'sms_sts', io timeout 5 ms, "
   "3 ping attempt(s), drop a servo after 50 consecutive read failures, allow_missing_servos false, "
-  "4096 encoder steps per revolution, 0.006 A per current count, 0.8825985 N m/A";
+  "feedback_mode 'auto', 4096 encoder steps per revolution, 0.006 A per current count, "
+  "0.8825985 N m/A";
 
 // The configuration lines of PHASE2_SPEC 4.5, in the order they were logged. on_init logs exactly
 // one per successful load and none at all when a value is rejected.
@@ -588,6 +592,58 @@ std::vector<std::string> configuration_lines(const LogCapture & logs)
     }
   }
   return lines;
+}
+
+// The two timeout advisories of PHASE3 2.82 and 2.85, in the order they were logged. Selecting by
+// the parameter name rather than by the whole sentence lets a case say "exactly one" without
+// having to know which of the two fired, which is the point of
+// `the_two_timeout_warnings_never_contradict_each_other`.
+std::vector<std::string> timeout_warnings(const LogCapture & logs)
+{
+  std::vector<std::string> selected;
+  for (const auto & message : logs.messages(RCUTILS_LOG_SEVERITY_WARN)) {
+    if (message.find("io_timeout_ms") != std::string::npos) {
+      selected.push_back(message);
+    }
+  }
+  return selected;
+}
+
+// The INFO of PHASE3 2.82's third rung: a DEFAULTED timeout below the floor is raised to it, so
+// that a stock description on a ten-joint bus keeps the fast path instead of silently demoting.
+std::vector<std::string> raise_infos(const LogCapture & logs)
+{
+  std::vector<std::string> selected;
+  for (const auto & message : logs.messages(RCUTILS_LOG_SEVERITY_INFO)) {
+    if (message.rfind("io_timeout_ms raised", 0) == 0) {
+      selected.push_back(message);
+    }
+  }
+  return selected;
+}
+
+// A description with `count` velocity joints, ids 1..count. The sync-read floor scales with the
+// joint count and only passes the 5 ms default from ten joints up -- min_io_timeout_ms(10) is 6 ms
+// and (20) is 9 ms (PHASE3 R9) -- so the upper rungs of 2.82's ladder are unreachable with the
+// four joints the example carries. Every joint named in a <ros2_control> block must also exist in
+// the URDF, so the ones past joint4 are added there as continuous joints, the way kUrdfJoint4 adds
+// the second wheel.
+std::string many_joint_description(size_t count, const std::string & declared)
+{
+  std::string urdf = std::string(ros2_control_test_assets::urdf_head) + kUrdfJoint4;
+  std::string block;
+  for (size_t i = 1; i <= count; i++) {
+    const std::string name = "joint" + std::to_string(i);
+    if (i > 4) {
+      urdf += "<link name=\"" + name + "_link\"/>\n<joint name=\"" + name +
+        "\" type=\"continuous\">\n<parent link=\"base_link\"/>\n<child link=\"" + name +
+        "_link\"/>\n<axis xyz=\"0 0 1\"/>\n</joint>\n";
+    }
+    block += joint_xml(example_velocity_joint(name, std::to_string(i)));
+  }
+  urdf += "<ros2_control name=\"" + std::string(kExampleName) + "\" type=\"system\">\n<hardware>\n";
+  urdf += std::string("<plugin>") + kPlugin + "</plugin>\n" + declared + "</hardware>\n" + block;
+  return urdf + "</ros2_control>\n" + ros2_control_test_assets::urdf_tail;
 }
 
 // The "ignoring it" warnings of PHASE2_SPEC 4.3, in the order they were logged.
@@ -638,7 +694,12 @@ Rejection hw_reject(
 
 std::vector<Rejection> hw_param_rejections()
 {
-  const std::string timeout = "an integer between 1 and 1000 (milliseconds)";
+  // PHASE3 R8 / 5.20a: the lower bound moved from 1 to 2, and the sentence explains why in terms
+  // of the batched read, because a user who sees "out of range" for 1 ms deserves the reason.
+  const std::string timeout =
+    "an integer between 2 and 1000 (milliseconds); 1 ms is not enough for a batched feedback "
+    "read, which needs about 0.48 ms plus 0.29 ms per servo";
+  const std::string modes = "a known feedback mode; expected 'auto', 'sync_read' or 'per_servo'";
   const std::string attempts = "an integer between 1 and 10";
   const std::string fails = "an integer between 1 and 1000000";
   const std::string steps = "an even integer between 2 and 32768 (encoder steps per revolution)";
@@ -671,8 +732,22 @@ std::vector<Rejection> hw_param_rejections()
     hw_reject(
       "protocol_unknown", "protocol", "feetech",
       malformed("protocol", "feetech", "a known protocol; expected 'sms_sts'")),
+    // PHASE3 2.71 / 2.126. A misspelt transport must not fall back to a working default: the whole
+    // point of the parameter is to pin the read path when the firmware's behaviour is in question.
+    hw_reject(
+      "feedback_mode_empty", "feedback_mode", "",
+      empty_param("feedback_mode", "'auto', 'sync_read' or 'per_servo'")),
+    hw_reject(
+      "feedback_mode_unknown", "feedback_mode", "syncread",
+      malformed("feedback_mode", "syncread", modes)),
     hw_reject(
       "io_timeout_ms_zero", "io_timeout_ms", "0", out_of_range("io_timeout_ms", "0", timeout)),
+    // PHASE3 4.T52. 1 ms was legal through Phase 2 and is now refused outright: at 1 ms a sync
+    // read of four servos fails 98.55 %, and 8 of 3000 "clean" reads at that setting were the
+    // PREVIOUS cycle's frames, with correct headers, ids, slots, lengths and checksums [P3 Q4/Q6].
+    // A setting that silently publishes stale samples as fresh ones must not be reachable.
+    hw_reject(
+      "io_timeout_ms_one", "io_timeout_ms", "1", out_of_range("io_timeout_ms", "1", timeout)),
     hw_reject(
       "io_timeout_ms_above_max", "io_timeout_ms", "1001",
       out_of_range("io_timeout_ms", "1001", timeout)),
@@ -775,10 +850,14 @@ TEST_F(WaveshareServosLoad, explicit_hardware_params_appear_in_the_configuration
   std::string declared = hardware_param("port", "/dev/ttyUSB1");
   declared += hardware_param("baudrate", "115200");
   declared += hardware_param("protocol", "sms_sts");
-  declared += hardware_param("io_timeout_ms", "5");
+  // 7 and not 5: 5 became the default in PHASE3 5.19, and a column that reads the same whether
+  // the parameter was honoured or ignored proves nothing. 7 is above min_io_timeout_ms(4) == 3 and
+  // below the 8 ms ceiling WARN, so neither timeout advisory fires here (PHASE3 5.20).
+  declared += hardware_param("io_timeout_ms", "7");
   declared += hardware_param("ping_attempts", "1");
   declared += hardware_param("max_read_fails", "7");
   declared += hardware_param("allow_missing_servos", "true");
+  declared += hardware_param("feedback_mode", "sync_read");
   declared += hardware_param("encoder_steps", "1024");
   declared += hardware_param("current_per_count_a", "0.0065");
   declared += hardware_param("torque_constant_nm_per_a", "1.5");
@@ -786,14 +865,20 @@ TEST_F(WaveshareServosLoad, explicit_hardware_params_appear_in_the_configuration
   hardware_interface::ResourceManager rm(params, false);
   ASSERT_TRUE(rm.load_and_initialize_components(params));
 
-  // exactly one line, and every one of the ten values is the declared one. A repeated <param>
+  // exactly one line, and every one of the eleven values is the declared one. A repeated <param>
   // keeps the last value with no diagnostic from the parser, so this line is the user's only check
   EXPECT_THAT(
     configuration_lines(logs_),
     ElementsAre(
-      "bus configuration: port '/dev/ttyUSB1', 115200 baud, protocol 'sms_sts', io timeout 5 ms, "
+      "bus configuration: port '/dev/ttyUSB1', 115200 baud, protocol 'sms_sts', io timeout 7 ms, "
       "1 ping attempt(s), drop a servo after 7 consecutive read failures, allow_missing_servos "
-      "true, 1024 encoder steps per revolution, 0.0065 A per current count, 1.5 N m/A"));
+      "true, feedback_mode 'sync_read', 1024 encoder steps per revolution, 0.0065 A per current "
+      "count, 1.5 N m/A"));
+  // All eleven names are in kKnownHardwareParams. Parsing a value and listing its name are two
+  // separate edits (PHASE3 2.71 item 1), and a name left out of the table is still parsed
+  // correctly -- the only visible symptom is the driver announcing it ignores a parameter it is
+  // in fact honouring, which is what this assertion catches.
+  EXPECT_THAT(unknown_parameter_warnings(logs_), IsEmpty());
   EXPECT_THAT(logs_.messages(RCUTILS_LOG_SEVERITY_FATAL), IsEmpty());
   EXPECT_FALSE(process_has_serial_port_open());
 }
@@ -808,6 +893,237 @@ TEST_F(WaveshareServosLoad, protocol_is_normalised_to_lower_case)
   EXPECT_THAT(configuration_lines(logs_), ElementsAre(HasSubstr("protocol 'sms_sts'")));
   EXPECT_THAT(logs_.messages(RCUTILS_LOG_SEVERITY_FATAL), IsEmpty());
   EXPECT_FALSE(process_has_serial_port_open());
+}
+
+TEST_F(WaveshareServosLoad, feedback_mode_is_normalised_to_lower_case)
+{
+  auto params = resource_manager_params(
+    example_description(example_joints(), "", hardware_param("feedback_mode", "Per_Servo")));
+  hardware_interface::ResourceManager rm(params, false);
+  ASSERT_TRUE(rm.load_and_initialize_components(params));
+
+  EXPECT_THAT(configuration_lines(logs_), ElementsAre(HasSubstr("feedback_mode 'per_servo'")));
+  // The name has to be in kKnownHardwareParams as well as parsed, or this same load also tells
+  // the user the parameter was ignored (PHASE3 2.71 item 1).
+  EXPECT_THAT(unknown_parameter_warnings(logs_), IsEmpty());
+  EXPECT_THAT(logs_.messages(RCUTILS_LOG_SEVERITY_FATAL), IsEmpty());
+  EXPECT_FALSE(process_has_serial_port_open());
+}
+
+// ---------------------------------------------------------------------------------------------
+// PHASE3 2.82 (R10): the four-way ladder that io_timeout_ms and feedback_mode form together. The
+// floor is ServoBus::min_io_timeout_ms(min(joints, 30)) -- 3 ms at four joints, 6 at ten, 9 at
+// twenty (R9) -- and what happens below it depends on whether the user chose the value and on
+// which transport was asked for.
+
+// 4.T53 / 3.39. The default is the one value a user gets without asking, so it must sit above the
+// floor and below the ceiling on the reference bench: five servos' worth of headroom either way.
+TEST_F(WaveshareServosLoad, the_default_io_timeout_is_five_milliseconds)
+{
+  auto params = resource_manager_params(robot_description(kExampleName, example_joints()));
+  hardware_interface::ResourceManager rm(params, false);
+  ASSERT_TRUE(rm.load_and_initialize_components(params));
+
+  EXPECT_THAT(configuration_lines(logs_), ElementsAre(HasSubstr("io timeout 5 ms")));
+  // 5 ms clears min_io_timeout_ms(4) == 3 and stays under the 8 ms dead-servo ceiling, so a stock
+  // four-joint description must load in silence.
+  EXPECT_THAT(timeout_warnings(logs_), IsEmpty());
+  EXPECT_THAT(raise_infos(logs_), IsEmpty());
+  EXPECT_THAT(logs_.messages(RCUTILS_LOG_SEVERITY_FATAL), IsEmpty());
+}
+
+// 3.39, with R9's floor and R10's response: a USER-SET value below the floor under 'auto' warns
+// with L3's frozen text and latches the per-servo path, which is the one transport measured
+// reliable at every setting down to 1 ms [P3 Q2].
+TEST_F(WaveshareServosLoad, a_timeout_below_the_sync_read_floor_warns_with_the_joint_count)
+{
+  auto params = resource_manager_params(
+    example_description(example_joints(), "", hardware_param("io_timeout_ms", "2")));
+  hardware_interface::ResourceManager rm(params, false);
+  ASSERT_TRUE(rm.load_and_initialize_components(params));
+
+  EXPECT_THAT(
+    timeout_warnings(logs_),
+    ElementsAre(
+      "io_timeout_ms 2 is below the 3 ms a sync read of 4 servos needs here; using one feedback "
+      "read per servo"));
+  // The latch is visible in the configuration line: the user asked for nothing, got 'auto', and
+  // the driver reports the transport it will actually use rather than the word it parsed.
+  EXPECT_THAT(configuration_lines(logs_), ElementsAre(HasSubstr("feedback_mode 'per_servo'")));
+  // A user-set value is never rewritten -- it is also the cost of a dead servo, which is theirs
+  // to choose (2.82, 4.T54).
+  EXPECT_THAT(configuration_lines(logs_), ElementsAre(HasSubstr("io timeout 2 ms")));
+  EXPECT_THAT(raise_infos(logs_), IsEmpty());
+  EXPECT_THAT(logs_.messages(RCUTILS_LOG_SEVERITY_FATAL), IsEmpty());
+}
+
+// 2.82's first rung: per_servo asks no question of the floor at all, because a single FeedBack
+// waits for one 21-byte reply and survives every setting the range still allows.
+TEST_F(WaveshareServosLoad, feedback_mode_per_servo_is_never_judged_against_the_sync_read_floor)
+{
+  std::string declared = hardware_param("io_timeout_ms", "2");
+  declared += hardware_param("feedback_mode", "per_servo");
+  auto params = resource_manager_params(example_description(example_joints(), "", declared));
+  hardware_interface::ResourceManager rm(params, false);
+  ASSERT_TRUE(rm.load_and_initialize_components(params));
+
+  EXPECT_THAT(timeout_warnings(logs_), IsEmpty());
+  EXPECT_THAT(raise_infos(logs_), IsEmpty());
+  EXPECT_THAT(configuration_lines(logs_), ElementsAre(HasSubstr("io timeout 2 ms")));
+  EXPECT_THAT(logs_.messages(RCUTILS_LOG_SEVERITY_FATAL), IsEmpty());
+}
+
+// 2.126 / 2.82's last rung. Asking for sync_read and then starving it is the one combination the
+// driver cannot satisfy in any degraded way, so it refuses the description instead of quietly
+// running the transport the user ruled out.
+TEST_F(WaveshareServosLoad, feedback_mode_sync_read_refuses_an_io_timeout_below_the_floor)
+{
+  std::string declared = hardware_param("io_timeout_ms", "2");
+  declared += hardware_param("feedback_mode", "sync_read");
+  auto params = resource_manager_params(example_description(example_joints(), "", declared));
+  hardware_interface::ResourceManager rm(params, false);
+
+  EXPECT_FALSE(rm.load_and_initialize_components(params));
+  EXPECT_THAT(
+    logs_.messages(RCUTILS_LOG_SEVERITY_FATAL),
+    ElementsAre(
+      "hardware parameter 'io_timeout_ms' is '2', below the 3 ms a sync read of 4 servos needs; "
+      "feedback_mode is 'sync_read', which rules out the per-servo path that would survive it, so "
+      "raise io_timeout_ms to at least 3 or use 'auto'"));
+  EXPECT_THAT(configuration_lines(logs_), IsEmpty());
+  EXPECT_FALSE(process_has_serial_port_open());
+}
+
+// 2.126 / 2.82's third rung, and the reason the ladder distinguishes a defaulted value from a
+// user-set one at all: ten joints is where min_io_timeout_ms passes the 5 ms default, and a stock
+// description must not lose the fast path to a number nobody chose.
+TEST_F(WaveshareServosLoad, a_defaulted_io_timeout_is_raised_to_the_floor_instead_of_demoting)
+{
+  auto params = resource_manager_params(many_joint_description(10, ""));
+  hardware_interface::ResourceManager rm(params, false);
+  ASSERT_TRUE(rm.load_and_initialize_components(params));
+
+  EXPECT_THAT(
+    raise_infos(logs_),
+    ElementsAre("io_timeout_ms raised from 5 to 6 ms for a sync read of 10 servos"));
+  EXPECT_THAT(timeout_warnings(logs_), IsEmpty());
+  // The raise is what the driver will use, so it is what the configuration line reports, and the
+  // transport the user never chose is still 'auto'.
+  EXPECT_THAT(configuration_lines(logs_), ElementsAre(HasSubstr("io timeout 6 ms")));
+  EXPECT_THAT(configuration_lines(logs_), ElementsAre(HasSubstr("feedback_mode 'auto'")));
+  EXPECT_THAT(logs_.messages(RCUTILS_LOG_SEVERITY_FATAL), IsEmpty());
+}
+
+// 3.39 with R11's threshold. Above 8 ms the setting is not wrong, it is expensive: the timeout is
+// what one non-answering servo costs in every cycle that polls it, measured at 1.00-1.03x the
+// setting from 2 to 50 ms [P1 Q7], and a 100 Hz period is 10 ms.
+TEST_F(WaveshareServosLoad, a_timeout_above_eight_milliseconds_warns_about_a_dead_servo)
+{
+  auto params = resource_manager_params(
+    example_description(example_joints(), "", hardware_param("io_timeout_ms", "20")));
+  hardware_interface::ResourceManager rm(params, false);
+  ASSERT_TRUE(rm.load_and_initialize_components(params));
+
+  EXPECT_THAT(timeout_warnings(logs_), ElementsAre(HasSubstr("a 100 Hz loop has 10 ms")));
+  // It is an advisory about a cost, not a verdict on the configuration (2.85): a slower loop or a
+  // deliberately patient bus is legitimate, and the line must say so.
+  EXPECT_THAT(timeout_warnings(logs_), ElementsAre(HasSubstr("legitimate")));
+  EXPECT_THAT(logs_.messages(RCUTILS_LOG_SEVERITY_FATAL), IsEmpty());
+}
+
+// The whole content of R11 is the number 8, and 20 ms is above both it and the max(10, floor) of
+// the superseded 3.8, so the case above cannot tell the two apart. Four joints put the floor at 3,
+// which makes 9 ms the one setting that is above max(8, 3) and below max(10, 3). The 8 ms arm pins
+// the other side of the same boundary: the comparison is strictly above the ceiling, not at it.
+TEST_F(WaveshareServosLoad, the_dead_servo_ceiling_is_eight_milliseconds_not_ten)
+{
+  auto at_the_ceiling = resource_manager_params(
+    example_description(example_joints(), "", hardware_param("io_timeout_ms", "8")));
+  hardware_interface::ResourceManager silent(at_the_ceiling, false);
+  ASSERT_TRUE(silent.load_and_initialize_components(at_the_ceiling));
+  EXPECT_THAT(timeout_warnings(logs_), IsEmpty());
+
+  // The capture accumulates across both loads, so "exactly one" below also re-states that the
+  // 8 ms arm contributed nothing.
+  auto above_it = resource_manager_params(
+    example_description(example_joints(), "", hardware_param("io_timeout_ms", "9")));
+  hardware_interface::ResourceManager warned(above_it, false);
+  ASSERT_TRUE(warned.load_and_initialize_components(above_it));
+  EXPECT_THAT(timeout_warnings(logs_), ElementsAre(HasSubstr("a 100 Hz loop has 10 ms")));
+  EXPECT_THAT(raise_infos(logs_), IsEmpty());
+  EXPECT_THAT(logs_.messages(RCUTILS_LOG_SEVERITY_FATAL), IsEmpty());
+}
+
+// 2.85's mode guard. The ceiling is what one non-answering servo costs a BURST, which waits for
+// the whole reply stream; the per-servo path waits for one 21-byte reply per joint and only pays
+// the timeout for the joint that is actually silent. A user who has already opted out of the burst
+// is not warned about its cost.
+TEST_F(WaveshareServosLoad, the_dead_servo_ceiling_is_never_raised_against_the_per_servo_path)
+{
+  std::string declared = hardware_param("io_timeout_ms", "20");
+  declared += hardware_param("feedback_mode", "per_servo");
+  auto params = resource_manager_params(example_description(example_joints(), "", declared));
+  hardware_interface::ResourceManager rm(params, false);
+  ASSERT_TRUE(rm.load_and_initialize_components(params));
+
+  EXPECT_THAT(timeout_warnings(logs_), IsEmpty());
+  EXPECT_THAT(logs_.messages(RCUTILS_LOG_SEVERITY_FATAL), IsEmpty());
+}
+
+// 2.80: the floor's argument is the CHUNK size, min(joints, sync_read_max_ids), because an id list
+// longer than 30 is split and no single burst ever waits for more than 30 replies. Forty joints is
+// the only shape that separates the clamp from the raw joint count -- min_io_timeout_ms(30) is
+// 12 ms where min_io_timeout_ms(40) would be 16 -- and both the number and the noun in the INFO
+// come from it.
+TEST_F(WaveshareServosLoad, the_sync_read_floor_is_measured_against_one_chunk_not_every_joint)
+{
+  auto params = resource_manager_params(many_joint_description(40, ""));
+  hardware_interface::ResourceManager rm(params, false);
+  ASSERT_TRUE(rm.load_and_initialize_components(params));
+
+  EXPECT_THAT(
+    raise_infos(logs_),
+    ElementsAre("io_timeout_ms raised from 5 to 12 ms for a sync read of 30 servos"));
+  // The raise lands exactly on max(8, floor), so the ceiling of R11 stays quiet: obeying the floor
+  // is never something to be scolded for.
+  EXPECT_THAT(timeout_warnings(logs_), IsEmpty());
+  EXPECT_THAT(configuration_lines(logs_), ElementsAre(HasSubstr("io timeout 12 ms")));
+  EXPECT_THAT(logs_.messages(RCUTILS_LOG_SEVERITY_FATAL), IsEmpty());
+}
+
+// The ladder's rungs are ordered, and this is the order: who chose the value is asked before which
+// transport was asked for, so a number nobody wrote is raised even under 'sync_read'. Reversing
+// the two would refuse a stock ten-joint description that pins the fast path -- the exact
+// combination 2.82 exists to keep working -- and only a value the user actually wrote can reach
+// the FATAL rung.
+TEST_F(WaveshareServosLoad, a_defaulted_timeout_is_raised_even_when_sync_read_is_pinned)
+{
+  auto params = resource_manager_params(
+    many_joint_description(10, hardware_param("feedback_mode", "sync_read")));
+  hardware_interface::ResourceManager rm(params, false);
+  ASSERT_TRUE(rm.load_and_initialize_components(params));
+
+  EXPECT_THAT(
+    raise_infos(logs_),
+    ElementsAre("io_timeout_ms raised from 5 to 6 ms for a sync read of 10 servos"));
+  EXPECT_THAT(timeout_warnings(logs_), IsEmpty());
+  EXPECT_THAT(configuration_lines(logs_), ElementsAre(HasSubstr("feedback_mode 'sync_read'")));
+  EXPECT_THAT(logs_.messages(RCUTILS_LOG_SEVERITY_FATAL), IsEmpty());
+}
+
+// R11: the ceiling is max(8, floor), never a flat 8, so a bus big enough to need more than 8 ms
+// can obey the floor without being scolded for it. Twenty joints put the floor at 9 ms.
+TEST_F(WaveshareServosLoad, the_two_timeout_warnings_never_contradict_each_other)
+{
+  auto params = resource_manager_params(
+    many_joint_description(20, hardware_param("io_timeout_ms", "9")));
+  hardware_interface::ResourceManager rm(params, false);
+  ASSERT_TRUE(rm.load_and_initialize_components(params));
+
+  EXPECT_THAT(timeout_warnings(logs_), IsEmpty());
+  EXPECT_THAT(raise_infos(logs_), IsEmpty());
+  EXPECT_THAT(configuration_lines(logs_), ElementsAre(HasSubstr("io timeout 9 ms")));
+  EXPECT_THAT(logs_.messages(RCUTILS_LOG_SEVERITY_FATAL), IsEmpty());
 }
 
 TEST_F(WaveshareServosLoad, unknown_hardware_param_warns_and_still_loads)

@@ -7,7 +7,8 @@
 #
 # Environment: WAVESHARE_HIL_PORT (default /dev/ttyACM0), WAVESHARE_HIL_OUT (default
 # ./hil_check.d), WAVESHARE_HIL_WS (default: the workspace this package was built from),
-# WAVESHARE_HIL_HELPERS and WAVESHARE_HIL_STOP_WHEELS / _PORT_PROBE (set by CMake).
+# WAVESHARE_HIL_HELPERS and WAVESHARE_HIL_STOP_WHEELS / _PORT_PROBE (set by CMake), and
+# WAVESHARE_HIL_SOAK_S (H11's soak length in seconds, default 600, clamped to at least 40).
 # Exit codes: 0 every check PASS/SKIP or an allowed INCONCLUSIVE; 1 a FAIL; 2 an abort; 77 skip.
 #
 # The safety machinery of PHASE2_SPEC 12.4 -- the clean-environment re-exec, HIL_TAG, killing
@@ -53,6 +54,7 @@ if [ -z "${HIL_CLEAN:-}" ]; then
     WAVESHARE_HIL_WS="$WS" WAVESHARE_HIL_HELPERS="$HELPERS" \
     WAVESHARE_HIL_STOP_WHEELS="$STOP_WHEELS" WAVESHARE_HIL_PORT_PROBE="$PORT_PROBE" \
     WAVESHARE_HIL_SCENARIOS="${WAVESHARE_HIL_SCENARIOS:-}" \
+    WAVESHARE_HIL_SOAK_S="${WAVESHARE_HIL_SOAK_S:-}" \
     bash --noprofile --norc "${BASH_SOURCE[0]}"
 fi
 
@@ -290,15 +292,19 @@ scenario_end() {
 }
 
 # ------------------------------------------------------------------ the stack under test
-# $1 = xacro arguments, $2 = the wheels joint list for the controller
+# $1 = xacro arguments, $2 = the wheels joint list for the controller, $3 = the stack watchdog in
+# seconds (default 420). The watchdog is what SIGINTs a stack that outlives its scenario, so it
+# has to be longer than the scenario: H11 soaks for ten minutes and passes its own (PHASE3 5.13).
+# Every other scenario is far inside 420 -- H9's 40 s recording is the longest.
 start_stack() {
+  local watchdog=${3:-420}
   # port:= first, so a scenario argument can still override it deliberately
   xacro "$HELPERS/descriptions/bench.urdf.xacro" "port:=$PORT" $1 > "$SDIR/robot.urdf" || return 1
   sed "s/@WHEELS@/$2/" "$HELPERS/controllers/bench.yaml" > "$SDIR/cm.yaml"
   hil_log "starting ros2_control_node ($1)"
   STACK_N=$((${STACK_N:-0} + 1))
   CM_LOG=$SDIR/cm$STACK_N.stdout
-  timeout -s INT 420 "$CM_BIN" --ros-args --params-file "$SDIR/cm.yaml" > "$CM_LOG" 2>&1 &
+  timeout -s INT "$watchdog" "$CM_BIN" --ros-args --params-file "$SDIR/cm.yaml" > "$CM_LOG" 2>&1 &
   CM_WRAP=$!
   # robot_state_publisher takes the description through a parameter FILE, not through
   # -p robot_description:=<urdf>: rcl parses a parameter override as YAML, and a multi-line
@@ -306,7 +312,7 @@ start_stack() {
   python3 -c 'import sys, yaml; yaml.safe_dump({"robot_state_publisher": {"ros__parameters":
     {"robot_description": open(sys.argv[1]).read()}}}, open(sys.argv[2], "w"))' \
     "$SDIR/robot.urdf" "$SDIR/rsp.yaml" || return 1
-  timeout -s INT 430 "$RSP_BIN" --ros-args --params-file "$SDIR/rsp.yaml" \
+  timeout -s INT "$((watchdog + 10))" "$RSP_BIN" --ros-args --params-file "$SDIR/rsp.yaml" \
     > "$SDIR/rsp$STACK_N.stdout" 2>&1 &
   RSP_WRAP=$!
   timeout -s INT 90 ros2 run controller_manager spawner joint_state_broadcaster arm wheels \
@@ -655,6 +661,53 @@ h_H10() {
   scenario_end
 }
 
+# H11: the soak of PHASE3 5.13. Ten minutes of the real Phase 3 cycle -- one sync read of four
+# servos, one position sync write for the arm, one speed sync write for the wheels -- so the
+# failed-transaction rate of jazzy.md item 3 is produced by this harness and not by a hand-run
+# probe. The load matches probe 3 Q1 (100 Hz, 4 read, 2+2 written) except that the wheels turn:
+# a stationary bus is not the bus a robot runs on, and probe 3 Q2 showed the timeout floor is
+# measured under load. That the wheels really did turn is not assumed: h11's wheels_turning row
+# reads it back out of the recording, because a publish that never matched a subscriber would
+# otherwise buy a clean failed-transaction rate on a load 5.13 forbids. Only the last 20 s are
+# recorded: the counters, not the samples, are the measurement, and a ten-minute /joint_states
+# capture is tens of MB for nothing.
+#
+# If WAVESHARE_HIL_SOAK_S is ever raised above 900, raise ctest's TIMEOUT 2400 with it
+# (CMakeLists.txt:278) -- see PHASE3 5.17 for the arithmetic: the measured full-suite duration is
+# 998 s, so 998 + 600 + 40 = 1638 s against a 2400 s ctest timeout, i.e. 762 s of margin.
+h_H11() {
+  scenario_begin H11 || return $?
+  # The tail of this function -- the park move, the 20 s recording, the 12 s diagnostics capture
+  # and the 2 s stop settle -- is about 38 s of the soak, so only the remainder is idled. Clamp
+  # at 0: `sleep -10` is an error, not a short sleep, and a SOAK_S under 40 would otherwise run
+  # the whole scenario with no soak in it and no sign that anything went wrong. 40 is also the
+  # floor the variable itself is clamped to, below the scenario is not a soak at all.
+  local soak=${WAVESHARE_HIL_SOAK_S:-600}
+  [ "$soak" -ge 40 ] 2> /dev/null || soak=40
+  local idle=$((soak - 38))
+  [ "$idle" -lt 0 ] && idle=0
+  # The stack's own watchdog must outlast the soak, or the controller manager takes a SIGINT
+  # mid-idle and there is no driver left to record, to capture /diagnostics from, or to print the
+  # totals line. 180 s of slack covers the stack start, the spawner and the teardown.
+  start_stack "allow_missing:=false nine:=true" "[joint3, joint4]" $((soak + 180))
+  fact soak_s "$soak"
+  move soak_park joint1,joint2 0.0,0.0 2.0
+  # Logged, unlike every other wheel publish in this file: this one IS the soak's load. If it
+  # times out waiting for a matching subscription the ten minutes still run, on a stopped bus,
+  # which is not the load PHASE3 5.13 specifies. h11's wheels_turning row is what FAILs the run;
+  # this line is what tells the reader why, in run.log, without reading the recording.
+  r2 10 topic pub --once /wheels/commands std_msgs/msg/Float64MultiArray \
+    "{data: [1.0, 1.0]}" > /dev/null 2>&1 || hil_log "soak wheel command rc=$?"
+  sleep "$idle"
+  $RECORD record --duration 20 --djs --label steady_soak --out "$SDIR/steady_soak.json"
+  diagnostics 12
+  r2 10 topic pub --once /wheels/commands std_msgs/msg/Float64MultiArray \
+    "{data: [0.0, 0.0]}" > /dev/null 2>&1 || hil_log "soak wheel stop rc=$?"
+  sleep 2
+  stop_stack TERM          # TERM, never KILL: on_deactivate prints the totals line (5.14)
+  scenario_end             # ... and scenario_end stops the wheels again and proves the port free
+}
+
 # ------------------------------------------------------------------ pre-flight and the run
 : > "$OUT/run.log"
 : > "$OUT/aborted.txt"
@@ -691,7 +744,9 @@ trap 'hil_log "interrupted"; exit 130' INT TERM
 timeout 20 ros2 daemon stop > /dev/null 2>&1
 readback initial_readback --read-only --registers --ids 1,2,3,4 > /dev/null
 
-SCENARIOS=${WAVESHARE_HIL_SCENARIOS:-"H1 H2 H3 H4 H5A H5B H5C H6 H7 H8 H9 H10"}
+# H11 goes last so its ten minutes are spent only after every fast row has reported, and so an
+# abort in it costs nothing else (PHASE3 5.13).
+SCENARIOS=${WAVESHARE_HIL_SCENARIOS:-"H1 H2 H3 H4 H5A H5B H5C H6 H7 H8 H9 H10 H11"}
 aborted_all=0
 for s in $SCENARIOS; do
   SCEN=run

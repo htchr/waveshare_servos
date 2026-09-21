@@ -472,7 +472,7 @@ TEST_F(Units, rad_and_step_conversions_round_trip)
 
 TEST_F(Units, plain_structs_default_every_member_to_zero)
 {
-  // Chunk 6 fills a FeedbackSample field by field from the ReadX(-1) accessors. A field left unset
+  // apply_feedback() fills a FeedbackSample field by field from a FeedbackBlock. A field left unset
   // on some path must read 0, not whatever was on the stack -- a stale `load_raw` would go straight
   // onto a state interface and no compiler warning catches it. Default-initialising over a poisoned
   // buffer makes the difference deterministic: with a default member initialiser on every member

@@ -28,12 +28,18 @@ IFACES = ('position', 'velocity', 'effort', 'current', 'voltage', 'temperature',
 REAL = ('joint1', 'joint2', 'joint3', 'joint4')
 BLOCK_KEYS = ('n', 'mode', 'pos_last_raw', 'pos_slope_ls_rad_s')
 
+# A post-Phase-3-plausible bench, in microseconds (PHASE3 5.16 item 1). The pre-Phase-3 numbers
+# here were 1500.0 [900.0 - 2800.0] read and 700.0 [400.0 - 1200.0] write, and 0.70 ms of write is
+# now ABOVE WRITE_MS_AVG_MAX. This fixture is shared by h1, h9 and h11, and h1/h9 gate maxima too,
+# so all four figures clear all four constants: 1.70 < 2.15, 2.60 < 4.00, 0.30 < 0.60, 0.90 < 1.50.
+# The self-test's claim is never that these verdicts are right (see the docstring) -- but a fixture
+# that reads like a broken bench misleads the next reader.
 DIAGNOSTICS = (
     'name: waveshare_servos\n'
     '  read_cycle.execution_time\n'
-    '   value: Avg: 1500.0 [900.0 - 2800.0]\n'
+    '   value: Avg: 1700.0 [1200.0 - 2600.0]\n'
     '  write_cycle.execution_time\n'
-    '   value: Avg: 700.0 [400.0 - 1200.0]\n')
+    '   value: Avg: 300.0 [150.0 - 900.0]\n')
 
 
 def times(samples, hz=100.0):
@@ -248,4 +254,22 @@ def build(root):
                  ('probe_after_exit.json', {'verdict': 'acquired'}),
                  ('term_after_exit.json', {'any_moving': False}),
                  ('shutdown.json', rec(quiet, mid_t))])
+
+    # H11, the soak of PHASE3 5.13/5.16. Written after H10 and not beside H9 because it reuses
+    # H9's `columns` local: `nine:=true` means the soak recording carries all nine interfaces, so
+    # h11's temperature NOTE has data. `columns` also carries a joint5 the real H11 has no
+    # equivalent of -- h11 names its joints explicitly, so it is inert, and matching the shape the
+    # rest of this fixture already uses is worth more than trimming it.
+    #
+    # The point of the entry is the bug this whole module exists to catch: a checker that reads a
+    # file label or a fact key nobody writes emits a degenerate row and the self-test still says
+    # GREEN. h11 reads `steady_soak.json`, `diagnostics.txt` and the `soak_s` fact, so all three
+    # are here; `port_free_before` / `port_free_after` come from write()'s own base facts.
+    write(root, 'H11',
+          facts={'controllers_active': 'true', 'hw_state': 'active', 'soak_s': '600'},
+          log=('[INFO] bus totals: transactions 60000, failed 0 (0.0 per million), '
+               'worst consecutive 0, dropped 0 [id1 0, id2 0, id3 0, id4 0]\n'),
+          files=[('steady_soak.json', rec(quiet, long_t,
+                                          dynamic_joint_states=djs(long_t, columns))),
+                 ('diagnostics.txt', DIAGNOSTICS)])
     return root

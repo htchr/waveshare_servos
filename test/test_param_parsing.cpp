@@ -121,7 +121,7 @@ TEST(ParamParsing, whitespace_only_parameter_reports_empty)
   // Stripping is not only an emptiness test: a padded value parses, and raw() reports the stripped
   // text, which is what the FATAL messages of PHASE2_SPEC 4.4 quote back.
   int64_t io_timeout_ms = 0;
-  EXPECT_EQ(get_int(p, "io_timeout_ms", 1, 1000, io_timeout_ms), Status::kOk);
+  EXPECT_EQ(get_int(p, "io_timeout_ms", 2, 1000, io_timeout_ms), Status::kOk);
   EXPECT_EQ(io_timeout_ms, 20);
   EXPECT_EQ(raw(p, "io_timeout_ms"), "20");
   EXPECT_EQ(raw(p, "allow_missing_servos"), "");
@@ -315,8 +315,18 @@ TEST(ParamParsing, integer_below_min_reports_out_of_range)
     {"max_read_fails", "1000001"}};
 
   int64_t io_timeout_ms = 20;
-  EXPECT_EQ(get_int(p, "io_timeout_ms", 1, 1000, io_timeout_ms), Status::kOutOfRange);
+  EXPECT_EQ(get_int(p, "io_timeout_ms", 2, 1000, io_timeout_ms), Status::kOutOfRange);
   EXPECT_EQ(io_timeout_ms, 20);
+
+  // 1 is the boundary PHASE3 R8 moved: legal through Phase 2, out of range from now on. The bounds
+  // here are the case's own, so this pins get_int's inclusivity, not the driver's choice of floor
+  // -- src/waveshare_servos.cpp is what makes that right, and test_load_waveshare_servos pins it.
+  const ParameterMap one{{"io_timeout_ms", "1"}};
+  int64_t one_ms = 20;
+  EXPECT_EQ(get_int(one, "io_timeout_ms", 2, 1000, one_ms), Status::kOutOfRange);
+  EXPECT_EQ(one_ms, 20);
+  EXPECT_EQ(get_int(one, "io_timeout_ms", 1, 1000, one_ms), Status::kOk);
+  EXPECT_EQ(one_ms, 1);
 
   int64_t ping_attempts = 3;
   EXPECT_EQ(get_int(p, "ping_attempts", 1, 10, ping_attempts), Status::kOutOfRange);
@@ -369,26 +379,26 @@ TEST(ParamParsing, bool_rejects_one_and_zero)
 TEST(ParamParsing, message_wording_for_each_status)
 {
   const std::string subject = "hardware parameter 'io_timeout_ms'";
-  const std::string expected = "an integer between 1 and 1000 (milliseconds)";
+  const std::string expected = "an integer between 2 and 1000 (milliseconds)";
 
   // kDefaulted exists for required parameters only (id, PHASE2_SPEC 5.1); no hardware parameter
   // reaches it, which is exactly why it is pinned here.
   EXPECT_EQ(
     message(Status::kDefaulted, subject, "", expected),
-    "hardware parameter 'io_timeout_ms' is missing; expected an integer between 1 and 1000 "
+    "hardware parameter 'io_timeout_ms' is missing; expected an integer between 2 and 1000 "
     "(milliseconds)");
   EXPECT_EQ(
     message(Status::kEmpty, subject, "", expected),
-    "hardware parameter 'io_timeout_ms' is empty; expected an integer between 1 and 1000 "
+    "hardware parameter 'io_timeout_ms' is empty; expected an integer between 2 and 1000 "
     "(milliseconds)");
   EXPECT_EQ(
     message(Status::kMalformed, subject, "20ms", expected),
-    "hardware parameter 'io_timeout_ms' is '20ms', which is not an integer between 1 and 1000 "
+    "hardware parameter 'io_timeout_ms' is '20ms', which is not an integer between 2 and 1000 "
     "(milliseconds)");
   EXPECT_EQ(
     message(Status::kOutOfRange, subject, "0", expected),
     "hardware parameter 'io_timeout_ms' is '0', which is out of range; expected an integer "
-    "between 1 and 1000 (milliseconds)");
+    "between 2 and 1000 (milliseconds)");
   EXPECT_EQ(message(Status::kOk, subject, "20", expected), "");
 
   // A joint parameter reads the same way: the subject and the expectation are the only variables.
