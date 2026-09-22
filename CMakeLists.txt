@@ -122,8 +122,27 @@ install(
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gmock REQUIRED)
+  find_package(ament_cmake_pytest REQUIRED)
   find_package(ament_lint_auto REQUIRED)
+  find_package(launch_testing_ament_cmake REQUIRED)
   find_package(ros2_control_test_assets REQUIRED)
+
+  # This used to sit next to hil_gates_self_test, its only user; it is up here now because the
+  # pytest test below needs it too and needs it first. ament_add_pytest_test() defaults
+  # PYTHON_EXECUTABLE to the imported target Python3::Interpreter and resolves it through
+  # get_executable_path(... BUILD) (ament_add_pytest_test.cmake:73-77 under
+  # /opt/ros/jazzy/share/ament_cmake_pytest/cmake). Measured, not assumed: a missing target is
+  # NOT a configure error there -- get_executable_path() hands back whatever it was given when the
+  # name is not a target (get_executable_path.cmake:49-50), so the ctest command would quietly
+  # become the literal string "Python3::Interpreter" and only fail when the test runs. And a
+  # second measurement: find_package(ament_cmake) at the top of this file already defines
+  # Python3::Interpreter, so the order is not load-bearing today. Both facts say the same thing --
+  # keep the find_package explicit and keep it above its first user, rather than resting on an
+  # accident of what ament_cmake happens to pull in.
+  # add_launch_test() needs none of this: it falls back to the plain ${PYTHON_EXECUTABLE} variable
+  # that the PythonExtra module sets, which launch_testing_ament_cmake-extras.cmake includes
+  # (add_launch_test.cmake:62-69).
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
   # The sources carry no license header, so the two linters that ask for one are
   # switched off: ament_copyright entirely, and cpplint's legal/copyright rule.
@@ -238,6 +257,60 @@ if(BUILD_TESTING)
     ${CMAKE_CURRENT_SOURCE_DIR}/test
   )
 
+  # The example description renders to different XML depending on use_mock_hardware, and which
+  # <plugin> ros2_control ends up loading is decided there, at xacro render time, before any
+  # ResourceManager exists -- so no gmock test above can reach it. This one renders the text and
+  # reads it back: no ROS graph, no plugin, no port.
+  # TIMEOUT 60 is ament_add_test's own default written out (ament_add_test.cmake:75-77); a render
+  # of description/urdf/example.urdf.xacro measures 0.07 s here for 8,891 bytes of URDF, so the
+  # timeout bounds a hung import, not the work. Note the file has to exist when cmake runs:
+  # ament_add_pytest_test() checks the path itself and stops the configure with a FATAL_ERROR if
+  # it is missing (ament_add_pytest_test.cmake:64-71).
+  ament_add_pytest_test(test_urdf_xacro test/test_urdf_xacro.py TIMEOUT 60)
+
+  # Brings the example up on mock hardware and waits for the controllers to become active. It is
+  # the only motorless test that runs the real bringup -- ros2_control_node, robot_state_publisher
+  # and the spawners -- which is what the ENV and RUN_SERIAL below are for.
+  #
+  # ENV gives it a private ROS graph. The domain must NOT be 77: test/hil_check.sh:51 re-execs
+  # itself with ROS_DOMAIN_ID=77, and on a shared domain this test would discover the bench's
+  # controller manager (or the bench ours) and assert against the wrong stack. LOCALHOST discovery
+  # keeps it off the LAN as well. ENV is not an add_launch_test keyword -- that function parses
+  # only TARGET, TIMEOUT, PYTHON_EXECUTABLE, ARGS and LABELS (add_launch_test.cmake:52-55) and
+  # forwards everything else verbatim to ament_add_test, where ENV is a multi-value VAR=value
+  # list (ament_add_test.cmake:56-59).
+  #
+  # TIMEOUT 330 replaces the 60 s default (ament_add_test.cmake:75-77), and the number is chosen
+  # to sit ABOVE this test's own worst case rather than below it. test/test_example_launch.py
+  # budgets ~295 s for a run in which nothing comes up at all: 45 s of ReadyToTest plus five test
+  # methods, two of whose helpers (check_controllers_running, check_if_js_published) spend their
+  # timeout twice over -- the arithmetic is written out at the STARTUP_TIMEOUT constant there.
+  # This was TIMEOUT 180, which broke the invariant that same comment states: a total failure
+  # would have been SIGKILLed by ctest at 180 s and reported as "test timed out", throwing away
+  # the assertion message that says WHICH of the five things failed. Raising the ctest bound
+  # rather than shortening the in-test waits is the deliberate half of that trade: the waits are
+  # long on purpose, because ctest may run this on a loaded machine and because every controller
+  # spawner on the machine serialises on one lock file (see RUN_SERIAL below), so a shorter wait
+  # would buy a readable failure by manufacturing flaky ones. The 35 s above 295 is headroom for
+  # launch shutdown and the post-shutdown test; none of it is paid in the normal case, where that
+  # same comment records a measured 7 s end to end. Keep the two numbers in step: the sum lives
+  # in test_example_launch.py, the bound lives here.
+  #
+  # TARGET is given explicitly because the ctest name is what set_tests_properties below needs:
+  # left to itself add_launch_test() derives that name from the path and this test would be
+  # called test_test_example_launch (add_launch_test.cmake:84-90).
+  add_launch_test(test/test_example_launch.py
+    TARGET test_example_launch
+    TIMEOUT 330
+    ENV "ROS_DOMAIN_ID=88" "ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST"
+  )
+  # RUN_SERIAL for the same reason hil_check has it, but over a different resource: every
+  # controller spawner on this machine serialises on one lock file,
+  # ~/.ros/locks/ros2-control-controller-spawner.lock, and holds it while it waits for its
+  # controller manager (see bringup/launch/example.launch.py:156-161). Two tests spawning
+  # controllers at once would queue behind each other inside their own timeouts.
+  set_tests_properties(test_example_launch PROPERTIES RUN_SERIAL TRUE)
+
   # Bench check. Runs only with WAVESHARE_HIL=1 and a real adapter; on any other
   # machine it exits 77 and ctest records a skip. It drives the motors, so it is
   # never part of a default build's expectations.
@@ -255,7 +328,6 @@ if(BUILD_TESTING)
   # The gate logic is the part of the bench check that can be proved without a bench: the
   # self-test runs the three invariant gates over synthetic series with injected defects and
   # needs no hardware, no ROS and no run directory (PHASE2_SPEC 11.2, 12.3).
-  find_package(Python3 REQUIRED COMPONENTS Interpreter)
   ament_add_test(hil_gates_self_test
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test/hil/hil_gates.py"
             --self-test
@@ -275,6 +347,18 @@ if(BUILD_TESTING)
         "WAVESHARE_HIL_PORT_PROBE=$<TARGET_FILE:hil_port_probe>"
         "WAVESHARE_HIL_HELPERS=${CMAKE_CURRENT_SOURCE_DIR}/test/hil"
     SKIP_RETURN_CODE 77
+    # Added in Phase 5, and it fixes a real defect rather than tidying one. The script writes its
+    # own report (hil_check.txt / hil_check.json) but never a JUnit file, so the RESULT_FILE above
+    # was always absent afterwards -- and without this flag ament treats an absent result file as
+    # an error even when the command exited 0, synthesising
+    # `hil_check.xunit.missing_result` (ament_cmake_test/__init__.py:263, and the template at
+    # :364). The effect was that a bench run in which every row PASSed still came back through
+    # `colcon test-result` as "1 error", which is the worst possible reading of a green run: it
+    # trains you to ignore the one test that drives the hardware. With the flag, rc 0 writes a
+    # passing result (__init__.py:237-242) and rc 77 still writes a skipped one (:257); a genuine
+    # non-zero exit, which is how this script reports a FAIL or an abort, keeps falling through to
+    # the failure path, so a red run stays red and carries the tail of the output with it.
+    GENERATE_RESULT_FOR_RETURN_CODE_ZERO
     TIMEOUT 2400
   )
   # RUN_SERIAL because nothing else may touch the port; SKIP_RETURN_CODE 77 is what makes a

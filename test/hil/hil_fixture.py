@@ -2,13 +2,18 @@
 A synthetic run tree for the hil_gates self-test (PHASE2_SPEC 12.3, 12.5).
 
 `hil_gates.py --self-test` used to exercise only the gate primitives of 12.2 against synthetic
-series. That left the twelve per-scenario checkers h1..h10 -- where the report of 12.4 is actually
-built -- entirely unexecuted, so a checker that could not run at all still reported GREEN. This
-module writes a run directory with the same file shapes hil_check.sh produces, thin enough to
-build in memory and complete enough that every checker walks its whole body.
+series. That left the per-scenario checkers h1..h12 -- the fifteen entries of hil_gates.py's
+CHECKERS, where the report of 12.4 is actually built -- entirely unexecuted, so a checker that
+could not run at all still reported GREEN. This module writes a run directory with the same file
+shapes hil_check.sh produces, thin enough to build in memory and complete enough that every
+checker walks its whole body.
 
-The data is deliberately NOT tuned to make every row PASS. The self-test's claim is only that the
-checkers run and emit rows; the verdicts themselves are what a real bench run decides.
+The data is mostly NOT tuned to make every row PASS. The self-test's claim is only that the
+checkers run and emit rows; the verdicts themselves are what a real bench run decides. The
+exception is a scenario whose rows are proved by DIFFERENTIAL injection -- H11's wheels_turning,
+H1's activate, H12's clamp rows -- where the copy carrying the defect has to be compared against
+a green baseline or the injection proves nothing; see the H12 entry below and
+hil_gates.py's _self_test_soak_load, _self_test_h1_ping and _self_test_h12_clamps.
 """
 
 import json
@@ -147,6 +152,24 @@ def build(root):
           log="[INFO] Successful 'activate'\n[INFO] bus on '/dev/ttyACM0' at 1000000 baud\n",
           files=[('steady.json', rec(quiet, long_t)), ('diagnostics.txt', DIAGNOSTICS)])
 
+    # H1B, the shipped example commanded rather than only watched. Its recordings deliberately
+    # reuse the shapes of the bench scenarios whose bounds h1b borrows -- the arm columns are
+    # H2's and the wheel column is H3's `spun` -- because the point of h1b is that the same
+    # measurements are taken on the packaged stack, and a fixture that made them look like
+    # different measurements would hide a checker that had drifted off them.
+    write(root, 'H1B',
+          facts={'controllers_active': 'true', 'hw_state': 'active',
+                 'diff_drive_state': 'inactive', 'arm_state_after': 'active',
+                 'hw_state_after_arm': 'active', 'vel_attempted': 'true',
+                 'launch_exit_code': '0', 'port_free_within_10s': 'true',
+                 'port_holders_after_exit': ''},
+          log="[INFO] Successful 'deactivate'\n[INFO] Successful 'shutdown'\n",
+          files=[('ex_move_to_0.json', rec({'joint1': hold(short_t, 0.0)}, short_t, t_cmd=0.0)),
+                 ('ex_move_to_06.json', rec({'joint1': hold(short_t, 0.6)}, short_t, t_cmd=0.0)),
+                 ('ex_vel_2.json', rec(spun, long_t, t_cmd=0.0, t_stop=6.0)),
+                 ('after_exit.json', {'any_moving': False}),
+                 ('probe_after_exit.json', {'verdict': 'acquired'})])
+
     write(root, 'H2',
           facts={'controllers_active': 'true'},
           files=[('move_to_0.json', rec({'joint1': hold(short_t, 0.0)}, short_t, t_cmd=0.0)),
@@ -235,13 +258,26 @@ def build(root):
                'joint3': nine(long_t, velocity=2.0), 'joint4': nine(long_t, velocity=-2.0),
                'joint5': nine(long_t, current=0.0)}
     listed = '\n'.join('%s/%s' % (j, i) for j in REAL + ('joint5',) for i in IFACES)
+    # t_cycle_done is 8.0 against a 12 s recording (long_t is 1200 samples at 100 Hz), so 400
+    # samples follow the cycle and H9.cycle_recorded clears its 100-sample floor with room to
+    # spare. It has to be a real margin rather than a value tuned to just pass: the row exists to
+    # notice a recorder that stopped near the cycle, and a fixture sitting on the boundary would
+    # make the red-first injection for it indistinguishable from fixture noise.
     write(root, 'H9',
           facts={'t_cycled': '2.0', 't_plus0': '1.0', 't_plus1': '3.0',
-                 't_minus0': '5.0', 't_minus1': '7.0'},
+                 't_minus0': '5.0', 't_minus1': '7.0', 't_cycle_done': '8.0',
+                 'cycle_inactive_rc': '0', 'cycle_active_rc': '0',
+                 'hw_state_after_cycle': 'active'},
           log=''.join("[WARN] joint '%s' declares the deprecated 'torque' interface\n" % j
                       for j in REAL + ('joint5',)),
           files=[('interfaces.json', rec(quiet, long_t,
                                          dynamic_joint_states=djs(long_t, columns))),
+                 ('arm_after_cycle.json', rec({'joint1': hold(short_t, 0.4),
+                                               'joint2': hold(short_t, 0.4)}, short_t,
+                                              t_cmd=0.0)),
+                 ('arm_after_park.json', rec({'joint1': hold(short_t, 0.0),
+                                              'joint2': hold(short_t, 0.0)}, short_t,
+                                             t_cmd=0.0)),
                  ('hardware_interfaces.txt', listed),
                  ('diagnostics.txt', DIAGNOSTICS)])
 
@@ -272,4 +308,70 @@ def build(root):
           files=[('steady_soak.json', rec(quiet, long_t,
                                           dynamic_joint_states=djs(long_t, columns))),
                  ('diagnostics.txt', DIAGNOSTICS)])
+
+    # H12, the limits scenario of jazzy.md section 6 step 8: three stacks, and the middle one
+    # renders +-0.8 rad / 2.0 rad/s <limit>s against bench_limits.yaml's enforce_command_limits,
+    # so the controller manager's JointSaturationLimiter clamps an arm command of 1.2 rad and a
+    # wheel command of 8.0 rad/s. Written last because it is the newest scenario, not because it
+    # runs last on the bench (it runs before H11, so the soak's ten minutes are spent after every
+    # fast row has reported).
+    #
+    # This entry is a HEALTHY H12 -- every h12 row passes over it -- which is a departure from the
+    # module docstring's "not tuned to make every row PASS", and deliberate. Two of h12's rows are
+    # proved by differential injection in hil_gates.py (_self_test_h12_clamps copies this
+    # directory, unclamps one recording in it and asserts that exactly one row turns red), and
+    # that argument only works against a baseline where the row in question is green: on a
+    # fixture where the row was already red, an injection would prove nothing at all. The same
+    # reasoning as _self_test_soak_load's H11 copy and _self_test_h1_ping's H1 copies.
+    #
+    # The numbers are the plausible ones rather than the exact ones wherever the bench has a
+    # measured answer: the arm settles 0.0033 rad short of a commanded target (H2.target.move_to_06
+    # read 0.5967 for 0.6 in the post-Phase-4 baseline), so the clamped arm rests at 0.7967 and
+    # not at a suspiciously exact 0.8, and turn() quantises 2.0 rad/s to the 26-quantum lattice
+    # value 1.99417 the same way a real reported velocity is quantised. Both sit inside their
+    # tolerances with room to spare, so a red row here is a checker defect and never fixture noise.
+    clamp_t = times(500)                      # 5 s: 0.5 pre + 2.0 move + 2.5 post, as h_H12 asks
+    parked = round(OFFSET * STEPS_PER_RAD)    # 1024 ticks; the joint angle is raw * TICK - OFFSET
+    arm_regs = {'torque_enable': 1, 'acc': 10, 'goal_position_raw': parked, 'goal_speed_raw': 0}
+    # The limiter lines, and the reason this file writes three cm*.stdout files. h_H12 records
+    # limited_cm_log so the gate reads the ONE log its limited stack wrote, and the two ordinary
+    # stacks that bracket it run against bench.yaml, where enforce_command_limits is false and no
+    # limiter is ever built. The order here is joint3, joint1, joint4, joint2 ON PURPOSE:
+    # hardware_interface emits these in hash-map order (jazzy.md's Phase 4 amendment to section 6
+    # step 8), so a checker that matched them by index would pass on a sorted fixture and fail on
+    # the bench. Note that log.txt below does NOT carry them, where the real scenario_end would
+    # (it concatenates every *.stdout into log.txt) -- that is what makes an injection into
+    # cm2.stdout a single defect, and h12 reads the named file rather than log.txt anyway.
+    limiter = ''.join('[INFO] [resource_manager]: Creating JointSaturationLimiter for joint '
+                      "'%s' in hardware 'bench'\n" % j for j in ('joint3', 'joint1',
+                                                                 'joint4', 'joint2'))
+    write(root, 'H12',
+          facts={'arm_pos_limit': '0.8', 'arm_command': '1.2',
+                 'wheel_vel_limit': '2.0', 'wheel_command': '8.0',
+                 'park_spawner_rc': '0', 'park_controllers_active': 'true',
+                 'park_cm_exit_code': '0',
+                 'limited_spawner_rc': '0', 'limited_controllers_active': 'true',
+                 # 137 = 128 + SIGKILL, which is what stop_stack KILL must produce: the limited
+                 # stack is killed with 8.0 rad/s still commanded so the goal-speed register
+                 # survives. h12 reports it and gates nothing on it (a 0 here would mean the kill
+                 # missed), exactly as H8's KILLed stack recorded cm_exit_code 137 on the bench.
+                 'limited_cm_exit_code': '137', 'limited_cm_log': 'cm2.stdout',
+                 'arm_state_after': 'active',
+                 'park_final_spawner_rc': '0', 'park_final_controllers_active': 'true',
+                 'park_final_cm_exit_code': '0'},
+          log="[INFO] Successful 'activate'\n[INFO] Successful 'deactivate'\n",
+          files=[('cm1.stdout', "[INFO] Successful 'activate'\n"),
+                 ('cm2.stdout', limiter),
+                 ('cm3.stdout', "[INFO] Successful 'activate'\n"),
+                 ('arm_pre.json', ids({1: dict(arm_regs, pos_last_raw=parked),
+                                       2: dict(arm_regs, pos_last_raw=parked)})),
+                 ('pos_clamp.json', rec({'joint1': hold(clamp_t, 0.7967)}, clamp_t, t_cmd=0.0)),
+                 ('vel_clamp.json', rec({'joint3': turn(mid_t, 2.0), 'joint4': turn(mid_t, 2.0)},
+                                        mid_t, t_cmd=0.0, t_stop=6.0)),
+                 ('vel_readback.json', ids({3: {'goal_speed_raw': 1304},
+                                            4: {'goal_speed_raw': 1304}})),
+                 ('vel_stop.json', dict(readback(servos=(3, 4), goal_speed_raw=0),
+                                        any_moving=False)),
+                 ('arm_post.json', ids({1: dict(arm_regs, pos_last_raw=parked),
+                                        2: dict(arm_regs, pos_last_raw=parked)}))])
     return root

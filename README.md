@@ -255,8 +255,11 @@ It is registered by `colcon test` like any other test and **skips itself** unles
 ```bash
 colcon test --packages-select waveshare_servos                       # hil_check: SKIPPED
 WAVESHARE_HIL=1 colcon test --packages-select waveshare_servos \
-  --ctest-args -R hil_check                                          # about 27 minutes of bus time: ~17 of scenarios plus the ten-minute soak
+  --ctest-args -R hil_check                                          # about 30 minutes of bus time: ~20 of scenarios plus the ten-minute soak
 ```
+
+Two of the motorless tests are worth knowing by name, because between them they cover the shipped example without touching a servo: `test_urdf_xacro` renders `description/urdf/example.urdf.xacro` with and without `use_mock_hardware` and reads the XML back, and `test_example_launch` brings `example.launch.py` up on `mock_components/GenericSystem` and asserts the three active controllers, the deliberately inactive `diff_drive_controller`, and `/joint_states`.
+`WAVESHARE_HIL_SCENARIOS` selects a subset of the bench scenarios (default: all of them, in the order the report lists) when you want one row back rather than the whole run.
 
 It skips, with the reason printed, unless `WAVESHARE_HIL=1`, the port exists and is readable and writable, the user is not root, and `ros2` is on `PATH`.
 `WAVESHARE_HIL_PORT` selects the port (default `/dev/ttyACM0`); `--ctest-args -L hil` runs only this test and `-LE hil` excludes it.
@@ -271,7 +274,8 @@ Three invariants carry the run: the reported position never steps more than half
 ### What the bench does not do, and why
 
 **No step of it asks a person to be at the adapter** -- no connector pull, no wheel held by hand, no ammeter.
-The two checks that used to need hands are covered deterministically instead, by the pty tests that run in CI on every build:
+That is a deliberate scope decision, not an oversight: jazzy.md section 6 step 6 asks for a servo to be unplugged mid-run, and the automated bench does not do it.
+What it does instead is gate the recoverable half of that step -- `ros2 control set_hardware_component_state <hw> inactive` then `active`, which `H9` cycles and now gates -- and cover the unpluggable half deterministically, with the pty tests that run in every `colcon test`:
 
 - a servo that stops answering mid-run, the drop after `max_read_fails`, the re-ping on activate and the post-gap warning: `test/test_lifecycle_over_pty.cpp`, a fake servo told to stop answering between two `read()` calls;
 - the status byte: synthetic status values fed through the same fake bus, over all 256 of them.

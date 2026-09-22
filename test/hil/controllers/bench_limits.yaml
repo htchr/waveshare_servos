@@ -1,0 +1,38 @@
+# Controller manager configuration for H12, the one scenario of jazzy.md section 6 step 8
+# (PHASE2_SPEC 12.5). It is bench.yaml with a single setting changed, and it exists as a separate
+# file rather than as a flag on the shared one because `enforce_command_limits` can only be set
+# here: the controller manager builds the JointSaturationLimiters at hardware-component init, so a
+# `ros2 param set` on a running stack is accepted and does nothing (jazzy.md section 6 step 8, the
+# Phase 4 amendment). Flipping bench.yaml instead would turn the limiters on for every other
+# scenario, which is a different bench than the one their gates were measured against.
+#
+# hil_check.sh substitutes @WHEELS@ exactly as it does in bench.yaml; h_H12 selects this file with
+# start_stack's fourth argument.
+#
+# The duplication is deliberate AND it is checked rather than trusted: `hil_gates.py --self-test`
+# reads both files and fails unless their non-comment lines differ in exactly one place, the
+# enforce_command_limits line below (_self_test_limits_yaml). A controller setting added to
+# bench.yaml and forgotten here would otherwise make H12 quietly test a different stack from
+# every other scenario, and no gate in the report could see it.
+controller_manager:
+  ros__parameters:
+    update_rate: 100
+    enforce_command_limits: true
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+    arm:
+      type: joint_trajectory_controller/JointTrajectoryController
+    wheels:
+      type: velocity_controllers/JointGroupVelocityController
+
+arm:
+  ros__parameters:
+    joints: [joint1, joint2]
+    command_interfaces: [position]
+    state_interfaces: [position, velocity]
+    allow_partial_joints_goal: true
+    interpolate_from_desired_state: false
+
+wheels:
+  ros__parameters:
+    joints: @WHEELS@

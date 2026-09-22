@@ -19,14 +19,66 @@
   <test_depend>ament_lint_common</test_depend>
   <test_depend>ros2_control_test_assets</test_depend>
 
-  <!-- test/hil/hil_record.py, the recorder of the hil_check bench test. It imports these only
-       when that test actually runs against hardware; every other test needs none of them. -->
+  <!-- test/hil/hil_record.py, the recorder of the hil_check bench test, imports all five of
+       these, and only when that test actually runs against hardware.
+
+       Two of them have a SECOND user since Phase 5, and it is not hardware-gated: rclpy is
+       imported at module scope by test/test_example_launch.py (it creates the node the service
+       calls there reuse), and sensor_msgs is imported at module scope by
+       controller_manager.test_utils (test_utils.py:34, `from sensor_msgs.msg import
+       JointState`), which that same test imports. So rclpy and sensor_msgs are needed by every
+       run of the launch test, motors or no motors; dropping them because hil_check skips would
+       break test_example_launch at its first import on a clean checkout. control_msgs,
+       std_msgs and trajectory_msgs are still hil_record.py's alone. -->
   <test_depend>control_msgs</test_depend>
   <test_depend>rclpy</test_depend>
   <test_depend>sensor_msgs</test_depend>
   <test_depend>std_msgs</test_depend>
   <test_depend>trajectory_msgs</test_depend>
-  
+
+  <!-- The two motorless tests added in Phase 5: test/test_urdf_xacro.py, which renders the
+       example description with xacro and reads the XML back, and test/test_example_launch.py,
+       which brings the example up on mock hardware. ament_cmake_pytest and
+       launch_testing_ament_cmake provide the CMake functions that register the two
+       (ament_add_pytest_test, add_launch_test); launch_testing and launch are imported by the
+       launch test, ament_index_python by both, and xacro by both as well (the launch test's
+       pre-flight guard renders the description before it will let the launch start).
+       launch_testing_ros is imported by neither, but controller_manager.test_utils imports it at
+       module scope (test_utils.py:33, `from launch_testing_ros import WaitForTopics`), so the
+       launch test's very first import fails without it. xacro is exec_depend below as well; it is
+       repeated here because it is the one dependency a test needs that nothing in the build or
+       the runtime pulls in on its own, and the duplication costs nothing.
+
+       launch is listed even though launch_testing already depends on it, because a test that
+       writes `from launch import LaunchDescription` should declare launch. The usual objection
+       to adding a test_depend does not apply here, and this was measured rather than assumed:
+       ament_lint_auto_find_test_dependencies() calls find_package(${dep} QUIET) for every
+       <test_depend> (ament_lint_auto_find_test_dependencies.cmake:35-40), and `launch` is an
+       ament_python package that installs no CMake config at all (there is no
+       /opt/ros/jazzy/share/launch/cmake), so that call finds nothing, says nothing and leaves
+       launch_FOUND unset; a probe project configured with find_package(ament_cmake REQUIRED)
+       followed by find_package(launch QUIET) printed launch_FOUND=0 with a 0-byte stderr, the
+       same as the launch_testing entry already here. Contrast controller_manager below, which
+       does ship a config and does cost a warning.
+
+       controller_manager is DELIBERATELY NOT REPEATED HERE, though test/test_example_launch.py
+       imports it. ament_lint_auto_find_test_dependencies() find_package()es every <test_depend>
+       (ament_lint_auto_find_test_dependencies.cmake:35-40), and find_package(controller_manager)
+       reaches tl_expected through parameter_traits, which prints a CMake deprecation warning.
+       Measured, not assumed: adding the line takes this package's build stderr.log from 0 bytes
+       to that warning, and removing it takes it back to 0 bytes. jazzy.md makes a warning-free
+       build a phase gate, and the dependency is already covered anyway: controller_manager is an
+       <exec_depend> below, and `rosdep install` installs every dependency type except doc by
+       default, so a clean checkout resolves it regardless. Re-adding it buys nothing and costs
+       the gate. -->
+  <test_depend>ament_cmake_pytest</test_depend>
+  <test_depend>ament_index_python</test_depend>
+  <test_depend>launch</test_depend>
+  <test_depend>launch_testing</test_depend>
+  <test_depend>launch_testing_ament_cmake</test_depend>
+  <test_depend>launch_testing_ros</test_depend>
+  <test_depend>xacro</test_depend>
+
   <exec_depend>controller_manager</exec_depend>
   <exec_depend>diff_drive_controller</exec_depend>
   <exec_depend>joint_state_broadcaster</exec_depend>

@@ -1,7 +1,8 @@
 <?xml version="1.0"?>
 <!-- The bench check's description (PHASE2_SPEC 12.5). One file with arguments, because the ten
      scenarios differ only in allow_missing_servos, the absent servo, inverted, the two
-     per-joint limits and whether every state interface is declared.
+     per-joint limits, the two <limit> ceilings H12 tightens and whether every state interface
+     is declared.
      joint1/joint2 are the arm servos (ids 1 and 2, pos, offset 1.570796); joint3/joint4 are the
      wheels (ids 3 and 4, vel, unwrap explicitly true); joint5 is the deliberately absent id 9. -->
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="waveshare_bench">
@@ -15,12 +16,23 @@
   <xacro:arg name="speed3" default=""/>
   <xacro:arg name="speed4" default=""/>
   <xacro:arg name="accel4" default=""/>
+  <!-- The two <limit> values the controller manager's JointSaturationLimiter reads when
+       enforce_command_limits is on (H12 only; every other scenario leaves the limiters off and
+       never notices these). They default to the values the limits were written with, so only H12
+       renders anything different. They are arguments, and NOT the same numbers as the command
+       interface min/max below, because that separation is the whole of H12's attribution: the
+       driver clamps to the command interface min/max and to max_speed_counts and never reads a
+       URDF <limit> at all, so a command clamped at a value only the description knows can only
+       have been clamped by the limiter. See h_H12 in test/hil_check.sh. -->
+  <xacro:arg name="arm_pos_limit" default="1.570796"/>
+  <xacro:arg name="wheel_vel_limit" default="9.2038847"/>
 
   <link name="base_link"/>
   <xacro:macro name="arm_link" params="name">
     <joint name="${name}" type="revolute">
       <axis xyz="0 0 1"/>
-      <limit effort="1.0" lower="-1.570796" upper="1.570796" velocity="9.2"/>
+      <limit effort="1.0" lower="-$(arg arm_pos_limit)" upper="$(arg arm_pos_limit)"
+             velocity="9.2"/>
       <parent link="base_link"/>
       <child link="l_${name}"/>
     </joint>
@@ -29,7 +41,7 @@
   <xacro:macro name="wheel_link" params="name">
     <joint name="${name}" type="continuous">
       <axis xyz="0 0 1"/>
-      <limit effort="1.0" velocity="9.2038847"/>
+      <limit effort="1.0" velocity="$(arg wheel_vel_limit)"/>
       <parent link="base_link"/>
       <child link="l_${name}"/>
     </joint>
