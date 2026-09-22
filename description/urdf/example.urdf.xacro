@@ -1,6 +1,11 @@
 <?xml version="1.0"?>
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="waveshare_servos">
-    <xacro:arg name="prefix" default="" />
+    <!-- Arguments the launch file forwards. port and baudrate are only used when
+         use_mock_hardware is false; with it true the driver is replaced by
+         mock_components/GenericSystem and no serial port is opened at all. -->
+    <xacro:arg name="port" default="/dev/ttyACM0" />
+    <xacro:arg name="baudrate" default="1000000" />
+    <xacro:arg name="use_mock_hardware" default="false" />
 
     <material name="white">
         <color rgba="1 1 1 1" />
@@ -16,9 +21,19 @@
         </visual>
     </link>
 
+    <!-- effort and velocity below are declared caps, not measured figures: 9.2 rad/s is just under
+         the servo's 6000-count goal-speed ceiling (9.2038847 rad/s) and 1.0 N m is the same cap the
+         hardware-verified bench description under test/hil declares. Keep them numerically equal to
+         the <command_interface> min/max in the ros2_control block beside this file: ros2_control
+         merges the two and enforces whichever is tighter. lower/upper are read only for revolute
+         and prismatic joints and are silently discarded for continuous ones, which is why joint3
+         and joint4 declare none - a wheel joint's position is unbounded once the driver unwraps it.
+         The <limit> element itself is kept on the wheels on purpose: a joint_trajectory_controller
+         older than 4.42.0 dereferences a null limits pointer at load time when a continuous joint
+         has none. -->
     <joint name="joint1" type="revolute">
         <axis xyz="0 0 1"/>
-        <limit effort="1000.0" lower="-1.570796" upper="1.570796" velocity="0.5"/>
+        <limit effort="1.0" lower="-1.570796" upper="1.570796" velocity="9.2"/>
         <origin xyz="0 0 0.3"/>
         <parent link="base_link"/>
         <child link="link2"/>
@@ -36,7 +51,7 @@
 
     <joint name="joint2" type="revolute">
         <axis xyz="1 0 0"/>
-        <limit effort="1000.0" lower="-1.570796" upper="1.570796" velocity="0.5"/>
+        <limit effort="1.0" lower="-1.570796" upper="1.570796" velocity="9.2"/>
         <origin rpy="0 0 0" xyz="0 0 0.3"/>
         <parent link="link2"/>
         <child link="link3"/>
@@ -54,7 +69,7 @@
 
     <joint name="joint3" type="continuous">
         <axis xyz="0 0 1"/>
-        <limit effort="1000.0" lower="-3.14" upper="3.14" velocity="1.0"/>
+        <limit effort="1.0" velocity="9.2"/>
         <origin xyz="0 0 0.3"/>
         <parent link="link3"/>
         <child link="link4"/>
@@ -74,7 +89,7 @@
          gets a link of its own. -->
     <joint name="joint4" type="continuous">
         <axis xyz="0 0 1"/>
-        <limit effort="1000.0" lower="-3.14" upper="3.14" velocity="1.0"/>
+        <limit effort="1.0" velocity="9.2"/>
         <origin xyz="0 0 0.1"/>
         <parent link="link4"/>
         <child link="link5"/>
@@ -92,6 +107,9 @@
 
     <xacro:include filename="$(find waveshare_servos)/description/ros2_control/example.ros2_control.xacro"/>
 
-    <xacro:example_ws_ros2_control name="example_ws_ros2_control" prefix="$(arg prefix)"/>
+    <xacro:example_ws_ros2_control name="example_ws_ros2_control"
+                                   port="$(arg port)"
+                                   baudrate="$(arg baudrate)"
+                                   use_mock_hardware="$(arg use_mock_hardware)"/>
 
 </robot>

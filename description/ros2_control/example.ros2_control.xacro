@@ -2,7 +2,15 @@
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro">
 
     <xacro:macro name="example_ws_ros2_control"
-                 params="name prefix port:=/dev/ttyACM0 baudrate:=1000000">
+                 params="name port:=/dev/ttyACM0 baudrate:=1000000 use_mock_hardware:=false">
+
+        <!-- use_mock_hardware accepts true, false, 1 or 0, in any case and with any surrounding
+             space. The list lookup is deliberate: an unrecognised spelling raises inside xacro and
+             aborts the render with exit 2 ("'yes' is not in list"), which aborts the launch. A
+             plain string comparison against 'true' would treat use_mock_hardware:=yes as false and
+             quietly open the real serial port instead. -->
+        <xacro:property name="mock"
+            value="${['false', '0', 'true', '1'].index(str(use_mock_hardware).strip().lower()) >= 2}"/>
 
         <!-- Optional, ros2_control 4.48 - read and write the hardware at its own rate, and/or on
              its own thread. Both are ATTRIBUTES of this element, not <param> children of
@@ -21,21 +29,47 @@
         -->
         <ros2_control name="${name}" type="system">
             <hardware>
-                <plugin>waveshare_servos/WaveshareServos</plugin>
-                <param name="port">${port}</param>
-                <param name="baudrate">${baudrate}</param>
-                <!-- Optional, shown with their defaults and deliberately left out so this example
-                     exercises them -
-                     io_timeout_ms 5, ping_attempts 3, max_read_fails 50,
-                     allow_missing_servos false, protocol sms_sts, feedback_mode auto,
-                     encoder_steps 4096, current_per_count_a 0.006,
-                     torque_constant_nm_per_a 0.8825985 -->
+                <!-- use_mock_hardware:=true swaps the driver for ros2_control's own loopback
+                     simulator, which ships inside hardware_interface, opens no serial port and
+                     mirrors every command straight back into its matching state. The four <joint>
+                     blocks below are shared verbatim with the real driver: GenericSystem ignores
+                     the id/type/offset params it does not know, and a state interface with no
+                     command interface (effort, temperature) simply reads a constant 0.0. Two mock
+                     behaviours are not bugs: a velocity-commanded joint's position state never
+                     advances, so joint3 and joint4 stand still in RViz and the diff_drive odometry
+                     stays at zero; and nothing validates port, baudrate or id, so a green mock run
+                     says nothing about your wiring. The obvious cure for the frozen wheel position
+                     - the calculate_dynamics param - is a trap: it rejects any joint claiming two
+                     of position/velocity/acceleration, which is exactly what
+                     joint_trajectory_position_controller does to joint1 and joint2, and that
+                     controller then fails to activate. Do not add it. -->
+                <xacro:if value="${mock}">
+                    <plugin>mock_components/GenericSystem</plugin>
+                </xacro:if>
+                <xacro:unless value="${mock}">
+                    <plugin>waveshare_servos/WaveshareServos</plugin>
+                    <param name="port">${port}</param>
+                    <param name="baudrate">${baudrate}</param>
+                    <!-- Optional, shown with their defaults and deliberately left out so this
+                         example exercises them -
+                         io_timeout_ms 5, ping_attempts 3, max_read_fails 50,
+                         allow_missing_servos false, protocol sms_sts, feedback_mode auto,
+                         encoder_steps 4096, current_per_count_a 0.006,
+                         torque_constant_nm_per_a 0.8825985 -->
+                </xacro:unless>
             </hardware>
-        
+
             <!-- State interfaces are free-form - declare any subset of position, velocity,
                  effort, current, voltage, temperature, load and status, in any order. `torque` is
-                 a deprecated alias of `effort` that keeps reporting kg cm instead of N m. -->
-            <joint name="${prefix}joint1">
+                 a deprecated alias of `effort` that keeps reporting kg cm instead of N m.
+
+                 The min/max below and the <limit> tags in the URDF beside this file are MERGED,
+                 most-restrictive-wins, so keep the two numerically identical: whichever is tighter
+                 is what the framework enforces, and a disagreement makes the description behave
+                 differently depending on a controller-manager flag. They only bite when the
+                 controller manager runs with enforce_command_limits: true; this example ships with
+                 it off, and the driver clamps position commands to these same values on its own. -->
+            <joint name="joint1">
                 <param name="id">1</param>
                 <param name="type">pos</param>
                 <param name="offset">1.570796</param>
@@ -53,7 +87,7 @@
                 <state_interface name="temperature"/>
             </joint>
 
-            <joint name="${prefix}joint2">
+            <joint name="joint2">
                 <param name="id">2</param>
                 <param name="type">pos</param>
                 <param name="offset">1.570796</param>
@@ -71,7 +105,7 @@
                 <state_interface name="temperature"/>
             </joint>
 
-            <joint name="${prefix}joint3">
+            <joint name="joint3">
                 <param name="id">3</param>
                 <param name="type">vel</param>
                 <command_interface name="velocity">
@@ -95,7 +129,7 @@
                  so an inverted joint4 would spin its servo opposite to the model RViz draws, and
                  this file is what a new user copies first. See the bench description under
                  test/hil/descriptions for `inverted` exercised on hardware. -->
-            <joint name="${prefix}joint4">
+            <joint name="joint4">
                 <param name="id">4</param>
                 <param name="type">vel</param>
                 <command_interface name="velocity">

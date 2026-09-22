@@ -17,7 +17,8 @@ USER $USERNAME
 RUN sudo apt update && sudo apt upgrade -y
 RUN sudo apt update && sudo apt install -y \
     git \
-    python3-pip
+    python3-pip \
+    ros-${ROS_DISTRO}-diff-drive-controller
 
 RUN rosdep update
 

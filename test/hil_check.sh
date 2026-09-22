@@ -379,9 +379,10 @@ diagnostics() {  # capture /diagnostics through the CLI (12.3: the recorder does
 
 # ------------------------------------------------------------------ the ten scenarios (12.5)
 h_H1() {
-  # H1 is the shipped entry point, and neither example.launch.py nor example.urdf.xacro forwards
-  # a port, so it can only ever drive the packaged default. Running it against another adapter
-  # would silently test the wrong port, so say so and skip instead.
+  # H1 is the shipped entry point. example.launch.py now has a port argument, but this scenario
+  # deliberately does not pass one, so it always exercises the packaged default. Running it against
+  # another adapter would silently test the wrong port, so say so and skip instead. (Passing
+  # port:=$PORT and dropping this skip is a Phase 5 change.)
   if [ "$PORT" != /dev/ttyACM0 ]; then
     abort_scenario H1 "example.launch.py drives its packaged default port, not $PORT"
     return 0
@@ -644,8 +645,8 @@ h_H10() {
   fact port_holders_after_exit "$(port_holders)"
   probe probe_after_exit
   # The second stimulus of 12.5: SIGTERM, not SIGINT, to a bare ros2_control_node, again with a
-  # wheel turning. The launch's own SIGINT teardown is the one H1 exercises; example.launch.py
-  # drives its packaged default port and ids 1-3, so it is not repeated here.
+  # wheel turning. The launch's own SIGINT teardown is the one H1 exercises, against the packaged
+  # default port which that scenario deliberately does not override, so it is not repeated here.
   start_stack "" "[joint3, joint4]"
   r2 10 topic pub --once /wheels/commands std_msgs/msg/Float64MultiArray "{data: [1.0, 1.0]}" \
     > /dev/null 2>&1

@@ -2604,14 +2604,67 @@ TEST_F(DropRecoverOverPty, a_dropped_wheel_does_not_jump_back_to_its_activation_
   }
 }
 
+TEST_F(DropRecoverOverPty, a_component_cycle_keeps_a_present_wheels_multi_turn_count)
+{
+  // Found on the real bench in Phase 4 (hil_check H9.g1c.joint3/joint4) and reproduced outside the
+  // harness on the shipped example.launch.py: `ros2 control set_hardware_component_state <hw>
+  // inactive` then `active` used to ZERO the multi-turn count, so a wheel several revolutions out
+  // jumped backward by exactly the whole turns it had accumulated -- 6.000 turns in H9, 5.000 in
+  // the standalone repro, landing on the raw wrapped register value.
+  //
+  // PHASE2_SPEC 8.4 reset on every activation, on the stated grounds that "the consumer that
+  // integrates wheel position re-zeroes on hardware activation, exactly as it does on controller
+  // activation". That premise is false for a hardware-component cycle: the CONTROLLER stays ACTIVE
+  // across it and is never told it happened, so it has no re-zero to perform. diff_drive_controller
+  // with position_feedback: true simply differences the two sides of the jump and teleports the
+  // odometry by N * 2 pi * wheel_radius -- 0.314 m per accumulated turn at the example's configured
+  // radius -- and 4.42.1 ships no reset service to recover from it.
+  //
+  // So a wheel that stayed PRESENT across the cycle keeps its count. The bridge is bounded to whole
+  // revolutions and is the same envelope every sample gap has; re-seeding instead makes the error
+  // the full travel, which position_unwrapper.hpp's own "Rejected alternatives" already calls
+  // strictly worse. A wheel that was DROPPED still starts a new count, because the drop path
+  // resets it (cpp, the dropping branch of read()) -- pinned by the test below this one.
+  bring_up();
+  for (int cycle = 1; cycle <= 10; cycle++) {
+    fake_.set_position(3, (cycle * 1000) % kEncoderSteps);
+    fake_.set_position(4, (cycle * 1000) % kEncoderSteps);
+    step_read();
+  }
+  const double spun = state_of("joint3/position");
+  ASSERT_DOUBLE_EQ(spun, rad_of_tick(10000, 0.0));
+  ASSERT_GT(spun, 4.0 * M_PI) << "two whole revolutions on";
+
+  ASSERT_EQ(deactivate(), hardware_interface::return_type::OK);
+  ASSERT_EQ(activate(), hardware_interface::return_type::OK);
+  step_read();
+
+  EXPECT_DOUBLE_EQ(state_of("joint3/position"), spun) <<
+    "the count survives the cycle instead of dropping back by whole revolutions";
+  EXPECT_DOUBLE_EQ(state_of("joint4/position"), spun);
+  EXPECT_GT(state_of("joint3/position"), 4.0 * M_PI) << "not the raw wrapped register value";
+
+  // and it keeps counting from there: the wheel turns another 1000 ticks after the cycle
+  fake_.set_position(3, 11000 % kEncoderSteps);
+  fake_.set_position(4, 11000 % kEncoderSteps);
+  step_read();
+  EXPECT_DOUBLE_EQ(state_of("joint3/position"), rad_of_tick(11000, 0.0));
+  EXPECT_DOUBLE_EQ(state_of("joint4/position"), rad_of_tick(11000, 0.0));
+
+  // the carried bridge is not reported as lost revolutions: read_fails_ is zeroed at the top of
+  // on_activate, so the seeding sample is charged no missed cycles
+  EXPECT_THAT(warnings(), Not(Contains(HasSubstr("may be off by whole revolutions"))));
+}
+
 TEST_F(DropRecoverOverPty, a_rejoining_wheel_starts_a_new_unwrapped_count)
 {
-  // PHASE2_SPEC 8.4: on_activate resets the counter, so a wheel that rejoins reports its plain
-  // register reading again rather than carrying an old count forward. The consumer that integrates
-  // wheel position re-zeroes on hardware activation, exactly as it does on controller activation.
-  // joint4 is the control: the same wheel motion, never silent, never dropped. It pins that the
-  // reset is on_activate's and not the drop's -- a driver that only reset a REJOINING servo's
-  // count would leave this one continuing from 10000 ticks across the same transition.
+  // PHASE2_SPEC 8.4, narrowed in Phase 4 to the case that still holds: a wheel that was DROPPED
+  // reports its plain register reading again rather than carrying an old count forward, because the
+  // drop path reset the accumulator when it stopped believing the servo. joint4 is the control, and
+  // its expectation is the REVERSE of what PHASE2_SPEC 8.4 originally pinned: it stayed present
+  // across the transition, so it carries its count -- see
+  // a_component_cycle_keeps_a_present_wheels_multi_turn_count above for why the old
+  // "every activation starts a new count" rule was wrong.
   bring_up();
   for (int cycle = 1; cycle <= 10; cycle++) {
     fake_.set_position(3, (cycle * 1000) % kEncoderSteps);
@@ -2634,8 +2687,12 @@ TEST_F(DropRecoverOverPty, a_rejoining_wheel_starts_a_new_unwrapped_count)
   EXPECT_DOUBLE_EQ(state_of("joint3/position"), rad_of_tick(700, 0.0));
   EXPECT_LT(state_of("joint3/position"), 2.0 * M_PI) << "a new count, inside one turn";
   EXPECT_GE(state_of("joint3/position"), 0.0);
-  EXPECT_DOUBLE_EQ(state_of("joint4/position"), rad_of_tick(900, 0.0)) <<
-    "every activation starts a new count, dropped servo or not";
+  // joint4 was never silent and never dropped, so it bridges 10000 -> 900 ticks the short way:
+  // 900 - (10000 % 4096) = 900 - 1808 = -908 ticks, i.e. 10000 - 908 = 9092. The point of the row
+  // is that the DROP is what starts a new count, not the activation.
+  EXPECT_DOUBLE_EQ(state_of("joint4/position"), rad_of_tick(9092, 0.0)) <<
+    "a servo that stayed present carries its count across the activation";
+  EXPECT_GT(state_of("joint4/position"), 4.0 * M_PI) << "two whole revolutions still on it";
   // the re-seed is not a gap: PositionUnwrapper::bridged() is false on the seeding sample, so
   // nothing about lost revolutions is reported for it
   EXPECT_THAT(warnings(), Not(Contains(HasSubstr("may be off by whole revolutions"))));

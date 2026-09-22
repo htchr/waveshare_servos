@@ -1414,12 +1414,37 @@ hardware_interface::CallbackReturn WaveshareServos::on_activate(
     vel_cmds_[i] = 0.0;
     push_velocity_command(i);
     hold_pos_[i] = std::numeric_limits<double>::quiet_NaN();
-    // Start the continuous count again, BEFORE the seeding feedback() below: that sample then makes
-    // pos_states_[i] the plain register reading, so the command seed, the limit check and the
-    // activation hold decision are bit-for-bit what they were before unwrapping existed. The
-    // consequence, documented rather than hidden: a consumer that integrates wheel position has to
-    // re-zero on hardware activation, exactly as it does on controller activation.
-    reset_unwrap(i);
+    // A joint whose count is still seeded KEEPS it across an inactive->active cycle; only a count
+    // that has already been thrown away is started again here, and the seeding feedback() below
+    // then bridges the gap instead of re-zeroing (PHASE2_SPEC 8.4, narrowed in Phase 4).
+    //
+    // 8.4 originally reset unconditionally, on the grounds that "a consumer that integrates wheel
+    // position has to re-zero on hardware activation, exactly as it does on controller activation".
+    // That premise does not hold: a controller stays ACTIVE across a hardware-component cycle and
+    // is never told it happened, so it has no re-zero to perform. Measured on the bench (hil_check
+    // H9.g1c) and reproduced on the shipped example, the reset dropped a wheel's position by
+    // exactly the whole turns it had accumulated -- 6.000 turns in H9 -- which
+    // diff_drive_controller with position_feedback: true differences into a 0.314 m odometry
+    // teleport per turn at the example's wheel_radius, with no reset service in 4.42.1 to undo it.
+    //
+    // There is nothing left to protect here: `unwrap` is rejected for a `pos` joint (read_joints),
+    // so only wheels carry a count, and a wheel has no position command to seed, no position limits
+    // to be outside of (outside_limits is false for every non-position joint) and no activation
+    // hold -- the three things the old comment said the plain register reading was needed for. For
+    // a joint that does not unwrap, unwrap_ticks() returns `raw` without consulting the accumulator
+    // at all, so this is bit-for-bit unchanged for `pos` joints either way.
+    //
+    // The two resets that DO fire are the ones where continuity was genuinely lost: close_port()
+    // clears every count (a new session on a newly opened port), and read()'s dropping branch
+    // clears the count of a servo it has stopped believing -- so a rejoining servo still starts
+    // fresh, which is what a_rejoining_wheel_starts_a_new_unwrapped_count pins. Carried from a live
+    // count, the bridge is bounded to whole revolutions and has the same envelope as any sample
+    // gap; a wheel hand-turned more than half a revolution while INACTIVE aliases exactly as one
+    // turned that far between two reads does. Re-seeding instead makes the error the full travel,
+    // which position_unwrapper.hpp's own "Rejected alternatives" already calls strictly worse.
+    if (!unwrap_[i].seeded()) {
+      reset_unwrap(i);
+    }
     if (present_[i]) {
       // A servo whose torque has been latched off -- by a protection trip, or by whatever
       // last talked to it -- accepts goal positions and quietly ignores them.

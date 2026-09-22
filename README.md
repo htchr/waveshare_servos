@@ -55,6 +55,24 @@ To verify your installation works, launch the example launch file:
 ros2 launch waveshare_servos example.launch.py
 ```
 
+The launch file takes four arguments:
+
+| argument | default | effect |
+| --- | --- | --- |
+| `port` | `/dev/ttyACM0` | serial port of the bus servo adapter |
+| `baudrate` | `1000000` | bus baud rate |
+| `use_mock_hardware` | `false` | `true` swaps in `mock_components/GenericSystem`, which opens no serial port. Accepts `true`, `false`, `1` or `0` in any case; any other value aborts the render on purpose |
+| `gui` | `true` | `false` starts no RViz |
+
+For example: `ros2 launch waveshare_servos example.launch.py port:=/dev/ttyUSB0 gui:=false`.
+
+Under `use_mock_hardware:=true` every command is mirrored straight back into its state, so this is
+how to try the example with no hardware at all.
+One mock-only quirk is worth knowing before reporting it as a bug: a velocity-commanded joint's
+`position` never advances, so the wheels stand still in RViz and the odometry below stays at zero.
+That is `mock_components/GenericSystem`, not the driver.
+`effort` and `temperature` likewise read a constant `0.0`.
+
 Move a position-controlled servo with:
 
 ```bash
@@ -88,6 +106,55 @@ Check the order on a running system with `ros2 param get /joint_velocity_control
 
 Each servo keeps turning at its commanded velocity until a new command arrives; send a zero for every joint (e.g. `{data: [0.0, 0.0]}`) to stop them.
 A command whose length does not match the `joints` list stops all the velocity-controlled servos and deactivates the controller; reactivate it with `ros2 control switch_controllers --activate joint_velocity_controller`.
+
+### Driving the wheels as a differential base
+
+`example_controllers.yaml` also configures a `diff_drive_controller` over the two wheels.
+It ships in its own apt package -- `sudo apt install ros-jazzy-diff-drive-controller` -- and is
+declared as an `<exec_depend>`, so `rosdep install --from-paths src --ignore-src -r -y` picks it up
+too.
+Without it the launch still brings up the other three controllers, but the `diff_drive_controller`
+spawner exits non-zero and says why.
+
+The launch file loads it but leaves it **inactive**, because it commands the same `joint3/velocity`
+and `joint4/velocity` interfaces as `joint_velocity_controller`, and ros2_control hands each command
+interface to one controller only.
+Swap them atomically -- activating first, without the deactivate, is refused:
+
+```bash
+ros2 control switch_controllers --strict \
+  --deactivate joint_velocity_controller --activate diff_drive_controller
+```
+
+The controller subscribes to `geometry_msgs/msg/TwistStamped` (4.42.1 has no unstamped option) and
+brakes 0.5 s after the last message, so publish continuously rather than with `--once`:
+
+```bash
+ros2 topic pub -r 20 /diff_drive_controller/cmd_vel geometry_msgs/msg/TwistStamped \
+  '{header: {frame_id: base_link}, twist: {linear: {x: 0.1}}}'
+```
+
+`wheel_radius` (0.05 m) and `wheel_separation` (0.20 m) are **example values for a bench with no
+chassis** -- measure them on a real robot.
+They are picked so the arithmetic checks by eye: `linear.x: 0.1` is 2.0 rad/s on both wheels, and
+`angular.z: 1.0` is -2.0 rad/s on the left wheel (`joint3`, `left_wheel_names`) and +2.0 rad/s on the
+right (`joint4`).
+Same sign on both wheels for `linear.x`, opposite signs for `angular.z`; a positive `angular.z`
+drives the right wheel forward.
+
+`/diff_drive_controller/odom` integrates the wheels' **unwrapped** multi-turn `position` state
+(`position_feedback: true`), so it does not jump once per revolution.
+Two expected artefacts: the pose takes one step at activation, because the controller seeds its
+previous-wheel-position memory at zero and 4.42.1 has no reset service -- cycle the controller
+through `unconfigured` and back to `active` to zero the pose -- and while nothing is publishing
+`cmd_vel` the controller logs `Velocity command timed out. Braking.` about once a second.
+
+Go back with the reverse switch:
+
+```bash
+ros2 control switch_controllers --strict \
+  --deactivate diff_drive_controller --activate joint_velocity_controller
+```
 
 ## State interfaces
 
@@ -267,7 +334,7 @@ It is also not the packet size limits: a sync write chunks at 30 position record
 
 `io_timeout_ms` is the per-transaction budget the driver hands to the vendored serial layer (`SCSerial::IOTimeOut`). Legal range **2..1000**, default **5**.
 
-This is the first hardware parameter this README documents; the rest are listed with their defaults in `description/ros2_control/example.ros2_control.xacro:12-17`.
+This is the first hardware parameter this README documents; the rest are listed with their defaults in the `<hardware>` block of `description/ros2_control/example.ros2_control.xacro`.
 
 **Breaking change in this release.** The lower bound moved from 1 to 2 and the default from 20 to 5. A description that sets `io_timeout_ms` to 1 no longer configures -- `on_init` fails with a message naming the new range. That is deliberate: at 1 ms a sync read of four servos does not merely time out, it occasionally returns *the previous cycle's* reply frames, with correct headers, correct ids in the correct slots, correct length bytes and correct checksums. Eight of 3000 reads did exactly that on this bench. No flush can prevent it, so the value is refused instead.
 
