@@ -437,7 +437,7 @@ hardware_interface::CallbackReturn WaveshareServos::on_init(
     // 1. id. Required, and unchecked in Phase 1: the bare find("id")->second below was undefined
     // behaviour on a joint that declares none, and a measured SIGSEGV.
     int64_t id = 0;
-    params::Status st = params::get_int(jp, "id", 1, 253, id);
+    params::Status st = params::get_int(jp, "id", limits::kIdMin, limits::kIdMax, id);
     if (st == params::Status::kDefaulted || st == params::Status::kEmpty) {
       RCLCPP_FATAL(get_logger(),
         "joint '%s' has no <param name=\"id\">; every joint needs the bus id of its servo (1..253)",
@@ -976,7 +976,8 @@ hardware_interface::CallbackReturn WaveshareServos::on_configure(
     RCLCPP_WARN(get_logger(),
       "running as root: the kernel lets a root process open '%s' even though it is marked "
       "exclusive, so only the advisory lock protects this bus, and only against programs that "
-      "take it. 'ros2 run waveshare_servos set_id', screen and minicom do not take it.",
+      "take it. This package's scan, set_id and calibrate_midpoint take it; screen and minicom do "
+      "not.",
       port_.c_str());
   }
   // ping motors and remember which ones are actually on the bus

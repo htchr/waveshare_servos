@@ -4,6 +4,7 @@
 #include <sys/file.h>
 #include <sys/ioctl.h>
 #include <sys/select.h>
+#include <termios.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -28,6 +29,30 @@ namespace
 // saying so.
 constexpr std::array<int, 7> kMappedBaudrates = {
   9600, 19200, 38400, 57600, 115200, 500000, 1000000};
+
+// The termios speed of each of those rates, for set_baudrate(); B0 (hang up) for anything else,
+// which set_baudrate() never passes on because it checks is_supported_baudrate() first.
+speed_t speed_of(int baudrate) noexcept
+{
+  switch (baudrate) {
+    case 9600:
+      return B9600;
+    case 19200:
+      return B19200;
+    case 38400:
+      return B38400;
+    case 57600:
+      return B57600;
+    case 115200:
+      return B115200;
+    case 500000:
+      return B500000;
+    case 1000000:
+      return B1000000;
+    default:
+      return B0;
+  }
+}
 
 // 254 (0xfe) is the broadcast address the sync-write header itself carries (src/SCS.cpp:132) and
 // 255 is the header byte (:130-131), so a record addressed to either is nonsense the servos would
@@ -79,6 +104,21 @@ uint8_t sync_read_frame_checksum(const uint8_t * frame) noexcept
 {
   uint8_t sum = 0;
   for (std::size_t i = kFrameIdOffset; i + 1 < ServoBus::sync_read_frame_bytes; i++) {
+    sum = static_cast<uint8_t>(sum + frame[i]);
+  }
+  return static_cast<uint8_t>(~sum);
+}
+
+// A frame with no payload: ff ff id 02 status ~cks -- a ping reply, a write's ack, and the late
+// ack a READ can catch instead of its reply (PHASE6_SPEC B.4).
+constexpr std::size_t kStatusFrameBytes = 6;
+
+// The same arithmetic as sync_read_frame_checksum, over a frame of any length: the complemented
+// uint8_t sum of indices 2..length-2.
+uint8_t frame_checksum(const uint8_t * frame, std::size_t length) noexcept
+{
+  uint8_t sum = 0;
+  for (std::size_t i = kFrameIdOffset; i + 1 < length; i++) {
     sum = static_cast<uint8_t>(sum + frame[i]);
   }
   return static_cast<uint8_t>(~sum);
@@ -149,6 +189,33 @@ const char * to_string(BusStatus status)
       return "line settings could not be applied";
     case BusStatus::EXCLUSIVE_FAILED:
       return "port refused exclusive access";
+  }
+  return "unknown";
+}
+
+const char * to_string(ReplyKind kind)
+{
+  // No `default:` label, for the reason to_string(BusStatus) has none. snake_case with no spaces,
+  // because the tools put these into key=value detail lines.
+  switch (kind) {
+    case ReplyKind::NOT_OPEN:
+      return "not_open";
+    case ReplyKind::INVALID_ID:
+      return "invalid_id";
+    case ReplyKind::INVALID_COUNT:
+      return "invalid_count";
+    case ReplyKind::SILENT:
+      return "silent";
+    case ReplyKind::ONE:
+      return "one";
+    case ReplyKind::EXTRA:
+      return "extra";
+    case ReplyKind::WRONG_ID:
+      return "wrong_id";
+    case ReplyKind::STATUS_ONLY:
+      return "status_only";
+    case ReplyKind::GARBLED:
+      return "garbled";
   }
   return "unknown";
 }
@@ -490,10 +557,20 @@ bool ServoBus::read_feedback_one(uint8_t id, FeedbackBlock & out)
 
 std::size_t ServoBus::drain_input(uint32_t max_ms) noexcept
 {
+  // The guard is repeated here, ahead of the counter, so a closed bus is still not a counted
+  // drain: the body moved to discard_input() for the checked calls and this stayed as it was.
   if (!is_open()) {
     return 0;
   }
   sync_read_stats_.drains++;
+  return discard_input(max_ms);
+}
+
+std::size_t ServoBus::discard_input(uint32_t max_ms) noexcept
+{
+  if (!is_open()) {
+    return 0;
+  }
   // A DEADLINE, not a per-iteration timeout, and it deliberately does not stop at the first quiet
   // window: the frame this exists to swallow is by definition one that has not arrived yet, so
   // "the line went quiet for a millisecond" is no reason to believe it is not coming. It
@@ -525,6 +602,144 @@ std::size_t ServoBus::drain_input(uint32_t max_ms) noexcept
       }
     }
   }
+}
+
+Reply ServoBus::checked_ping(uint8_t id)
+{
+  // No parameters; writeBuf still sums MemAddr into the checksum, so it is 0 as in SCS::Ping.
+  return checked_transaction(
+    id, INST_PING, 0, nullptr, 0, 0, static_cast<uint32_t>(IOTimeOut), true);
+}
+
+Reply ServoBus::checked_read(uint8_t id, uint8_t first, uint8_t count)
+{
+  const bool count_ok = count >= 1 && count <= checked_max_bytes;
+  // The request SCS::Read builds (src/SCS.cpp:175-177): one parameter, the length.
+  uint8_t length = count;
+  return checked_transaction(
+    id, INST_READ, first, &length, 1, count, static_cast<uint32_t>(IOTimeOut), count_ok);
+}
+
+Reply ServoBus::checked_write(
+  uint8_t id, uint8_t first, const uint8_t * data, uint8_t count, uint32_t ack_timeout_ms)
+{
+  const bool count_ok = data != nullptr && count >= 1 && count <= checked_max_bytes;
+  // writeBuf takes u8 * (include/SCS.h:51) and a vendored signature is not something to
+  // const_cast around, so the bytes go through a copy -- bounded, because the count is.
+  std::array<uint8_t, checked_max_bytes> bytes{};
+  if (count_ok) {
+    std::copy(data, data + count, bytes.begin());
+  }
+  return checked_transaction(
+    id, INST_WRITE, first, bytes.data(), count, 0, ack_timeout_ms, count_ok);
+}
+
+Reply ServoBus::checked_reset(uint8_t id, uint32_t ack_timeout_ms)
+{
+  // No parameters, like a ping: writeBuf still sums MemAddr (0) into the checksum, which gives the
+  // bench's FF FF 04 02 06 F3 for id 4.
+  return checked_transaction(id, inst_reset, 0, nullptr, 0, 0, ack_timeout_ms, true);
+}
+
+bool ServoBus::set_baudrate(int baudrate) noexcept
+{
+  if (!is_open() || !is_supported_baudrate(baudrate)) {
+    return false;
+  }
+  struct termios settings{};
+  if (::tcgetattr(fd, &settings) != 0) {
+    return false;
+  }
+  const speed_t speed = speed_of(baudrate);
+  if (::cfsetispeed(&settings, speed) != 0 || ::cfsetospeed(&settings, speed) != 0) {
+    return false;
+  }
+  // TCSADRAIN: a request still leaving at the old rate goes out whole before the switch.
+  if (::tcsetattr(fd, TCSADRAIN, &settings) != 0) {
+    return false;
+  }
+  ::tcflush(fd, TCIFLUSH);
+  baudrate_ = baudrate;
+  return true;
+}
+
+Reply ServoBus::checked_transaction(
+  uint8_t id, uint8_t instruction, uint8_t first, uint8_t * params, uint8_t param_bytes,
+  uint8_t payload_bytes, uint32_t window_ms, bool count_ok)
+{
+  Reply reply;
+  // Every refusal before a byte is built, and the port first: readSCS would FD_SET(-1) and abort
+  // under _FORTIFY_SOURCE (write_acc above), and 0xfe / 0xff are the broadcast and a header
+  // byte, which no single servo answers for.
+  if (!is_open()) {
+    return reply;
+  }
+  if (id == 0xfe || id == 0xff) {
+    reply.kind = ReplyKind::INVALID_ID;
+    return reply;
+  }
+  if (!count_ok) {
+    reply.kind = ReplyKind::INVALID_COUNT;
+    return reply;
+  }
+
+  // Exactly the reply this request is owed, never more: readSCS returns early only once it has
+  // them all, so asking for more would cost the whole window on every healthy transaction.
+  const std::size_t expected = payload_bytes + kStatusFrameBytes;
+  std::array<uint8_t, checked_max_bytes + kStatusFrameBytes> rx{};
+  rFlushSCS();
+  writeBuf(id, first, params, param_bytes, instruction);
+  wFlushSCS();
+  const auto started = std::chrono::steady_clock::now();
+  // Borrowed for this one readSCS and given back on the only path out of it.
+  const auto io_timeout = IOTimeOut;
+  IOTimeOut = window_ms;
+  const int got = readSCS(rx.data(), static_cast<int>(expected));
+  IOTimeOut = io_timeout;
+  reply.elapsed_us = static_cast<uint32_t>(
+    std::chrono::duration_cast<std::chrono::microseconds>(
+      std::chrono::steady_clock::now() - started).count());
+  reply.bytes = (got > 0) ? std::min(static_cast<std::size_t>(got), expected) : 0u;
+  if (reply.bytes == 0) {
+    // No drain: nothing arrived, so a silent id costs one window and not a window and a drain.
+    reply.kind = ReplyKind::SILENT;
+    return reply;
+  }
+  // Whatever follows the reply -- a twin's copy, the rest of a frame longer than the one asked
+  // for -- is read out and counted, not left to be taken for the next transaction's reply.
+  reply.extra_bytes = discard_input(checked_drain_ms);
+
+  // One frame, at the head of the window, through the gate parse_sync_read_burst applies to a
+  // slot: header, length byte, checksum, id. No resync: a byte ahead of the header is not a
+  // reply from anybody, and GARBLED is the honest word for it.
+  const uint8_t * frame = rx.data();
+  const bool headed = reply.bytes >= kStatusFrameBytes && frame[0] == 0xff && frame[1] == 0xff &&
+    frame[kFrameIdOffset] != 0xff && frame[kFrameLengthOffset] >= 2;
+  const std::size_t length = headed ? frame[kFrameLengthOffset] + 4u : 0u;
+  const bool summed = headed && length <= reply.bytes &&
+    frame[length - 1] == frame_checksum(frame, length);
+  const bool asked_for = summed && length == expected;
+  const bool late_status = summed && instruction == INST_READ && length == kStatusFrameBytes;
+  if (!asked_for && !late_status) {
+    reply.kind = ReplyKind::GARBLED;
+    return reply;
+  }
+  reply.from_id = frame[kFrameIdOffset];
+  reply.status = frame[kFrameStatusOffset];
+  reply.frame_bytes = length;
+  if (late_status) {
+    reply.kind = ReplyKind::STATUS_ONLY;
+    return reply;
+  }
+  // A write's ack is accepted from ANY id (an id write may be acked from the new one); a ping's
+  // or a READ's reply only from the id that was asked.
+  if (instruction != INST_WRITE && reply.from_id != id) {
+    reply.kind = ReplyKind::WRONG_ID;
+    return reply;
+  }
+  reply.kind = (reply.extra_bytes > 0) ? ReplyKind::EXTRA : ReplyKind::ONE;
+  reply.data.assign(frame + kFrameDataOffset, frame + kFrameDataOffset + payload_bytes);
+  return reply;
 }
 
 void ServoBus::reserve_goal_capacity(std::size_t position_servos, std::size_t speed_servos)

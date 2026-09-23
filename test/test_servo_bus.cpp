@@ -21,6 +21,7 @@
 #include <pty.h>
 #include <sys/file.h>
 #include <sys/ioctl.h>
+#include <termios.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -33,7 +34,9 @@
 #include <cstring>
 #include <deque>
 #include <filesystem>
+#include <map>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <system_error>
 #include <thread>
@@ -650,7 +653,7 @@ TEST_F(ServoBusPty, a_plain_open_by_this_process_is_refused_while_the_bus_holds_
   if (probe != -1) {
     ::close(probe);
   }
-  EXPECT_EQ(probe, -1) << "TIOCEXCL did not take: screen, minicom and set_id could still open it";
+  EXPECT_EQ(probe, -1) << "TIOCEXCL did not take: screen and minicom could still open it";
   EXPECT_EQ(refused_with, EBUSY);
 }
 
@@ -3023,4 +3026,1375 @@ TEST_F(ServoBusSyncRead, sync_read_feedback_counts_what_it_lost)
   EXPECT_EQ(stats.missing_frames, 1u + 4u);
   EXPECT_EQ(stats.short_bursts, 2u);
   fake_.set_sync_read_supported(true);
+}
+
+// ---------------------------------------------------------------------------------------------
+// PHASE6_SPEC D.1: what test/fake_servo_bus.hpp learned for the Phase 6 tools, on trial itself
+// before any tool is tested against it -- the FakeBusSyncRead precedent. Plain TESTs with their
+// own FakeBus, because two of them put a bad-checksum frame on the wire on purpose and the
+// fixtures above assert bad_checksums() == 0 on the way out.
+// ---------------------------------------------------------------------------------------------
+
+namespace
+{
+
+using waveshare_servos_test::EepromPolicy;
+using waveshare_servos_test::FakeBus;
+using waveshare_servos_test::FakeServo;
+using waveshare_servos_test::FrameRecord;
+using waveshare_servos_test::IdWriteAck;
+using waveshare_servos_test::TwinReply;
+using waveshare_servos_test::WriteRecord;
+using waveshare_servos_test::kBroadcastId;
+using waveshare_servos_test::kInstPing;
+using waveshare_servos_test::kInstRead;
+using waveshare_servos_test::kInstReset;
+using waveshare_servos_test::kInstSyncWrite;
+using waveshare_servos_test::kInstWrite;
+using waveshare_servos_test::kRegAcc;
+using waveshare_servos_test::kRegId;
+using waveshare_servos_test::kRegLock;
+using waveshare_servos_test::kRegMode;
+using waveshare_servos_test::kRegOffset;
+using waveshare_servos_test::kRegPresentPosition;
+using waveshare_servos_test::kRegTorqueEnable;
+
+// A ServoBus that can also put on the wire what no vendored call would send as it stands -- raw
+// bytes, a request with no Ack() after it -- and read back whatever arrives, through the bus's own
+// raw-mode descriptor. writeBuf, writeSCS, wFlushSCS and readSCS are protected, so a derived type
+// is the only way to reach them; every other call is the ordinary ServoBus.
+struct RawWire : ServoBus
+{
+  void send_raw(std::vector<uint8_t> bytes)
+  {
+    rFlushSCS();
+    writeSCS(bytes.data(), static_cast<int>(bytes.size()));
+    wFlushSCS();
+  }
+
+  void send_ping(uint8_t id)
+  {
+    rFlushSCS();
+    writeBuf(id, 0, nullptr, 0, kInstPing);
+    wFlushSCS();
+  }
+
+  void send_read(uint8_t id, uint8_t address, uint8_t length)
+  {
+    rFlushSCS();
+    writeBuf(id, address, &length, 1, kInstRead);
+    wFlushSCS();
+  }
+
+  void send_write(uint8_t id, uint8_t address, std::vector<uint8_t> bytes)
+  {
+    rFlushSCS();
+    writeBuf(id, address, bytes.data(), static_cast<uint8_t>(bytes.size()), kInstWrite);
+    wFlushSCS();
+  }
+
+  // FF FF id 02 06 ~sum, the frame of context/motor_reset_command_email.png
+  void send_reset(uint8_t id)
+  {
+    rFlushSCS();
+    writeBuf(id, 0, nullptr, 0, kInstReset);
+    wFlushSCS();
+  }
+
+  // Up to `bytes` bytes within one io timeout, unparsed.
+  std::vector<uint8_t> receive(std::size_t bytes)
+  {
+    std::vector<uint8_t> got(bytes);
+    const int n = readSCS(got.data(), static_cast<int>(bytes));
+    got.resize(n > 0 ? static_cast<std::size_t>(n) : 0u);
+    return got;
+  }
+};
+
+int offset_word(const FakeBus & fake, uint8_t id)
+{
+  const FakeServo servo = fake.snapshot(id);
+  return servo.mem[kRegOffset] | (servo.mem[kRegOffset + 1] << 8);
+}
+
+}  // namespace
+
+TEST(FakeBusTools, add_servo_seeds_its_id_register)
+{
+  // A real servo's register 5 IS its id. The tools read it back and refuse a servo whose id
+  // register disagrees with the id it answered at, so a fake that left it 0 would make every
+  // servo on it look inconsistent.
+  FakeBus fake;
+  fake.add_servo(7, 1);
+  const FakeServo servo = fake.snapshot(7);
+  EXPECT_EQ(servo.mem[kRegId], 7);
+  EXPECT_EQ(servo.mem[kRegMode], 1);
+  // and the EEPROM shadow starts as the register file's EEPROM half, so a power cycle of a servo
+  // nobody wrote to changes nothing
+  EXPECT_EQ(servo.eeprom[kRegId], 7);
+  EXPECT_EQ(servo.eeprom[kRegMode], 1);
+
+  RawWire bus;
+  ASSERT_TRUE(static_cast<bool>(bus.open(fake.port(), kBaudrate, kIoTimeoutMs)));
+  EXPECT_EQ(bus.readByte(7, kRegId), 7);
+}
+
+TEST(FakeBusTools, descriptors_are_close_on_exec)
+{
+  // The CLI tests spawn the real tools on this fake. A child that inherited the master or the
+  // slave would hold the pty open after the parent is done with it -- and an inherited slave
+  // would show up in the child's own holder list. This is the only proof of the flag (D.5).
+  FakeBus fake;
+  const int master_flags = ::fcntl(fake.master_fd(), F_GETFD);
+  const int slave_flags = ::fcntl(fake.slave_fd(), F_GETFD);
+  ASSERT_NE(master_flags, -1) << std::strerror(errno);
+  ASSERT_NE(slave_flags, -1) << std::strerror(errno);
+  EXPECT_NE(master_flags & FD_CLOEXEC, 0) << "a spawned tool would inherit the master";
+  EXPECT_NE(slave_flags & FD_CLOEXEC, 0) << "a spawned tool would inherit the slave";
+}
+
+TEST(FakeBusTools, frame_log_records_requests_to_absent_unknown_and_broadcast_ids)
+{
+  // The frame log is what a coverage gate reads ("every id 0..253 was pinged three times"), so it
+  // must see a request whether or not anything answered it. Logged before the broadcast and the
+  // absent/unknown returns, or a scan of an empty bus would log nothing at all.
+  FakeBus fake;
+  fake.add_servo(1);
+  fake.add_servo(2);
+  fake.set_absent(2, true);
+  RawWire bus;
+  ASSERT_TRUE(static_cast<bool>(bus.open(fake.port(), kBaudrate, kIoTimeoutMs)));
+
+  EXPECT_EQ(bus.Ping(1), 1);
+  EXPECT_EQ(bus.readByte(1, kRegMode), 0);
+  EXPECT_EQ(bus.writeByte(1, kRegAcc, 9), 1);
+  EXPECT_EQ(bus.Ping(2), -1);       // absent
+  EXPECT_EQ(bus.Ping(9), -1);       // unknown
+  EXPECT_TRUE(static_cast<bool>(bus.write_goal_speeds({GoalSpeed{1, 100}})));
+  fake.wait_quiet();                // a broadcast is never acked, so nothing else waits for it
+
+  const std::vector<FrameRecord> frames = fake.frames();
+  ASSERT_EQ(frames.size(), 6u);
+  const std::vector<std::vector<uint8_t>> params = {
+    {}, {kRegMode, 1}, {kRegAcc, 9}, {}, {}, {46, 2, 1, 100, 0}};
+  const std::vector<uint8_t> ids = {1, 1, 1, 2, 9, kBroadcastId};
+  const std::vector<uint8_t> instructions = {
+    kInstPing, kInstRead, kInstWrite, kInstPing, kInstPing, kInstSyncWrite};
+  for (std::size_t i = 0; i < frames.size(); i++) {
+    EXPECT_EQ(frames[i].id, ids[i]) << "frame " << i;
+    EXPECT_EQ(frames[i].instruction, instructions[i]) << "frame " << i;
+    EXPECT_EQ(frames[i].params, params[i]) << "frame " << i;
+  }
+  EXPECT_EQ(fake.frames_received(), 6u);
+  EXPECT_EQ(fake.ping_counts(), (std::map<uint8_t, int>{{1, 1}, {2, 1}, {9, 1}}));
+  EXPECT_EQ(fake.writes(), (std::vector<WriteRecord>{WriteRecord{1, kRegAcc, {9}}})) <<
+    "a broadcast sync write is not an addressed write";
+
+  fake.clear_frames();
+  EXPECT_TRUE(fake.frames().empty());
+  EXPECT_EQ(fake.frames_received(), 0u);
+  EXPECT_EQ(fake.bytes_received(), 0u) << "clear_frames() starts a new observation window";
+}
+
+TEST(FakeBusTools, bytes_received_counts_garbage_and_bad_checksum_frames)
+{
+  // consume() drops garbage and bad-checksum frames before answer() ever sees them, so the frame
+  // log alone cannot prove that nothing was sent. The raw byte count can: it is taken right after
+  // read(), before anything is parsed.
+  FakeBus fake;
+  fake.add_servo(1);
+  RawWire bus;
+  ASSERT_TRUE(static_cast<bool>(bus.open(fake.port(), kBaudrate, kIoTimeoutMs)));
+  EXPECT_EQ(fake.bytes_received(), 0u) << "opening the port sends nothing";
+
+  const std::vector<uint8_t> garbage = {0x12, 0x34, 0x56};
+  // a ping of id 1 with its checksum (0xfb) inverted
+  const std::vector<uint8_t> mis_summed = {0xff, 0xff, 0x01, 0x02, kInstPing, 0x04};
+  std::vector<uint8_t> bytes = garbage;
+  bytes.insert(bytes.end(), mis_summed.begin(), mis_summed.end());
+  bus.send_raw(bytes);
+  fake.wait_quiet();
+
+  EXPECT_EQ(fake.bytes_received(), garbage.size() + mis_summed.size());
+  EXPECT_EQ(fake.frames_received(), 0u) << "neither reached answer()";
+  EXPECT_EQ(fake.bad_checksums(), 1u);
+  EXPECT_EQ(fake.snapshot(1).pings, 0);
+}
+
+TEST(FakeBusTools, writing_the_id_register_moves_the_servo)
+{
+  // set_id's whole effect. The map entry moves, counters and knobs with it, so a case can follow
+  // one servo across the move.
+  FakeBus fake;
+  fake.add_servo(4);
+  fake.set_status(4, 0x20);
+  RawWire bus;
+  ASSERT_TRUE(static_cast<bool>(bus.open(fake.port(), kBaudrate, kIoTimeoutMs)));
+  ASSERT_EQ(bus.Ping(4), 4);
+
+  EXPECT_EQ(bus.writeByte(4, kRegId, 253), 1) << "acked from the old id, the default";
+  ASSERT_EQ(bus.Ping(253), 253);
+  EXPECT_EQ(bus.Ping(4), -1);
+  EXPECT_THROW(fake.snapshot(4), std::out_of_range);
+  FakeServo moved;
+  ASSERT_NO_THROW(moved = fake.snapshot(253));
+  EXPECT_EQ(moved.mem[kRegId], 253);
+  EXPECT_EQ(moved.eeprom[kRegId], 253) << "the default policy commits it";
+  EXPECT_EQ(moved.pings, 2) << "the counters moved with it";
+  EXPECT_EQ(moved.writes, 1);
+  EXPECT_EQ(moved.status, 0x20) << "and so did the knobs";
+  EXPECT_EQ(fake.id_collisions(), 0u);
+}
+
+TEST(FakeBusTools, id_write_ack_can_come_from_the_new_id_or_not_at_all)
+{
+  // Which id acks an id write is unmeasured on the ST3025 (H15 records it), so the tools must
+  // succeed whichever it is. The fake can do all three.
+  FakeBus fake;
+  fake.add_servo(4);
+  fake.add_servo(5);
+  fake.add_servo(6);
+  fake.set_id_write_ack(4, IdWriteAck::new_id);
+  fake.set_id_write_ack(5, IdWriteAck::none);
+  fake.set_id_write_ack(6, IdWriteAck::new_id);
+  RawWire bus;
+  ASSERT_TRUE(static_cast<bool>(bus.open(fake.port(), kBaudrate, kIoTimeoutMs)));
+
+  bus.send_write(4, kRegId, {253});
+  const std::vector<uint8_t> ack = bus.receive(6);
+  ASSERT_EQ(ack.size(), 6u);
+  EXPECT_EQ(ack[2], 253) << "the ack carries the id the servo has now";
+  ASSERT_EQ(bus.Ping(253), 253);
+
+  bus.send_write(5, kRegId, {252});
+  EXPECT_TRUE(bus.receive(6).empty()) << "no ack at all";
+  ASSERT_EQ(bus.Ping(252), 252);
+
+  // And the vendored writeByte calls an ack from the new id a failure (src/SCS.cpp:279) although
+  // the servo moved -- the reason no tool may read an ack as proof either way.
+  EXPECT_EQ(bus.writeByte(6, kRegId, 251), 0);
+  EXPECT_EQ(bus.Ping(251), 251);
+}
+
+TEST(FakeBusTools, moving_onto_a_taken_id_counts_a_collision)
+{
+  // Two servos on one key cannot be represented, so the move is refused and counted. The tool
+  // tests assert id_collisions() == 0 on the way out: a tool that let this happen fails there.
+  FakeBus fake;
+  fake.add_servo(3);
+  fake.add_servo(4);
+  RawWire bus;
+  ASSERT_TRUE(static_cast<bool>(bus.open(fake.port(), kBaudrate, kIoTimeoutMs)));
+
+  EXPECT_EQ(bus.writeByte(4, kRegId, 3), 1);
+  EXPECT_EQ(fake.id_collisions(), 1u);
+  EXPECT_EQ(fake.snapshot(4).mem[kRegId], 3) << "the register took the write";
+  EXPECT_EQ(fake.snapshot(3).mem[kRegId], 3);
+  EXPECT_EQ(bus.Ping(4), 4) << "but the servo did not move";
+}
+
+TEST(FakeBusTools, drop_when_locked_ignores_eeprom_writes_until_unlocked)
+{
+  FakeBus fake;
+  fake.add_servo(1);
+  fake.set_eeprom_policy(EepromPolicy::drop_when_locked);
+  fake.set_byte(1, kRegLock, 1);
+  RawWire bus;
+  ASSERT_TRUE(static_cast<bool>(bus.open(fake.port(), kBaudrate, kIoTimeoutMs)));
+
+  EXPECT_EQ(bus.writeByte(1, kRegOffset, 7), 1) << "acked";
+  EXPECT_EQ(fake.snapshot(1).mem[kRegOffset], 0) << "and ignored";
+  EXPECT_EQ(fake.snapshot(1).eeprom[kRegOffset], 0);
+  // SRAM is not EEPROM: torque applies whatever the lock says
+  EXPECT_EQ(bus.writeByte(1, kRegTorqueEnable, 1), 1);
+  EXPECT_EQ(fake.snapshot(1).mem[kRegTorqueEnable], 1);
+
+  EXPECT_EQ(bus.writeByte(1, kRegLock, 0), 1);
+  EXPECT_EQ(bus.writeByte(1, kRegOffset, 7), 1);
+  EXPECT_EQ(fake.snapshot(1).mem[kRegOffset], 7);
+  EXPECT_EQ(fake.snapshot(1).eeprom[kRegOffset], 7);
+}
+
+TEST(FakeBusTools, volatile_when_locked_reverts_at_power_cycle)
+{
+  // Memory-table row 50: a write made while 55 reads 1 is applied and lost at power-off. The
+  // servo acts on it at once -- an id write moves it -- which is exactly why only a power cycle
+  // shows that a tool forgot to unlock.
+  FakeBus fake;
+  fake.add_servo(1);
+  fake.set_eeprom_policy(EepromPolicy::volatile_when_locked);
+  fake.set_byte(1, kRegLock, 1);
+  RawWire bus;
+  ASSERT_TRUE(static_cast<bool>(bus.open(fake.port(), kBaudrate, kIoTimeoutMs)));
+
+  EXPECT_EQ(bus.writeByte(1, kRegOffset, 7), 1);
+  EXPECT_EQ(fake.snapshot(1).mem[kRegOffset], 7) << "applied";
+  EXPECT_EQ(fake.snapshot(1).eeprom[kRegOffset], 0) << "and not committed";
+  fake.power_cycle();
+  EXPECT_EQ(fake.snapshot(1).mem[kRegOffset], 0) << "so the power cycle takes it back";
+
+  fake.set_byte(1, kRegLock, 1);
+  EXPECT_EQ(bus.writeByte(1, kRegId, 9), 1);
+  ASSERT_EQ(bus.Ping(9), 9) << "the servo moves at once";
+  fake.power_cycle();
+  EXPECT_EQ(bus.Ping(1), 1) << "and moves back at power-up";
+  EXPECT_EQ(bus.Ping(9), -1);
+}
+
+TEST(FakeBusTools, unlocked_write_survives_power_cycle)
+{
+  // The negative control of the case above: without it, a fake whose power cycle reverted
+  // everything would pass that case and fail no tool test that forgets the unlock.
+  FakeBus fake;
+  fake.add_servo(1);
+  fake.set_eeprom_policy(EepromPolicy::volatile_when_locked);
+  fake.set_power_up_lock(1);
+  fake.set_byte(1, kRegLock, 1);
+  RawWire bus;
+  ASSERT_TRUE(static_cast<bool>(bus.open(fake.port(), kBaudrate, kIoTimeoutMs)));
+
+  EXPECT_EQ(bus.writeByte(1, kRegLock, 0), 1);
+  EXPECT_EQ(bus.writeByte(1, kRegOffset, 7), 1);
+  EXPECT_EQ(bus.writeByte(1, kRegLock, 1), 1);
+  EXPECT_EQ(bus.writeByte(1, kRegTorqueEnable, 1), 1);
+  EXPECT_EQ(fake.snapshot(1).eeprom[kRegOffset], 7) << "committed while unlocked";
+  fake.power_cycle();
+  const FakeServo after = fake.snapshot(1);
+  EXPECT_EQ(after.mem[kRegOffset], 7);
+  EXPECT_EQ(after.mem[kRegTorqueEnable], 0) << "torque is off at power-up";
+  EXPECT_EQ(after.mem[kRegLock], 1) << "and the lock is the power-up value";
+
+  EXPECT_EQ(bus.writeByte(1, kRegLock, 0), 1);
+  EXPECT_EQ(bus.writeByte(1, kRegId, 9), 1);
+  ASSERT_EQ(bus.Ping(9), 9);
+  EXPECT_EQ(bus.writeByte(9, kRegLock, 1), 1);
+  fake.power_cycle();
+  EXPECT_EQ(bus.Ping(9), 9) << "an unlocked id write survives";
+  EXPECT_EQ(bus.Ping(1), -1);
+}
+
+TEST(FakeBusTools, default_policy_is_apply_always)
+{
+  // The fake every earlier suite was written against ignores the lock. The driver's set_mode
+  // brackets register 33 with an unlock and a lock, and those suites must see it land.
+  FakeBus fake;
+  fake.add_servo(1);
+  fake.set_byte(1, kRegLock, 1);
+  RawWire bus;
+  ASSERT_TRUE(static_cast<bool>(bus.open(fake.port(), kBaudrate, kIoTimeoutMs)));
+
+  EXPECT_EQ(bus.writeByte(1, kRegOffset, 7), 1);
+  EXPECT_EQ(fake.snapshot(1).mem[kRegOffset], 7);
+  EXPECT_EQ(fake.snapshot(1).eeprom[kRegOffset], 7) << "committed although 55 reads 1";
+  fake.power_cycle();
+  EXPECT_EQ(fake.snapshot(1).mem[kRegOffset], 7);
+}
+
+TEST(FakeBusTools, calibration_centres_present_and_moves_the_offset_on_bit_11)
+{
+  // Register 40 = 128: "current position correction is 2048". The model keeps the servo's
+  // physical angle and derives present from it and the offset. Its sign convention is the one H16
+  // measured on the ST3025 (README NOTE offset_sign = +1: the offset moves by position_before -
+  // 2048, sign-magnitude on bit 11), and ToolCalibrate.centres_a_position_servo pins it on purpose.
+  FakeBus fake;
+  fake.add_servo(2);
+  fake.add_servo(3);
+  fake.set_offset_model(2, true);
+  fake.set_offset_model(3, true);
+  fake.set_position(2, 1026);
+  fake.set_position(3, 3000);
+  fake.set_register40_after(3, 1);
+  RawWire bus;
+  ASSERT_TRUE(static_cast<bool>(bus.open(fake.port(), kBaudrate, kIoTimeoutMs)));
+
+  EXPECT_EQ(bus.writeByte(2, kRegTorqueEnable, 128), 1);
+  EXPECT_EQ(fake.word(2, kRegPresentPosition), 2048);
+  EXPECT_EQ(offset_word(fake, 2), 0x0800 | 1022) << "1026 - 2048 = -1022, sign on bit 11";
+  EXPECT_EQ(fake.snapshot(2).eeprom[kRegOffset], 0xfe) << "an EEPROM write";
+  EXPECT_EQ(fake.snapshot(2).mem[kRegTorqueEnable], 0) << "128 is not stored";
+  EXPECT_EQ(fake.snapshot(2).calibrations, 1);
+
+  EXPECT_EQ(bus.writeByte(3, kRegTorqueEnable, 128), 1);
+  EXPECT_EQ(fake.word(3, kRegPresentPosition), 2048);
+  EXPECT_EQ(offset_word(fake, 3), 952) << "3000 - 2048, bit 11 clear";
+  EXPECT_EQ(fake.snapshot(3).mem[kRegTorqueEnable], 1) << "set_register40_after";
+
+  // a write to 31-32 moves present too: offset 0 puts servo 2 back at its physical 1026
+  EXPECT_EQ(bus.writeWord(2, kRegOffset, 0), 1);
+  EXPECT_EQ(fake.word(2, kRegPresentPosition), 1026);
+}
+
+TEST(FakeBusTools, offset_model_off_stores_128_and_nothing_else)
+{
+  // "Calibration unsupported": today's fake, which the driver suites rely on, and the firmware
+  // calibrate_midpoint must report as not applied.
+  FakeBus fake;
+  fake.add_servo(2);
+  fake.set_position(2, 1026);
+  RawWire bus;
+  ASSERT_TRUE(static_cast<bool>(bus.open(fake.port(), kBaudrate, kIoTimeoutMs)));
+
+  EXPECT_EQ(bus.writeByte(2, kRegTorqueEnable, 128), 1);
+  EXPECT_EQ(fake.writes(), (std::vector<WriteRecord>{WriteRecord{2, kRegTorqueEnable, {128}}}));
+  const FakeServo after = fake.snapshot(2);
+  EXPECT_EQ(after.mem[kRegTorqueEnable], 128);
+  EXPECT_EQ(fake.word(2, kRegPresentPosition), 1026);
+  EXPECT_EQ(offset_word(fake, 2), 0);
+  EXPECT_EQ(after.calibrations, 0);
+}
+
+TEST(FakeBusTools, doubled_twin_leaves_six_extra_bytes_after_a_ping)
+{
+  FakeBus fake;
+  fake.add_servo(1);
+  fake.set_twin(1, TwinReply::doubled);
+  RawWire bus;
+  ASSERT_TRUE(static_cast<bool>(bus.open(fake.port(), kBaudrate, kIoTimeoutMs)));
+
+  EXPECT_EQ(bus.Ping(1), 1) << "the first copy is a perfect reply";
+  EXPECT_EQ(bus.drain_input(), 6u) << "and the second is still on the line";
+  // writes apply once, however many servos ack them
+  EXPECT_EQ(bus.writeByte(1, kRegAcc, 9), 1);
+  EXPECT_EQ(bus.drain_input(), 6u);
+  EXPECT_EQ(fake.snapshot(1).writes, 1);
+  EXPECT_EQ(fake.snapshot(1).mem[kRegAcc], 9);
+}
+
+TEST(FakeBusTools, garbled_twin_fails_the_ping)
+{
+  FakeBus fake;
+  fake.add_servo(1);
+  fake.set_twin(1, TwinReply::garbled);
+  RawWire bus;
+  ASSERT_TRUE(static_cast<bool>(bus.open(fake.port(), kBaudrate, kIoTimeoutMs)));
+
+  EXPECT_EQ(bus.Ping(1), -1);
+  EXPECT_EQ(bus.readByte(1, kRegMode), -1);
+  EXPECT_EQ(bus.writeByte(1, kRegAcc, 9), 0) << "the ack is garbled too";
+  EXPECT_EQ(fake.snapshot(1).mem[kRegAcc], 9) << "but the write applied, once";
+  EXPECT_EQ(fake.snapshot(1).writes, 1);
+  EXPECT_EQ(fake.snapshot(1).pings, 1) << "it answered; the answer was unreadable";
+}
+
+TEST(FakeBusTools, garbled_reads_twin_pings_clean_and_garbles_reads)
+{
+  // Twins at different positions: identical pings, disagreeing READ replies.
+  FakeBus fake;
+  fake.add_servo(1);
+  fake.set_twin(1, TwinReply::garbled_reads);
+  RawWire bus;
+  ASSERT_TRUE(static_cast<bool>(bus.open(fake.port(), kBaudrate, kIoTimeoutMs)));
+
+  EXPECT_EQ(bus.Ping(1), 1);
+  EXPECT_EQ(bus.readByte(1, kRegMode), -1);
+  EXPECT_EQ(bus.readWord(1, kRegPresentPosition), -1);
+  EXPECT_EQ(bus.writeByte(1, kRegAcc, 9), 1) << "write acks are not READ replies";
+}
+
+TEST(FakeBusTools, silent_read_only_silences_that_address)
+{
+  FakeBus fake;
+  fake.add_servo(1);
+  fake.set_byte(1, 3, 9);
+  fake.set_byte(1, 4, 3);
+  fake.set_silent_read(1, 3);
+  RawWire bus;
+  ASSERT_TRUE(static_cast<bool>(bus.open(fake.port(), kBaudrate, kIoTimeoutMs)));
+
+  EXPECT_EQ(bus.readByte(1, 3), -1);
+  EXPECT_EQ(bus.readWord(1, 3), -1) << "any READ that starts there";
+  EXPECT_EQ(bus.readByte(1, 4), 3) << "and no other";
+  EXPECT_EQ(bus.readWord(1, 2), 9 << 8) << "a READ that starts before it still answers";
+  EXPECT_EQ(bus.Ping(1), 1);
+  fake.set_silent_read(1, -1);
+  EXPECT_EQ(bus.readByte(1, 3), 9);
+}
+
+TEST(FakeBusTools, write_acks_off_applies_without_acking)
+{
+  // Register 8 = 0: a servo that answers READ and PING and nothing else.
+  FakeBus fake;
+  fake.add_servo(1);
+  fake.set_write_acks(1, false);
+  RawWire bus;
+  ASSERT_TRUE(static_cast<bool>(bus.open(fake.port(), kBaudrate, kIoTimeoutMs)));
+
+  EXPECT_EQ(bus.writeByte(1, kRegAcc, 9), 0);
+  EXPECT_EQ(fake.snapshot(1).mem[kRegAcc], 9);
+  EXPECT_EQ(bus.Ping(1), 1);
+  EXPECT_EQ(bus.readByte(1, kRegAcc), 9);
+}
+
+TEST(FakeBusTools, ignore_write_acks_but_does_not_apply)
+{
+  // A firmware that refuses one register and says nothing: the case a read-back exists for.
+  FakeBus fake;
+  fake.add_servo(1);
+  fake.set_byte(1, kRegLock, 1);
+  fake.set_ignore_write(1, kRegLock, true);
+  fake.set_ignore_write(1, kRegOffset + 1, true);
+  RawWire bus;
+  ASSERT_TRUE(static_cast<bool>(bus.open(fake.port(), kBaudrate, kIoTimeoutMs)));
+
+  EXPECT_EQ(bus.writeByte(1, kRegLock, 0), 1) << "acked";
+  EXPECT_EQ(fake.snapshot(1).mem[kRegLock], 1) << "and not applied";
+  EXPECT_EQ(bus.writeWord(1, kRegOffset, 0x0102), 1);
+  EXPECT_EQ(fake.snapshot(1).mem[kRegOffset], 0x02) << "the other byte of the write applies";
+  EXPECT_EQ(fake.snapshot(1).mem[kRegOffset + 1], 0x00);
+
+  fake.set_ignore_write(1, kRegLock, false);
+  EXPECT_EQ(bus.writeByte(1, kRegLock, 0), 1);
+  EXPECT_EQ(fake.snapshot(1).mem[kRegLock], 0);
+}
+
+TEST(FakeBusTools, vanish_after_id_write)
+{
+  // context/motor_reset_command_email.png: a servo that answered nowhere after an id change.
+  FakeBus fake;
+  fake.add_servo(4);
+  fake.set_vanish_after_id_write(4);
+  RawWire bus;
+  ASSERT_TRUE(static_cast<bool>(bus.open(fake.port(), kBaudrate, kIoTimeoutMs)));
+
+  EXPECT_EQ(bus.writeByte(4, kRegId, 253), 0) << "no ack: it is gone";
+  EXPECT_EQ(bus.Ping(4), -1);
+  EXPECT_EQ(bus.Ping(253), -1);
+  FakeServo moved;
+  ASSERT_NO_THROW(moved = fake.snapshot(253)) << "keyed at the id it was given";
+  EXPECT_TRUE(moved.absent);
+  EXPECT_EQ(moved.mem[kRegId], 253);
+}
+
+TEST(FakeBusTools, eeprom_commit_delays_the_ack_and_ignores_requests_meanwhile)
+{
+  // An EEPROM commit that outlasts the ack window: the ack arrives inside a LATER transaction's
+  // window, where it looks like a reply from the wrong servo (PHASE6_SPEC C.0 "late acks").
+  FakeBus fake;
+  fake.add_servo(1);
+  fake.set_eeprom_commit_ms(1, 100);
+  RawWire bus;
+  ASSERT_TRUE(static_cast<bool>(bus.open(fake.port(), kBaudrate, kIoTimeoutMs)));
+
+  const auto started = std::chrono::steady_clock::now();
+  bus.send_write(1, kRegOffset, {7});
+  EXPECT_TRUE(bus.receive(6).empty()) << "a 20 ms window cannot see a 100 ms commit's ack";
+  EXPECT_EQ(bus.Ping(1), -1) << "a request inside the commit window is ignored";
+  ASSERT_TRUE(bus.set_io_timeout_ms(500));
+  const std::vector<uint8_t> ack = bus.receive(6);
+  const auto acked_after = std::chrono::duration_cast<std::chrono::milliseconds>(
+    std::chrono::steady_clock::now() - started);
+  ASSERT_EQ(ack.size(), 6u) << "the late ack still arrives, on its own";
+  EXPECT_EQ(ack[2], 1);
+  EXPECT_EQ(ack[3], 2) << "a bare status frame";
+  EXPECT_GE(acked_after.count(), 100);
+
+  EXPECT_EQ(fake.snapshot(1).mem[kRegOffset], 7) << "the write itself applied at once";
+  EXPECT_EQ(fake.snapshot(1).pings, 0) << "the ignored ping never reached the servo";
+  EXPECT_EQ(fake.ping_counts(), (std::map<uint8_t, int>{{1, 1}})) << "but it is in the log";
+  ASSERT_TRUE(bus.set_io_timeout_ms(kIoTimeoutMs));
+  EXPECT_EQ(bus.Ping(1), 1) << "after the window the servo answers again";
+  EXPECT_EQ(bus.writeByte(1, kRegAcc, 5), 1) << "an SRAM write is no commit and acks at once";
+}
+
+TEST(FakeBusTools, a_calibration_is_an_eeprom_write_for_commit_latency)
+{
+  // With the offset model on, 128 to register 40 writes 31-32, so it commits like one.
+  FakeBus fake;
+  fake.add_servo(2);
+  fake.add_servo(3);
+  fake.set_offset_model(2, true);
+  fake.set_position(2, 1026);
+  fake.set_eeprom_commit_ms(2, 100);
+  fake.set_eeprom_commit_ms(3, 100);
+  RawWire bus;
+  ASSERT_TRUE(static_cast<bool>(bus.open(fake.port(), kBaudrate, kIoTimeoutMs)));
+
+  const auto started = std::chrono::steady_clock::now();
+  bus.send_write(2, kRegTorqueEnable, {128});
+  EXPECT_TRUE(bus.receive(6).empty()) << "the calibration's ack waits for its commit";
+  ASSERT_TRUE(bus.set_io_timeout_ms(500));
+  const std::vector<uint8_t> ack = bus.receive(6);
+  const auto acked_after = std::chrono::duration_cast<std::chrono::milliseconds>(
+    std::chrono::steady_clock::now() - started);
+  ASSERT_EQ(ack.size(), 6u);
+  EXPECT_EQ(ack[2], 2);
+  EXPECT_GE(acked_after.count(), 100);
+  ASSERT_TRUE(bus.set_io_timeout_ms(kIoTimeoutMs));
+  EXPECT_EQ(fake.word(2, kRegPresentPosition), 2048);
+  EXPECT_EQ(fake.snapshot(2).calibrations, 1);
+
+  // A torque write is SRAM, and with the model off so is 128: neither waits.
+  EXPECT_EQ(bus.writeByte(2, kRegTorqueEnable, 1), 1);
+  EXPECT_EQ(bus.writeByte(3, kRegTorqueEnable, 128), 1);
+}
+
+TEST(FakeBusTools, addressed_faults_are_off_by_default_and_act_when_on)
+{
+  // The sync-read fault knobs, reused for addressed replies only when asked: the sync-read suites
+  // set them on servos they also ping, and a ping that suddenly failed would break them.
+  FakeBus fake;
+  fake.add_servo(1);
+  fake.set_reply_id_override(1, 9);
+  RawWire bus;
+  ASSERT_TRUE(static_cast<bool>(bus.open(fake.port(), kBaudrate, kIoTimeoutMs)));
+  EXPECT_EQ(bus.Ping(1), 1) << "off by default";
+
+  fake.set_faults_apply_to_addressed(true);
+  bus.send_ping(1);
+  std::vector<uint8_t> reply = bus.receive(6);
+  ASSERT_EQ(reply.size(), 6u);
+  EXPECT_EQ(reply[2], 9) << "the reply claims id 9";
+  EXPECT_EQ(bus.Ping(1), -1);
+  fake.set_reply_id_override(1, 0);
+
+  fake.set_reply_length_delta(1, 1);
+  bus.send_read(1, kRegMode, 1);
+  reply = bus.receive(7);
+  ASSERT_EQ(reply.size(), 7u) << "the same wire length";
+  EXPECT_EQ(reply[3], 4) << "one more than a 1-byte READ reply's 3";
+  EXPECT_EQ(bus.Ping(1), -1) << "SCS::Ping checks the length byte (src/SCS.cpp:251)";
+  fake.set_reply_length_delta(1, 0);
+
+  fake.set_reply_checksum_corrupt(1, true);
+  EXPECT_EQ(bus.readByte(1, kRegMode), -1);
+  fake.set_reply_checksum_corrupt(1, false);
+  EXPECT_EQ(bus.Ping(1), 1);
+  EXPECT_EQ(bus.readByte(1, kRegMode), 0);
+}
+
+TEST(FakeBusTools, drop_pings_ignores_exactly_n)
+{
+  // The retry a scan and a set_id make: a servo found only on the last attempt.
+  FakeBus fake;
+  fake.add_servo(1);
+  fake.drop_pings(1, 2);
+  RawWire bus;
+  ASSERT_TRUE(static_cast<bool>(bus.open(fake.port(), kBaudrate, kIoTimeoutMs)));
+
+  EXPECT_EQ(bus.Ping(1), -1);
+  EXPECT_EQ(bus.Ping(1), -1);
+  EXPECT_EQ(bus.Ping(1), 1);
+  EXPECT_EQ(bus.Ping(1), 1);
+  EXPECT_EQ(fake.ping_counts(), (std::map<uint8_t, int>{{1, 4}}));
+
+  fake.drop_pings(1, 1);
+  EXPECT_EQ(bus.readByte(1, kRegMode), 0) << "only pings are dropped";
+  EXPECT_EQ(bus.Ping(1), -1);
+  EXPECT_EQ(bus.Ping(1), 1);
+}
+
+TEST(FakeBusTools, a_twin_or_a_silent_read_can_be_limited_to_the_next_n)
+{
+  // One odd reply among clean ones -- twins that fall in and out of step, or a noisy line -- is
+  // what a tool must not forget once a retry comes back clean (review fixes F5, F6, F1).
+  FakeBus fake;
+  fake.add_servo(1);
+  RawWire bus;
+  ASSERT_TRUE(static_cast<bool>(bus.open(fake.port(), kBaudrate, kIoTimeoutMs)));
+
+  fake.set_twin(1, TwinReply::garbled, 1);
+  EXPECT_EQ(bus.Ping(1), -1) << "the first reply is garbled";
+  EXPECT_EQ(bus.Ping(1), 1) << "and only the first";
+
+  fake.set_twin(1, TwinReply::doubled_reads, 1);
+  EXPECT_EQ(bus.Ping(1), 1) << "a ping is not a READ reply";
+  EXPECT_EQ(bus.drain_input(), 0u);
+  EXPECT_EQ(bus.readByte(1, kRegMode), 0) << "the first copy of a doubled read is perfect";
+  EXPECT_EQ(bus.drain_input(), 7u) << "and the second is still on the line";
+  EXPECT_EQ(bus.readByte(1, kRegMode), 0);
+  EXPECT_EQ(bus.drain_input(), 0u) << "the next read comes back once";
+
+  fake.set_twin(1, TwinReply::garbled_reads, 2);
+  EXPECT_EQ(bus.readByte(1, kRegMode), -1);
+  EXPECT_EQ(bus.Ping(1), 1) << "a ping does not use up the count";
+  EXPECT_EQ(bus.readByte(1, kRegMode), -1);
+  EXPECT_EQ(bus.readByte(1, kRegMode), 0);
+
+  fake.set_silent_read(1, kRegMode, 1);
+  EXPECT_EQ(bus.readByte(1, kRegMode), -1);
+  EXPECT_EQ(bus.readByte(1, kRegMode), 0) << "one silent read, then it answers again";
+}
+
+TEST(FakeBusTools, garbled_write_acks_break_the_ack_and_nothing_else)
+{
+  // A collision on the ack alone: the write applies, and reads and pings stay clean (review F28).
+  FakeBus fake;
+  fake.add_servo(1);
+  fake.set_garble_write_acks(1, true);
+  RawWire bus;
+  ASSERT_TRUE(static_cast<bool>(bus.open(fake.port(), kBaudrate, kIoTimeoutMs)));
+
+  EXPECT_EQ(bus.writeByte(1, kRegAcc, 9), 0) << "the ack fails its checksum";
+  EXPECT_EQ(fake.snapshot(1).mem[kRegAcc], 9) << "but the write applied, once";
+  EXPECT_EQ(fake.snapshot(1).writes, 1);
+  EXPECT_EQ(bus.Ping(1), 1);
+  EXPECT_EQ(bus.readByte(1, kRegAcc), 9);
+}
+
+// ---- factory_reset (factory_reset_evidence/FACTORY_RESET_SPEC.md 1, 2) ----
+
+TEST(FakeBusTools, reset_restores_the_factory_table_keeps_the_id_and_reinitialises_sram)
+{
+  // M1-M5 on the bench: every EEPROM register from 6 on goes back to the factory table, the id
+  // stays, and torque, goal and lock are re-initialised. The version bytes 0..4 are read-only.
+  FakeBus fake;
+  fake.add_servo(4, 1);
+  fake.set_byte(4, 3, 10);
+  fake.set_byte(4, 4, 25);
+  fake.set_byte(4, 6, 1);
+  fake.set_word(4, kRegOffset, 100, 11);
+  fake.set_byte(4, 37, 26);
+  fake.set_factory_byte(4, 3, 99);          // never used: 3 is read-only
+  fake.set_factory_byte(4, kRegId, 1);      // never used: the id is kept
+  fake.set_factory_byte(4, 37, 25);
+  fake.set_byte(4, kRegTorqueEnable, 1);
+  fake.set_word(4, waveshare_servos_test::kRegGoalPosition, 2838);
+  fake.set_byte(4, kRegLock, 0);
+  RawWire bus;
+  ASSERT_TRUE(static_cast<bool>(bus.open(fake.port(), kBaudrate, kIoTimeoutMs)));
+
+  bus.send_reset(4);
+  const std::vector<uint8_t> ack = bus.receive(6);
+  EXPECT_EQ(ack, (std::vector<uint8_t>{0xff, 0xff, 4, 2, 0, 0xf9})) << "the bench's own ack";
+  const FakeServo after = fake.snapshot(4);
+  EXPECT_EQ(after.resets, 1);
+  EXPECT_EQ(after.mem[3], 10);
+  EXPECT_EQ(after.mem[4], 25);
+  EXPECT_EQ(after.mem[kRegId], 4);
+  EXPECT_EQ(after.mem[6], 0);
+  EXPECT_EQ(after.mem[kRegOffset], 0);
+  EXPECT_EQ(after.mem[kRegOffset + 1], 0);
+  EXPECT_EQ(after.mem[kRegMode], 0);
+  EXPECT_EQ(after.mem[37], 25);
+  EXPECT_EQ(after.mem[kRegTorqueEnable], 0);
+  EXPECT_EQ(fake.word(4, waveshare_servos_test::kRegGoalPosition), 0);
+  EXPECT_EQ(after.mem[kRegLock], 1) << "the reset closes the lock (M5)";
+  EXPECT_EQ(fake.resets(), (std::vector<uint8_t>{4}));
+  EXPECT_EQ(bus.Ping(4), 4);
+}
+
+TEST(FakeBusTools, reset_is_a_flash_write_whatever_the_lock_says)
+{
+  // Under volatile_when_locked an EEPROM WRITE with the lock closed is lost at power-off; the
+  // reset is no WRITE, and its values outlive a power cycle (M2 was sent with the lock closed).
+  FakeBus fake;
+  fake.add_servo(4, 1);
+  fake.set_eeprom_policy(EepromPolicy::volatile_when_locked);
+  fake.set_power_up_lock(1);
+  fake.set_byte(4, kRegLock, 1);
+  RawWire bus;
+  ASSERT_TRUE(static_cast<bool>(bus.open(fake.port(), kBaudrate, kIoTimeoutMs)));
+
+  bus.send_reset(4);
+  EXPECT_EQ(bus.receive(6).size(), 6u);
+  fake.power_cycle();
+  EXPECT_EQ(fake.snapshot(4).mem[kRegMode], 0);
+  EXPECT_EQ(fake.snapshot(4).eeprom[kRegMode], 0);
+}
+
+TEST(FakeBusTools, reset_ack_waits_for_the_commit_only_when_a_byte_changed)
+{
+  // M1 against M4: 25 ms when the flash was rewritten, under a millisecond when nothing differed.
+  FakeBus fake;
+  fake.add_servo(4, 1);
+  fake.set_eeprom_commit_ms(4, 60);
+  RawWire bus;
+  ASSERT_TRUE(static_cast<bool>(bus.open(fake.port(), kBaudrate, kIoTimeoutMs)));
+
+  bus.send_reset(4);
+  EXPECT_TRUE(bus.receive(6).empty()) << "a 20 ms window cannot see a 60 ms commit's ack";
+  EXPECT_EQ(bus.Ping(4), -1) << "a request inside the commit is ignored";
+  ASSERT_TRUE(bus.set_io_timeout_ms(200));
+  EXPECT_EQ(bus.receive(6).size(), 6u) << "the late ack still comes";
+  ASSERT_TRUE(bus.set_io_timeout_ms(kIoTimeoutMs));
+
+  bus.send_reset(4);
+  EXPECT_EQ(bus.receive(6).size(), 6u) << "already factory: no commit, an ack at once";
+  EXPECT_EQ(fake.snapshot(4).resets, 2);
+}
+
+TEST(FakeBusTools, reset_knobs_ignore_it_or_skip_a_register)
+{
+  FakeBus fake;
+  fake.add_servo(4, 1);
+  fake.add_servo(5, 1);
+  fake.set_reset_supported(4, false);
+  fake.set_reset_skip(5, kRegMode, true);
+  fake.set_byte(5, 6, 1);
+  RawWire bus;
+  ASSERT_TRUE(static_cast<bool>(bus.open(fake.port(), kBaudrate, kIoTimeoutMs)));
+
+  bus.send_reset(4);
+  EXPECT_TRUE(bus.receive(6).empty()) << "an unknown instruction gets no reply";
+  EXPECT_EQ(fake.snapshot(4).mem[kRegMode], 1) << "and changes nothing";
+  EXPECT_EQ(fake.snapshot(4).resets, 1) << "but it reached the servo";
+
+  bus.send_reset(5);
+  EXPECT_EQ(bus.receive(6).size(), 6u);
+  EXPECT_EQ(fake.snapshot(5).mem[kRegMode], 1) << "skipped";
+  EXPECT_EQ(fake.snapshot(5).mem[6], 0) << "the rest is reset";
+  EXPECT_EQ(fake.resets(), (std::vector<uint8_t>{4, 5}));
+
+  fake.set_byte(5, kRegTorqueEnable, 1);
+  fake.set_byte(5, kRegLock, 0);
+  fake.set_reset_keeps_sram(5, true);
+  bus.send_reset(5);
+  EXPECT_EQ(bus.receive(6).size(), 6u);
+  EXPECT_EQ(fake.snapshot(5).mem[kRegTorqueEnable], 1) << "SRAM kept";
+  EXPECT_EQ(fake.snapshot(5).mem[kRegLock], 0);
+}
+
+TEST(FakeBusTools, baud_model_hears_only_the_rate_register_6_names)
+{
+  // Off by default, so every earlier suite runs at whatever rate it likes. On, a servo at
+  // register 6 = 1 answers at 500000 only -- and after a reset at 500000 its ack still comes at
+  // that rate while every later request needs 1000000 (M3).
+  FakeBus fake;
+  fake.add_servo(4);
+  fake.set_byte(4, 6, 1);
+  {
+    RawWire bus;
+    ASSERT_TRUE(static_cast<bool>(bus.open(fake.port(), kBaudrate, kIoTimeoutMs)));
+    EXPECT_EQ(bus.Ping(4), 4) << "no baud model by default";
+  }
+  fake.set_baud_model(true);
+  {
+    RawWire bus;
+    ASSERT_TRUE(static_cast<bool>(bus.open(fake.port(), kBaudrate, kIoTimeoutMs)));
+    EXPECT_EQ(bus.Ping(4), -1) << "1000000 is noise to a servo at register 6 = 1";
+  }
+  RawWire slow;
+  ASSERT_TRUE(static_cast<bool>(slow.open(fake.port(), 500000, kIoTimeoutMs)));
+  EXPECT_EQ(slow.Ping(4), 4);
+  slow.send_reset(4);
+  EXPECT_EQ(slow.receive(6).size(), 6u) << "the ack at the old rate";
+  EXPECT_EQ(slow.Ping(4), -1) << "and nothing more at it";
+  slow.close();
+  RawWire fast;
+  ASSERT_TRUE(static_cast<bool>(fast.open(fake.port(), kBaudrate, kIoTimeoutMs)));
+  EXPECT_EQ(fast.Ping(4), 4) << "the factory rate";
+}
+
+// ---------------------------------------------------------------------------------------------
+// PHASE6_SPEC D.2: the checked transactions the Phase 6 tools are built on, over the fake bus.
+// Each kind is produced by the wire itself -- a twin, a stranger's id, a late ack -- and never by
+// mocking the library, so the vendored request builders and readSCS run unchanged.
+// ---------------------------------------------------------------------------------------------
+
+namespace
+{
+
+using waveshare_servos::Reply;
+using waveshare_servos::ReplyKind;
+
+}  // namespace
+
+namespace waveshare_servos
+{
+
+// gtest prints an enum it has no printer for as "1-byte object <00>"; with this a failed kind
+// reads "not_open" instead. Found by argument-dependent lookup, hence this namespace.
+void PrintTo(ReplyKind kind, std::ostream * out)
+{
+  *out << to_string(kind);
+}
+
+}  // namespace waveshare_servos
+
+namespace
+{
+
+class ServoBusChecked : public ::testing::Test
+{
+protected:
+  void SetUp() override
+  {
+    fake_.add_servo(1);
+    ASSERT_TRUE(static_cast<bool>(bus_.open(fake_.port(), kBaudrate, kIoTimeoutMs)));
+  }
+
+  void TearDown() override
+  {
+    bus_.close();
+    // Every fault below is in a REPLY; a request the fake could not verify means the wire itself
+    // misbehaved and the case proved nothing.
+    EXPECT_EQ(fake_.bad_checksums(), 0u) << "the wire itself misbehaved";
+    EXPECT_EQ(fake_.quiet_timeouts(), 0u) << "wait_quiet gave up";
+    EXPECT_EQ(fake_.id_collisions(), 0u);
+  }
+
+  FakeBus fake_;
+  ServoBus bus_;                        // declared after fake_, so it is destroyed first
+};
+
+}  // namespace
+
+TEST_F(ServoBusChecked, checked_ping_silent_costs_one_timeout_and_zero_bytes)
+{
+  // A scan pings 254 ids three times each and nearly all are silent. The drain runs only when a
+  // byte arrived, so a silent id costs one window and nothing more -- measured against the
+  // vendored Ping, which never drains, and not against a clock.
+  ASSERT_TRUE(bus_.set_io_timeout_ms(5));
+  const Reply reply = bus_.checked_ping(9);
+  EXPECT_EQ(reply.kind, ReplyKind::SILENT);
+  EXPECT_FALSE(static_cast<bool>(reply));
+  EXPECT_EQ(reply.bytes, 0u);
+  EXPECT_EQ(reply.extra_bytes, 0u);
+  EXPECT_EQ(reply.frame_bytes, 0u);
+  EXPECT_EQ(reply.from_id, -1);
+  EXPECT_GE(reply.elapsed_us, 5000u) << "the whole window";
+
+  // Each call is timed on its own and the FASTEST of each kind compared (review fix F18): a drain
+  // after every silence adds 2 ms to every checked call, its minimum included, while a scheduling
+  // stall inflates only the calls it lands on. Two sums with a 10 ms margin failed under load with
+  // no drain at all.
+  constexpr int kPings = 10;
+  std::chrono::steady_clock::duration vendored = std::chrono::hours(1);
+  std::chrono::steady_clock::duration checked = std::chrono::hours(1);
+  for (int i = 0; i < kPings; i++) {
+    const auto started = std::chrono::steady_clock::now();
+    EXPECT_EQ(bus_.Ping(9), -1);
+    vendored = std::min(vendored, std::chrono::steady_clock::now() - started);
+  }
+  for (int i = 0; i < kPings; i++) {
+    const auto started = std::chrono::steady_clock::now();
+    EXPECT_EQ(bus_.checked_ping(9).kind, ReplyKind::SILENT);
+    checked = std::min(checked, std::chrono::steady_clock::now() - started);
+  }
+  // in microseconds, so a failure prints numbers; the margin is half of a 2 ms drain
+  const int64_t checked_us =
+    std::chrono::duration_cast<std::chrono::microseconds>(checked).count();
+  const int64_t vendored_us =
+    std::chrono::duration_cast<std::chrono::microseconds>(vendored).count();
+  EXPECT_LT(checked_us, vendored_us + 1000) << "silence paid for a drain";
+  fake_.wait_quiet();
+  EXPECT_EQ(fake_.ping_counts(), (std::map<uint8_t, int>{{9, 2 * kPings + 1}})) <<
+    "one request per call: no retry hides inside";
+}
+
+TEST_F(ServoBusChecked, checked_ping_one_servo_is_ONE_with_its_status)
+{
+  fake_.set_status(1, 0x20);
+  const Reply reply = bus_.checked_ping(1);
+  EXPECT_EQ(reply.kind, ReplyKind::ONE);
+  EXPECT_TRUE(static_cast<bool>(reply));
+  EXPECT_EQ(reply.from_id, 1);
+  // SCS::Ping overwrites SCS::Error with the id byte (src/SCS.cpp:261); this is the real one
+  EXPECT_EQ(reply.status, 0x20);
+  EXPECT_EQ(reply.frame_bytes, 6u);
+  EXPECT_EQ(reply.bytes, 6u);
+  EXPECT_EQ(reply.extra_bytes, 0u);
+  EXPECT_TRUE(reply.data.empty());
+  EXPECT_GT(reply.elapsed_us, 0u);
+  EXPECT_LT(reply.elapsed_us, kIoTimeoutMs * 1000u) << "a complete frame ends the window early";
+}
+
+TEST_F(ServoBusChecked, checked_ping_doubled_twin_is_EXTRA_with_six_extra_bytes)
+{
+  // Two servos on one id answering in bit synchrony: the first reply is perfect, the second is
+  // the only evidence, and it is drained and counted instead of left for the next transaction.
+  fake_.set_twin(1, TwinReply::doubled);
+  const Reply reply = bus_.checked_ping(1);
+  EXPECT_EQ(reply.kind, ReplyKind::EXTRA);
+  EXPECT_FALSE(static_cast<bool>(reply)) << "only ONE is a clean answer";
+  EXPECT_EQ(reply.from_id, 1);
+  EXPECT_EQ(reply.frame_bytes, 6u);
+  EXPECT_EQ(reply.bytes, 6u);
+  EXPECT_EQ(reply.extra_bytes, 6u);
+  fake_.set_twin(1, TwinReply::none);
+  EXPECT_EQ(bus_.checked_ping(1).kind, ReplyKind::ONE) << "nothing of the copy was left behind";
+}
+
+TEST_F(ServoBusChecked, checked_ping_garbled_is_GARBLED)
+{
+  fake_.set_twin(1, TwinReply::garbled);
+  const Reply reply = bus_.checked_ping(1);
+  EXPECT_EQ(reply.kind, ReplyKind::GARBLED);
+  EXPECT_FALSE(static_cast<bool>(reply));
+  EXPECT_EQ(reply.bytes, 6u) << "bytes arrived: this is not an absence";
+  EXPECT_EQ(reply.from_id, -1) << "no well-formed frame, so no id to believe";
+  EXPECT_EQ(reply.frame_bytes, 0u);
+}
+
+TEST_F(ServoBusChecked, checked_ping_reply_from_another_id_is_WRONG_ID_with_frame_bytes_6)
+{
+  // The shape of a late ack caught by a ping (PHASE6_SPEC C.0, is_late_ack): a whole, well-formed
+  // six-byte frame, from somebody else.
+  fake_.set_faults_apply_to_addressed(true);
+  fake_.set_reply_id_override(1, 7);
+  const Reply reply = bus_.checked_ping(1);
+  EXPECT_EQ(reply.kind, ReplyKind::WRONG_ID);
+  EXPECT_FALSE(static_cast<bool>(reply));
+  EXPECT_EQ(reply.from_id, 7);
+  EXPECT_EQ(reply.frame_bytes, 6u);
+  EXPECT_EQ(reply.extra_bytes, 0u);
+}
+
+TEST_F(ServoBusChecked, checked_calls_refuse_0xfe_and_0xff_without_sending)
+{
+  // 0xfe is the broadcast every servo obeys and none answers, 0xff a header byte. A checked call
+  // exists to hear ONE servo, so neither ever reaches the wire.
+  const uint8_t value = 1;
+  for (const uint8_t id : {uint8_t{0xfe}, uint8_t{0xff}}) {
+    EXPECT_EQ(bus_.checked_ping(id).kind, ReplyKind::INVALID_ID) << static_cast<int>(id);
+    EXPECT_EQ(bus_.checked_read(id, kRegMode, 1).kind, ReplyKind::INVALID_ID) <<
+      static_cast<int>(id);
+    EXPECT_EQ(
+      bus_.checked_write(id, kRegTorqueEnable, &value, 1, kIoTimeoutMs).kind,
+      ReplyKind::INVALID_ID) << static_cast<int>(id);
+  }
+  fake_.wait_quiet();
+  EXPECT_EQ(fake_.bytes_received(), 0u);
+  EXPECT_EQ(fake_.frames_received(), 0u);
+}
+
+TEST_F(ServoBusChecked, checked_calls_on_a_closed_bus_return_NOT_OPEN_without_aborting)
+{
+  // readSCS does FD_SET(fd, ...), and with fd == -1 glibc's _FORTIFY_SOURCE check aborts the
+  // whole binary (the reason write_acc checks the port). The same bus answers before and after,
+  // so NOT_OPEN is the closed bus speaking, not a call that never works.
+  ASSERT_EQ(bus_.checked_ping(1).kind, ReplyKind::ONE);
+  bus_.close();
+  fake_.clear_frames();
+  const uint8_t value = 1;
+  EXPECT_EQ(bus_.checked_ping(1).kind, ReplyKind::NOT_OPEN);
+  EXPECT_EQ(bus_.checked_read(1, kRegMode, 1).kind, ReplyKind::NOT_OPEN);
+  EXPECT_EQ(
+    bus_.checked_write(1, kRegTorqueEnable, &value, 1, kIoTimeoutMs).kind, ReplyKind::NOT_OPEN);
+  ServoBus never_opened;
+  EXPECT_EQ(never_opened.checked_ping(1).kind, ReplyKind::NOT_OPEN);
+  EXPECT_EQ(fake_.bytes_received(), 0u);
+
+  ASSERT_TRUE(static_cast<bool>(bus_.open(fake_.port(), kBaudrate, kIoTimeoutMs)));
+  EXPECT_EQ(bus_.checked_ping(1).kind, ReplyKind::ONE);
+}
+
+TEST_F(ServoBusChecked, checked_read_returns_the_payload)
+{
+  // The tools' identity block: registers 3..39 in one READ, every byte distinct.
+  std::vector<uint8_t> identity;
+  for (uint8_t reg = 3; reg <= 39; reg++) {
+    identity.push_back(static_cast<uint8_t>(0x40 + reg));
+    fake_.set_byte(1, reg, identity.back());
+  }
+  fake_.set_status(1, 0x08);
+  const Reply reply = bus_.checked_read(1, 3, 37);
+  ASSERT_EQ(reply.kind, ReplyKind::ONE);
+  EXPECT_TRUE(static_cast<bool>(reply));
+  EXPECT_EQ(reply.from_id, 1);
+  EXPECT_EQ(reply.status, 0x08);
+  EXPECT_EQ(reply.frame_bytes, 43u);
+  EXPECT_EQ(reply.bytes, 43u);
+  EXPECT_EQ(reply.extra_bytes, 0u);
+  EXPECT_EQ(reply.data, identity);
+
+  fake_.set_position(1, 1234);
+  const Reply position = bus_.checked_read(1, kRegPresentPosition, 2);
+  ASSERT_EQ(position.kind, ReplyKind::ONE);
+  EXPECT_EQ(position.data, (std::vector<uint8_t>{1234 & 0xff, 1234 >> 8}));
+}
+
+TEST_F(ServoBusChecked, checked_read_rejects_a_reply_from_another_id)
+{
+  // The hole this call exists to close, shown on the vendored call first: SCS::Read checks neither
+  // the responder id nor the length byte (src/SCS.cpp:173-203), so a Read-based implementation
+  // hands servo 7's payload over as servo 1's.
+  fake_.set_faults_apply_to_addressed(true);
+  fake_.set_reply_id_override(1, 7);
+  uint8_t mode = 0xaa;
+  EXPECT_EQ(bus_.Read(1, kRegMode, &mode, 1), 1) << "the vendored read believes it";
+
+  const Reply reply = bus_.checked_read(1, kRegMode, 1);
+  EXPECT_EQ(reply.kind, ReplyKind::WRONG_ID);
+  EXPECT_FALSE(static_cast<bool>(reply));
+  EXPECT_EQ(reply.from_id, 7);
+  EXPECT_EQ(reply.frame_bytes, 7u);
+  EXPECT_TRUE(reply.data.empty()) << "a payload from the wrong servo is never handed over";
+}
+
+TEST_F(ServoBusChecked, checked_read_of_a_bare_status_frame_is_STATUS_ONLY)
+{
+  // A commit-latency ack caught by a read: the write's 5 ms window closed before the servo acked,
+  // the read went out while it was still committing (and was ignored), and the ack landed in the
+  // read's window. A well-formed frame from the right id -- only its length gives it away.
+  fake_.set_eeprom_commit_ms(1, 30);
+  ASSERT_TRUE(bus_.set_io_timeout_ms(60));
+  const uint8_t offset = 7;
+  EXPECT_EQ(bus_.checked_write(1, kRegOffset, &offset, 1, 5).kind, ReplyKind::SILENT);
+  const Reply reply = bus_.checked_read(1, kRegPresentPosition, 2);
+  EXPECT_EQ(reply.kind, ReplyKind::STATUS_ONLY);
+  EXPECT_FALSE(static_cast<bool>(reply));
+  EXPECT_EQ(reply.from_id, 1);
+  EXPECT_EQ(reply.frame_bytes, 6u);
+  EXPECT_EQ(reply.bytes, 6u);
+  EXPECT_TRUE(reply.data.empty());
+  EXPECT_EQ(bus_.checked_read(1, kRegPresentPosition, 2).kind, ReplyKind::ONE) <<
+    "repeated after the commit, the read is answered";
+}
+
+TEST_F(ServoBusChecked, checked_read_rejects_a_bad_length_byte)
+{
+  // One more than the payload says, checksum repaired and the wire length unchanged: only the
+  // length gate can catch it, and SCS::Read has none.
+  fake_.set_faults_apply_to_addressed(true);
+  fake_.set_reply_length_delta(1, 1);
+  const Reply reply = bus_.checked_read(1, kRegMode, 1);
+  EXPECT_EQ(reply.kind, ReplyKind::GARBLED);
+  EXPECT_EQ(reply.bytes, 7u) << "every byte arrived; the length byte disagrees with them";
+  EXPECT_EQ(reply.from_id, -1);
+  EXPECT_TRUE(reply.data.empty());
+
+  fake_.set_reply_length_delta(1, 0);
+  const Reply clean = bus_.checked_read(1, kRegMode, 1);
+  EXPECT_EQ(clean.kind, ReplyKind::ONE) << "nothing of the bad frame was left on the line";
+  EXPECT_EQ(clean.data, (std::vector<uint8_t>{0}));
+}
+
+TEST_F(ServoBusChecked, checked_read_rejects_a_bad_checksum)
+{
+  fake_.set_faults_apply_to_addressed(true);
+  fake_.set_reply_checksum_corrupt(1, true);
+  const Reply reply = bus_.checked_read(1, kRegMode, 1);
+  EXPECT_EQ(reply.kind, ReplyKind::GARBLED);
+  EXPECT_EQ(reply.bytes, 7u);
+  EXPECT_EQ(reply.from_id, -1);
+  EXPECT_TRUE(reply.data.empty());
+
+  fake_.set_reply_checksum_corrupt(1, false);
+  const Reply clean = bus_.checked_read(1, kRegMode, 1);
+  EXPECT_EQ(clean.kind, ReplyKind::ONE) << "nothing of the bad frame was left on the line";
+  EXPECT_EQ(clean.data, (std::vector<uint8_t>{0}));
+}
+
+TEST_F(ServoBusChecked, checked_write_reports_the_acking_id_old_new_or_none)
+{
+  // An ack is advisory (PHASE6_SPEC C.0): SCS::Ack returns 1 whatever the status byte says,
+  // rejects an ack from the new id, and cannot hear a servo with register 8 = 0. checked_write
+  // takes a frame from any id as the ack and says whose it was.
+  fake_.add_servo(4);
+  fake_.add_servo(5);
+  fake_.add_servo(6);
+  fake_.set_id_write_ack(5, IdWriteAck::new_id);
+  fake_.set_id_write_ack(6, IdWriteAck::none);
+  const uint8_t to_253 = 253;
+  const uint8_t to_252 = 252;
+  const uint8_t to_251 = 251;
+
+  const Reply old_id = bus_.checked_write(4, kRegId, &to_253, 1, kIoTimeoutMs);
+  EXPECT_EQ(old_id.kind, ReplyKind::ONE);
+  EXPECT_EQ(old_id.from_id, 4);
+  EXPECT_EQ(old_id.frame_bytes, 6u);
+  const Reply new_id = bus_.checked_write(5, kRegId, &to_252, 1, kIoTimeoutMs);
+  EXPECT_EQ(new_id.kind, ReplyKind::ONE) << "a frame from any id is the ack";
+  EXPECT_EQ(new_id.from_id, 252);
+  const Reply none = bus_.checked_write(6, kRegId, &to_251, 1, kIoTimeoutMs);
+  EXPECT_EQ(none.kind, ReplyKind::SILENT);
+  EXPECT_EQ(none.from_id, -1);
+  // all three moved, which only a read-back can tell
+  EXPECT_EQ(bus_.checked_ping(253).kind, ReplyKind::ONE);
+  EXPECT_EQ(bus_.checked_ping(252).kind, ReplyKind::ONE);
+  EXPECT_EQ(bus_.checked_ping(251).kind, ReplyKind::ONE);
+
+  const uint8_t acc = 9;
+  const Reply plain = bus_.checked_write(1, kRegAcc, &acc, 1, kIoTimeoutMs);
+  EXPECT_EQ(plain.kind, ReplyKind::ONE);
+  EXPECT_EQ(plain.from_id, 1);
+  EXPECT_EQ(fake_.snapshot(1).mem[kRegAcc], 9);
+}
+
+TEST_F(ServoBusChecked, checked_write_restores_io_timeout_after_its_ack_window)
+{
+  // An EEPROM write gets a longer ack window than the bus's io timeout (PHASE6_SPEC R7). The
+  // window is borrowed for that one transaction and given back, both ways round.
+  ASSERT_TRUE(bus_.set_io_timeout_ms(5));
+  const uint8_t value = 1;
+  const Reply write = bus_.checked_write(9, kRegTorqueEnable, &value, 1, 40);
+  EXPECT_EQ(write.kind, ReplyKind::SILENT);
+  EXPECT_GE(write.elapsed_us, 40000u) << "the ack window, not the io timeout";
+  EXPECT_EQ(bus_.io_timeout_ms(), 5u);
+  const Reply ping = bus_.checked_ping(9);
+  EXPECT_EQ(ping.kind, ReplyKind::SILENT);
+  EXPECT_LT(ping.elapsed_us, write.elapsed_us / 2) << "the next transaction is back on 5 ms";
+
+  ASSERT_TRUE(bus_.set_io_timeout_ms(40));
+  const Reply quick = bus_.checked_write(9, kRegTorqueEnable, &value, 1, 5);
+  EXPECT_EQ(quick.kind, ReplyKind::SILENT);
+  EXPECT_LT(quick.elapsed_us, write.elapsed_us / 2) << "a shorter window is honoured too";
+  EXPECT_EQ(bus_.io_timeout_ms(), 40u);
+}
+
+TEST_F(ServoBusChecked, a_late_ack_is_drained_and_not_read_as_the_next_reply)
+{
+  // The commit outlasts the write's ack window and the ack lands while nobody is listening. The
+  // next transaction must not take it for its own reply: to a ping of a silent id it would be a
+  // reply from the wrong servo, and to a read a short, well-formed frame.
+  fake_.set_eeprom_commit_ms(1, 30);
+  const uint8_t offset = 7;
+  EXPECT_EQ(bus_.checked_write(1, kRegOffset, &offset, 1, 5).kind, ReplyKind::SILENT);
+  std::this_thread::sleep_for(std::chrono::milliseconds(60));   // the ack is on the line now
+
+  const Reply silent = bus_.checked_ping(9);
+  EXPECT_EQ(silent.kind, ReplyKind::SILENT) << "the stale ack was read as id 9's reply";
+  EXPECT_EQ(silent.bytes, 0u);
+  const Reply read = bus_.checked_read(1, kRegOffset, 1);
+  EXPECT_EQ(read.kind, ReplyKind::ONE);
+  EXPECT_EQ(read.data, (std::vector<uint8_t>{7}));
+  EXPECT_EQ(read.extra_bytes, 0u);
+}
+
+TEST_F(ServoBusChecked, checked_calls_leave_the_sync_read_drain_count_alone)
+{
+  // SyncReadStats::drains is the control loop's error-path count, which the README quotes. The
+  // checked calls drain after every reply; counting those there would let one scan swamp it.
+  fake_.set_twin(1, TwinReply::doubled);
+  const uint64_t before = bus_.sync_read_stats().drains;
+  const Reply reply = bus_.checked_ping(1);
+  EXPECT_EQ(reply.kind, ReplyKind::EXTRA);
+  EXPECT_EQ(reply.extra_bytes, 6u) << "the drain ran";
+  EXPECT_EQ(bus_.sync_read_stats().drains, before);
+  EXPECT_EQ(bus_.drain_input(), 0u) << "and left nothing behind";
+  EXPECT_EQ(bus_.sync_read_stats().drains, before + 1) << "drain_input still counts";
+}
+
+TEST_F(ServoBusChecked, checked_calls_refuse_a_count_outside_1_to_64_without_sending)
+{
+  // SCSerial::writeSCS appends to txBuf[255] with no bound check (src/SCSerial.cpp:179-191), so an
+  // unchecked count is an out-of-bounds write; and a READ of 0 bytes is answered by a bare status
+  // frame, the very shape STATUS_ONLY exists to single out. Neither reaches the wire.
+  const std::array<uint8_t, 255> bytes{};
+  const uint8_t too_many = static_cast<uint8_t>(ServoBus::checked_max_bytes + 1);
+  EXPECT_EQ(bus_.checked_read(1, 3, 0).kind, ReplyKind::INVALID_COUNT);
+  EXPECT_EQ(bus_.checked_read(1, 3, too_many).kind, ReplyKind::INVALID_COUNT);
+  EXPECT_EQ(
+    bus_.checked_write(1, 3, bytes.data(), 0, kIoTimeoutMs).kind, ReplyKind::INVALID_COUNT);
+  EXPECT_EQ(
+    bus_.checked_write(1, 3, bytes.data(), 255, kIoTimeoutMs).kind, ReplyKind::INVALID_COUNT);
+  fake_.wait_quiet();
+  EXPECT_EQ(fake_.bytes_received(), 0u);
+
+  const Reply most = bus_.checked_read(
+    1, 3, static_cast<uint8_t>(ServoBus::checked_max_bytes));
+  EXPECT_EQ(most.kind, ReplyKind::ONE) << "the largest legal count";
+  EXPECT_EQ(most.data.size(), ServoBus::checked_max_bytes);
+}
+
+// ---- factory_reset (FACTORY_RESET_SPEC 2, "New bus primitives") ----
+
+TEST_F(ServoBusChecked, checked_reset_sends_the_bench_frame_and_hears_the_ack)
+{
+  // FF FF 04 02 06 F3 is the frame the bench took (M1): one request, six bytes, no parameter.
+  fake_.add_servo(4, 1);
+  fake_.clear_frames();
+  const Reply reply = bus_.checked_reset(4, 100);
+  EXPECT_EQ(reply.kind, ReplyKind::ONE);
+  EXPECT_EQ(reply.from_id, 4);
+  EXPECT_EQ(reply.frame_bytes, 6u);
+  EXPECT_TRUE(reply.data.empty());
+  fake_.wait_quiet();
+  EXPECT_EQ(fake_.bytes_received(), 6u);
+  const std::vector<FrameRecord> frames = fake_.frames();
+  ASSERT_EQ(frames.size(), 1u);
+  EXPECT_EQ(frames[0].id, 4);
+  EXPECT_EQ(frames[0].instruction, ServoBus::inst_reset);
+  EXPECT_TRUE(frames[0].params.empty());
+  EXPECT_EQ(fake_.snapshot(4).mem[kRegMode], 0) << "the servo was reset";
+  EXPECT_EQ(fake_.snapshot(4).mem[kRegId], 4);
+}
+
+TEST_F(ServoBusChecked, checked_reset_refuses_0xfe_0xff_and_a_closed_bus_without_sending)
+{
+  // A broadcast RESET would reset every servo on the bus; the checked call hears one servo only.
+  EXPECT_EQ(bus_.checked_reset(0xfe, 100).kind, ReplyKind::INVALID_ID);
+  EXPECT_EQ(bus_.checked_reset(0xff, 100).kind, ReplyKind::INVALID_ID);
+  bus_.close();
+  EXPECT_EQ(bus_.checked_reset(1, 100).kind, ReplyKind::NOT_OPEN);
+  fake_.wait_quiet();
+  EXPECT_EQ(fake_.bytes_received(), 0u);
+  EXPECT_EQ(fake_.snapshot(1).resets, 0);
+}
+
+TEST_F(ServoBusChecked, checked_reset_names_a_silent_id_a_foreign_ack_and_a_doubled_one)
+{
+  fake_.add_servo(4);
+  fake_.add_servo(5);
+  const Reply silent = bus_.checked_reset(9, 30);
+  EXPECT_EQ(silent.kind, ReplyKind::SILENT);
+  EXPECT_GE(silent.elapsed_us, 30000u) << "the ack window, not the io timeout";
+  EXPECT_EQ(bus_.io_timeout_ms(), kIoTimeoutMs) << "and the io timeout is given back";
+
+  fake_.set_faults_apply_to_addressed(true);
+  fake_.set_reply_id_override(4, 9);
+  const Reply foreign = bus_.checked_reset(4, 100);
+  EXPECT_EQ(foreign.kind, ReplyKind::WRONG_ID) << "only the addressed id acks a reset";
+  EXPECT_EQ(foreign.from_id, 9);
+  fake_.set_faults_apply_to_addressed(false);
+
+  fake_.set_twin(5, TwinReply::doubled);
+  const Reply doubled = bus_.checked_reset(5, 100);
+  EXPECT_EQ(doubled.kind, ReplyKind::EXTRA);
+  EXPECT_EQ(doubled.extra_bytes, 6u);
+}
+
+TEST_F(ServoBusChecked, set_baudrate_retimes_the_line_and_keeps_the_port)
+{
+  // Under the baud model a servo at register 6 = 1 answers at 500000 only. The bus moves to it and
+  // back without ever letting go of the port.
+  fake_.add_servo(4);
+  fake_.set_byte(4, 6, 1);
+  fake_.set_baud_model(true);
+  ASSERT_EQ(bus_.checked_ping(4).kind, ReplyKind::SILENT);
+
+  ASSERT_TRUE(bus_.set_baudrate(500000));
+  EXPECT_EQ(bus_.baudrate(), 500000);
+  struct termios settings{};
+  ASSERT_EQ(::tcgetattr(fake_.slave_fd(), &settings), 0);
+  EXPECT_EQ(::cfgetospeed(&settings), static_cast<speed_t>(B500000));
+  EXPECT_EQ(::cfgetispeed(&settings), static_cast<speed_t>(B500000));
+  EXPECT_EQ(bus_.checked_ping(4).kind, ReplyKind::ONE);
+  EXPECT_EQ(bus_.port(), fake_.port());
+
+  // TIOCEXCL is still set, so a second open is refused before it even reaches the flock.
+  ServoBus other;
+  const OpenResult held = other.open(fake_.port(), kBaudrate, kIoTimeoutMs);
+  EXPECT_EQ(held.status, BusStatus::LOCK_OPEN_FAILED) << "the port is still held";
+  EXPECT_EQ(held.error, EBUSY);
+
+  ASSERT_TRUE(bus_.set_baudrate(kBaudrate));
+  EXPECT_EQ(bus_.baudrate(), kBaudrate);
+  EXPECT_EQ(bus_.checked_ping(4).kind, ReplyKind::SILENT);
+  EXPECT_EQ(bus_.checked_ping(1).kind, ReplyKind::ONE) << "servo 1 is at register 6 = 0";
+}
+
+TEST_F(ServoBusChecked, set_baudrate_refuses_a_closed_bus_and_an_unmapped_rate)
+{
+  for (const int rate : {0, 250000, 128000, 76800, 230400, -1}) {
+    EXPECT_FALSE(bus_.set_baudrate(rate)) << rate;
+    EXPECT_EQ(bus_.baudrate(), kBaudrate) << rate;
+  }
+  struct termios settings{};
+  ASSERT_EQ(::tcgetattr(fake_.slave_fd(), &settings), 0);
+  EXPECT_EQ(::cfgetospeed(&settings), static_cast<speed_t>(B1000000));
+  bus_.close();
+  EXPECT_FALSE(bus_.set_baudrate(500000));
+  ServoBus never_opened;
+  EXPECT_FALSE(never_opened.set_baudrate(kBaudrate));
+}
+
+TEST_F(ServoBusChecked, every_reply_kind_has_a_name)
+{
+  // The BusStatus and WriteStatus discipline, plus one rule of its own: a name goes into the
+  // tools' key=value detail lines, so it may not contain a space.
+  const std::vector<ReplyKind> all = {
+    ReplyKind::NOT_OPEN, ReplyKind::INVALID_ID, ReplyKind::INVALID_COUNT, ReplyKind::SILENT,
+    ReplyKind::ONE, ReplyKind::EXTRA, ReplyKind::WRONG_ID, ReplyKind::STATUS_ONLY,
+    ReplyKind::GARBLED};
+  std::vector<std::string> names;
+  for (const ReplyKind kind : all) {
+    const std::string name = to_string(kind);
+    EXPECT_FALSE(name.empty());
+    EXPECT_EQ(name.find(' '), std::string::npos) << name;
+    names.push_back(name);
+  }
+  std::sort(names.begin(), names.end());
+  EXPECT_EQ(std::unique(names.begin(), names.end()), names.end()) << "two kinds share a name";
 }

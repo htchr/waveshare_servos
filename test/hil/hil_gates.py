@@ -1402,8 +1402,8 @@ def h9(R, S, C):
     R.ck('status_zero', bool(status) and all(x == 0.0 for x in status),
          non_zero=sum(1 for x in status if x != 0.0), of=len(status))
     # The window is t_cycle_done, not t_cycled, because this row's detail says "after the
-    # inactive/active cycle" and t_cycled is recorded BEFORE both transitions (hil_check.sh:755,
-    # against the transitions at :769 and :773 and t_cycle_done at :778). The old window was a
+    # inactive/active cycle" and t_cycled is recorded BEFORE both transitions (hil_check.sh:928,
+    # against the transitions at :942 and :946 and t_cycle_done at :951). The old window was a
     # superset of the claim -- it could not miss a leaked status, but it could report one that
     # arrived before the cycle and blame the cycle for it, and the diagnosis it prints
     # (PING_DIAGNOSIS: a status latched from a Ping or an Ack) is specifically about the ping
@@ -1611,7 +1611,7 @@ def h11(R, S, C):
 
 def h12(R, S, C):
     """
-    Gate the JointSaturationLimiter clamp of jazzy.md section 6 step 8 (h_H12, hil_check.sh:968).
+    Gate the JointSaturationLimiter clamp of jazzy.md section 6 step 8 (h_H12, hil_check.sh:1157).
 
     THE ATTRIBUTION ARGUMENT, which is the whole of this scenario and the reason every row below
     is worth anything. The driver clamps too, and it would clamp these same commands: a position
@@ -1833,9 +1833,639 @@ def h12(R, S, C):
              park_final_cm_exit_code=S.fact('park_final_cm_exit_code') or "''")
 
 
+#
+# Phase 6 (PHASE6_SPEC E.2-E.8): the tools scan, set_id and calibrate_midpoint on the bench, and
+# the bench's EEPROM as hil_eeprom reads it. H13 scans, H14 proves every tool refuses a held port
+# and writes nothing when it refuses, H15 and H16 are the two EEPROM writers (journaled, restored),
+# and H17 compares the bench at the end of the run with the bench at its start and with E.0's
+# golden baseline. Every row that is not a NOTE is proved red by an injected defect
+# (TOOL_INJECTIONS).
+#
+
+# The bench's servo ids. The SAME four ids as EXAMPLE_IDS, and named twice on purpose: EXAMPLE_IDS
+# is what the shipped example declares, BENCH_IDS is what answers on this bench's bus, and the
+# tool scenarios gate on the second. They agree because the example was written for this bench; a
+# bench with a fifth servo would change BENCH_IDS and not the example.
+BENCH_IDS = EXAMPLE_IDS
+BENCH_MODES = {1: 0, 2: 0, 3: 1, 4: 1}         # register 33 as E.0 read it: two arms, two wheels
+SAFE_SILENT_IDS = (200, 201, 44)               # H14's write targets; 44 is 300 narrowed to 8 bits
+TEMP_ID = 253                                  # H15's temporary id: the top of scan's range
+CALIB_ID = 2                                   # H16 calibrates the arm that rests near 1026
+WHEEL_ID = 3                                   # ... and is refused on this wheel [Q1]
+MIDPOINT_TOL = 3                               # ticks, servo_tools kMidpointTolTicks (G.2 R3)
+# A full scan pings 250-odd silent ids three times at 5 ms each (C.1). The floor is 90 % of that
+# alone, before rclcpp start-up, so a scan that lost its retries (one attempt: ~1.8 s with
+# start-up) lands under it. The ceiling catches a 20 or 100 ms timeout. It cannot see a narrowed id
+# range -- 1..253 or 0..230 still takes more than 3.8 s -- which the exact ping-count tests of
+# D.4/D.5 and H15.scan_sees_move cover instead.
+SCAN_FLOOR_S = 0.9 * 250 * 3 * 0.005
+SCAN_CEIL_S = 12.0
+EEPROM_ADDRS = (0, 1) + tuple(range(3, 40))    # every EEPROM byte hil_eeprom reads; 2 is undefined
+
+
+# scan's stdout contract (C.1), which is all the HIL knows about the table: the header's eleven
+# column names, then one row per servo of exactly eleven tokens starting with its id, then the
+# footer. `?` is a legal token anywhere but in the id column.
+SCAN_COLUMNS = ('id', 'type', 'mode', 'model', 'baud_reg', 'baud', 'position', 'voltage_V',
+                'temp_C', 'status', 'offset')
+SCAN_FOOTER = re.compile(r'found (no servo|\d+ servo\(s\)) on \S+ at \d+ baud(: ids( \d+)+)? '
+                         r'\(pinged (ids \d+\.\.\d+|no id), \d+ attempts each, [\d.]+ s\)'
+                         r'(, interrupted (after|before) id \d+)?$')
+DETAIL_LINE = re.compile(r'^[a-z_]+: detail (.*)$')
+
+
+def scan_table(text):
+    """
+    Parse scan's stdout into (header_ok, rows_by_id, bad_lines, footer) by the C.1 contract.
+
+    The header is the first line and names exactly SCAN_COLUMNS; the footer is the last line and
+    matches SCAN_FOOTER; everything between is a data row of eleven tokens whose first is an id
+    not seen before, and any other line is a bad line. rows_by_id maps each id to {column: token}.
+    The rows are parsed whether the header is right or not, so a drifted header is H13.table's
+    business alone and does not also empty every row that reads the table.
+    """
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    header_ok = bool(lines) and tuple(lines[0].split()) == SCAN_COLUMNS
+    footer = lines[-1] if lines and SCAN_FOOTER.match(lines[-1]) else None
+    rows, bad = {}, []
+    for line in lines[1 if header_ok else 0:-1 if footer else None]:
+        tokens = line.split()
+        if len(tokens) == len(SCAN_COLUMNS) and tokens[0].isdigit() and int(tokens[0]) not in rows:
+            rows[int(tokens[0])] = dict(zip(SCAN_COLUMNS, tokens))
+        else:
+            bad.append(line)
+    return header_ok, rows, bad, footer
+
+
+def tool_detail(err_text):
+    """Return the key=value fields of a tool's last `<tool>: detail` line (C.2, C.3), or None."""
+    found = None
+    for line in err_text.splitlines():
+        match = DETAIL_LINE.match(line.strip())
+        if match:
+            found = dict(field.split('=', 1) for field in match.group(1).split() if '=' in field)
+    return found
+
+
+def _int(text):
+    """Return the text as an int, or None when it is not one (`?`, `none`, `busy`, '')."""
+    text = str(text).strip()
+    return int(text) if re.fullmatch(r'-?\d+', text) else None
+
+
+def int_fact(S, key):
+    """Return the fact as an int, or None when it is missing or not a number (`none`, `busy`)."""
+    return _int(S.fact(key))
+
+
+def decode11(raw):
+    """Sign-magnitude on bit 11, the offset register's convention (servo_tools offset_from_raw)."""
+    return -(raw & ~0x800) if raw & 0x800 else raw
+
+
+def decode15(raw):
+    """Sign-magnitude on bit 15, the present-position register's convention (ReadPos)."""
+    return -(raw & 0x7fff) if raw & 0x8000 else raw
+
+
+def tick_distance(a, b):
+    """Return the distance between two encoder readings on the 4096-tick circle."""
+    d = abs(a - b) % ENCODER_STEPS
+    return min(d, ENCODER_STEPS - d)
+
+
+def _ids(values):
+    return ' '.join(str(i) for i in values) or 'none'
+
+
+def snap_file(path):
+    """
+    Parse a hil_eeprom .snap file (E.1, DEVIATIONS D-5) into the shape of its RESULT json.
+
+    H17 reads the pre-flight's initial snapshot and E.0's golden baseline as .snap files -- the
+    baseline has no RESULT json beside it in the scenario directory -- so the same comparison can
+    run over both kinds. An unreadable value stays the string 'x' and a missing or foreign file
+    parses to {}, which every comparison below counts as a difference.
+    """
+    lines = _text(path).splitlines()
+    if not lines or lines[0].strip() != 'hil_eeprom snapshot 1':
+        return {}
+    snap = {'ok': False, 'census': None, 'ids': {}}
+    for line in lines[1:]:
+        tokens = line.split()
+        if tokens[:1] == ['ok']:
+            snap['ok'] = tokens[1:] == ['true']
+        elif tokens[:1] == ['census']:
+            census_ids = [_int(token) for token in tokens[1:]]
+            snap['census'] = census_ids if None not in census_ids else None
+        elif tokens[:1] == ['servo'] and len(tokens) > 2 and tokens[1].isdigit():
+            block = snap['ids'].setdefault(tokens[1], {'eeprom': {}, 'sram': {}, 'volatile': {}})
+            if tokens[2] == 'eeprom':
+                block['eeprom'] = {str(reg): 'x' if _int(value) is None else _int(value)
+                                   for reg, value in enumerate(tokens[3:]) if reg != 2}
+                block['n'] = sum(1 for value in block['eeprom'].values() if value != 'x')
+            elif tokens[2] in ('sram', 'volatile'):
+                pairs = (token.split('=', 1) for token in tokens[3:] if '=' in token)
+                block[tokens[2]] = {reg: 'x' if _int(value) is None else _int(value)
+                                    for reg, value in pairs}
+    return snap
+
+
+def _block(snap, servo):
+    return (snap.get('ids') or {}).get(str(servo)) or {}
+
+
+def _reg(block, reg):
+    """One register of a snapshot block: EEPROM below 40, else SRAM; None when absent."""
+    return (block.get('eeprom' if reg < 40 else 'sram') or {}).get(str(reg))
+
+
+def _word(block, first):
+    low, high = _reg(block, first), _reg(block, first + 1)
+    return low | high << 8 if isinstance(low, int) and isinstance(high, int) else None
+
+
+def _snapshot_problems(snap):
+    """Say why a snapshot as a whole is not evidence: none at all, an error, ok not true."""
+    if not snap:
+        return ['no snapshot']
+    why = ['error %s' % snap['error']] if snap.get('error') else []
+    return why + ([] if snap.get('ok') is True else ['ok is %s' % snap.get('ok')])
+
+
+def _unreadable_values(snap):
+    """Name every value of every servo in the snapshot that is not a number (hil_eeprom's 'x')."""
+    return ['id %s %s %s unreadable' % (servo, part, reg)
+            for servo, block in sorted((snap.get('ids') or {}).items(), key=lambda s: int(s[0]))
+            for part in ('eeprom', 'sram', 'volatile')
+            for reg, value in sorted((block.get(part) or {}).items(), key=lambda r: int(r[0]))
+            if not isinstance(value, int)]
+
+
+def _diffs(a, b, ids, regs, with_census=False):
+    """
+    Compare two loaded snapshots register by register; return [{'at': (id, reg) or None, 'text'}].
+
+    Never vacuous (E.2): a snapshot that is missing, carries an error (port_busy_skipped,
+    no_result) or says ok false is a difference, and so is an id missing on either side and a
+    value either side could not read. Those carry at=None, so a caller that allows a few
+    registers to change (H16.only_offset_changed) can never mistake an unreadable byte for one.
+    """
+    out = [{'at': None, 'text': '%s: %s' % (side, why)}
+           for side, snap in (('A', a), ('B', b)) for why in _snapshot_problems(snap)]
+    for servo in ids:
+        x, y = _block(a, servo), _block(b, servo)
+        if not x or not y:
+            out.append({'at': None,
+                        'text': 'id %s: missing in %s' % (servo, 'A' if not x else 'B')})
+            continue
+        for reg in regs:
+            p, q = _reg(x, reg), _reg(y, reg)
+            if not isinstance(p, int) or not isinstance(q, int):
+                out.append({'at': None, 'text': 'id %s reg %d: unreadable (%s -> %s)'
+                            % (servo, reg, p, q)})
+            elif p != q:
+                out.append({'at': (servo, reg), 'text': 'id %s reg %d: %s -> %s'
+                            % (servo, reg, p, q)})
+    if with_census and (not isinstance(a.get('census'), list) or
+                        a.get('census') != b.get('census')):
+        out.append({'at': None, 'text': 'census: %s -> %s' % (a.get('census'), b.get('census'))})
+    return out
+
+
+def eeprom_diff(S, a, b, ids, eeprom_only, census=False):
+    """
+    Return the differences between two snapshots over EEPROM, plus 40 and 55 unless eeprom_only.
+
+    a and b are snapshot labels in the scenario directory (their RESULT json) or snapshots already
+    loaded (snap_file). Every missing id, ok false, port_busy_skipped or unreadable value counts
+    as a difference, so an empty list always means both snapshots were read and were equal. With
+    census=True the two censuses must also be present and equal.
+    """
+    loaded = [S.rec(x) if isinstance(x, str) else x for x in (a, b)]
+    regs = EEPROM_ADDRS + (() if eeprom_only else (40, 55))
+    return [d['text'] for d in _diffs(loaded[0], loaded[1], ids, regs, census)]
+
+
+def census(S, label):
+    """Return a snapshot's census as a list of ids, or None when it was not taken or not read."""
+    got = S.rec(label).get('census')
+    return got if isinstance(got, list) and all(isinstance(i, int) for i in got) else None
+
+
+def holders_left(S, allowed):
+    """
+    Name each tool run whose `<label>_holders_after` holds a pid not allowed for that label.
+
+    tool() records the port's holders after every run, on every path. A holder that was there
+    before the tool and is still there (the controller manager in H14's stage A, the flock-only
+    probe in stage B) is allowed; any other pid is a leaked lock, and a label with no fact at all
+    means the run's facts are incomplete, which is not evidence of a release either.
+    """
+    left = []
+    for label, pids in allowed.items():
+        key = '%s_holders_after' % label
+        if key not in S.facts:
+            left.append('%s unrecorded' % key)
+        else:
+            left += ['%s=%s' % (key, pid) for pid in S.fact(key).split() if pid not in pids]
+    return left
+
+
+def journal_row(R, S):
+    """Emit the journal row of H13-H16: guard_end found the bench unchanged, or restored it."""
+    R.ck('journal_cleared', S.fact('journal_left') == 'false',
+         "true: guard_end could not restore the bench and kept the journal; '': guard_end never "
+         'ran', journal_left=S.fact('journal_left') or "''")
+
+
+def scan_fields(row, block):
+    """Say where one scan row disagrees with the servo's snapshot block (H13.fields); [] if not."""
+    if row is None:
+        return ['no row in the table']
+    if not block:
+        return ['no servo in the snapshot']
+    mode, volatile = _reg(block, 33), block.get('volatile') or {}
+    offset = _word(block, 31)
+    wrong = []
+    for column, got, want in (
+            ('model', _int(row['model']), _word(block, 3)),
+            ('mode', _int(row['mode']), mode),
+            ('type', row['type'], {0: 'pos', 1: 'vel'}.get(mode, '-')),
+            ('baud_reg', _int(row['baud_reg']), _reg(block, 6)),
+            ('offset', _int(row['offset']), None if offset is None else decode11(offset))):
+        if got is None or want is None or got != want:
+            wrong.append('%s %s, snapshot %s' % (column, row[column], want))
+    rest = REST_TICKS if mode == 0 else WHEEL_REST_TICKS
+    position, at = _int(row['position']), volatile.get('56')
+    if position is None or not isinstance(at, int) or tick_distance(position, decode15(at)) > rest:
+        wrong.append('position %s, snapshot %s (bound %d)' % (row['position'], at, rest))
+    try:
+        volts = float(row['voltage_V'])
+    except ValueError:
+        volts = NAN
+    if not isinstance(volatile.get('62'), int) or not abs(volts - 0.1 * volatile['62']) <= 0.2001:
+        wrong.append('voltage_V %s, snapshot %s (bound 0.2 V)' % (row['voltage_V'],
+                                                                  volatile.get('62')))
+    temp = _int(row['temp_C'])
+    if temp is None or not isinstance(volatile.get('63'), int) or abs(temp - volatile['63']) > 2:
+        wrong.append('temp_C %s, snapshot %s (bound 2)' % (row['temp_C'], volatile.get('63')))
+    return wrong
+
+
+def h13(R, S, C):
+    """
+    Gate scan on the bench (E.3): one explicit scan, cross-checked against hil_eeprom's snapshot.
+
+    Scan and hil_eeprom read the same registers by two paths that share nothing above ServoBus --
+    the tool's id-checked 37-byte identity block and feedback block, the helper's single vendored
+    reads -- so a column swap, a wrong byte order, an offset decoded on the wrong bit or one
+    servo's data printed under another's id makes the two disagree in `fields`. The default-port
+    run, the stale name and the positional port are the three ways a user's old command line meets
+    the new tool; `read_only` is the whole-EEPROM proof that none of the four scans wrote anything.
+    """
+    port_rows(R, S)
+    journal_row(R, S)
+    R.ck('rc', int_fact(S, 'scan_rc') == 0, rc=S.fact('scan_rc') or "''", expected=0)
+    out = S.txt('scan.out.txt')
+    header_ok, rows, bad, footer = scan_table(out)
+    R.ck('table', header_ok and footer is not None and not bad,
+         'C.1: the header, rows of 11 tokens, the footer, and nothing else on stdout',
+         header=header_ok, rows=len(rows), footer=footer is not None, bad_lines=len(bad),
+         first_bad=repr(bad[0]) if bad else 'none')
+    ids = sorted(rows)
+    R.ck('ids', ids == list(BENCH_IDS), ids=_ids(ids), expected=_ids(BENCH_IDS),
+         missing=_ids(i for i in BENCH_IDS if i not in rows),
+         unlisted=_ids(i for i in ids if i not in BENCH_IDS))
+    pre = S.rec('pre_eeprom')
+    unsound = _snapshot_problems(pre) + _unreadable_values(pre)
+    R.ck('census_agrees', not unsound and census(S, 'pre_eeprom') == ids,
+         '; '.join(unsound) or 'the table and hil_eeprom census agree',
+         table=_ids(ids), census=_ids(census(S, 'pre_eeprom') or []))
+    for servo in BENCH_IDS:
+        wrong = unsound + scan_fields(rows.get(servo), _block(pre, servo))
+        R.ck('fields.%d' % servo, not wrong, '; '.join(wrong) or
+             'model, mode and type, baud_reg, offset, position, voltage and temperature agree '
+             'with pre_eeprom')
+    table_modes = {i: _int(rows[i]['mode']) for i in BENCH_IDS if i in rows}
+    snap_modes = {i: _reg(_block(pre, i), 33) for i in BENCH_IDS}
+    R.ck('modes', bool(table_modes) and snap_modes == BENCH_MODES and
+         all(mode == BENCH_MODES[i] for i, mode in table_modes.items()),
+         'table=%s snapshot=%s expected=%s' % (table_modes, snap_modes, BENCH_MODES))
+    seconds = S.number('scan_seconds')
+    R.ck('timing', SCAN_FLOOR_S <= seconds <= SCAN_CEIL_S,
+         'catches a lost retry or a long timeout, NOT a narrowed range (H15.scan_sees_move does)',
+         seconds=seconds, floor=SCAN_FLOOR_S, ceiling=SCAN_CEIL_S)
+    lines, on_stdout = int_fact(S, 'scan_serial_speed_lines'), out.count('serial speed')
+    R.ck('serial_speed', lines == 1 and on_stdout == 0,
+         'opened once, through open_bus, which sends the vendored line to stderr (R19)',
+         lines=S.fact('scan_serial_speed_lines') or "''", expected=1, on_stdout=on_stdout)
+    if S.fact('scan_default_skipped'):
+        R.row('default_params', 'SKIP', S.fact('scan_default_skipped'))
+    else:
+        _, default_rows, _, _ = scan_table(S.txt('scan_default.out.txt'))
+        same = bool(rows) and sorted(default_rows) == ids and all(
+            default_rows[i]['mode'] == rows[i]['mode'] and
+            default_rows[i]['model'] == rows[i]['model'] for i in ids)
+        R.ck('default_params', int_fact(S, 'scan_default_rc') == 0 and same,
+             "no parameter at all: the defaults are the hardware parameters' defaults",
+             rc=S.fact('scan_default_rc') or "''", ids=_ids(sorted(default_rows)),
+             explicit_ids=_ids(ids))
+    for key, label in (('usage.stale', 'stale_scan'), ('usage.positional', 'positional_scan')):
+        R.ck(key, int_fact(S, label + '_rc') == 64 and
+             int_fact(S, label + '_serial_speed_lines') == 0,
+             'refused before the port was opened', rc=S.fact(label + '_rc') or "''",
+             serial_speed_lines=S.fact(label + '_serial_speed_lines') or "''")
+    diffs = eeprom_diff(S, 'pre_eeprom', 'post_eeprom', BENCH_IDS, False, census=True)
+    R.ck('read_only', not diffs, '; '.join(diffs[:6]) or
+         'EEPROM, 40, 55 and census identical before and after the four scans', diffs=len(diffs))
+    runs = ['scan', 'stale_scan', 'positional_scan']
+    runs += [] if S.fact('scan_default_skipped') else ['scan_default']
+    left = holders_left(S, {label: () for label in runs})
+    probe = S.rec('released')
+    R.ck('released', probe.get('verdict') == 'acquired' and not left, ', '.join(left),
+         verdict=probe.get('verdict', 'no_result'))
+    R.row('model', 'NOTE', 'registers 3-4 as scan prints them, raw: %s' % ' '.join(
+        'id%d=%s' % (i, rows[i]['model']) for i in ids))
+    R.row('firmware', 'NOTE', 'registers 0-1: %s' % ' '.join(
+        'id%d=%s.%s' % (i, _reg(_block(pre, i), 0), _reg(_block(pre, i), 1)) for i in BENCH_IDS))
+    R.row('lock', 'NOTE', 'register 55 before the scans: %s' % ' '.join(
+        'id%d=%s' % (i, _reg(_block(pre, i), 55)) for i in BENCH_IDS))
+
+
+H14_TOOLS = (('scan', 'scan'), ('set_id', 'set_id'), ('calibrate', 'calibrate_midpoint'))
+H14_USAGE = ('stale', 'bad_type', 'range', 'cal_range', 'missing', 'positional', 'foreign_node')
+
+
+def _names_pid(text, pid):
+    return bool(pid) and re.search(r'\bpid %s\b' % re.escape(pid), text) is not None
+
+
+def h14(R, S, C):
+    """
+    Gate every tool's refusals, which must all write nothing (E.4).
+
+    Stage A runs the three tools while the controller manager holds the port, stage B while a
+    flock-only port_probe does, stage C with the port free and arguments that must be refused.
+    Every set_id and calibrate call addresses only ids no servo answers (200, 201, 300 -> 44), so
+    even a tool whose refusals are all broken writes nothing; nothing_written is the proof, over
+    the whole EEPROM. via_servobus is the discriminating row of Phase 6 item 4: a tool that opens
+    with a raw SMS_STS::begin gets past a flock-only holder and prints `serial speed`, while one
+    that goes through ServoBus is refused before begin() and prints nothing.
+    """
+    port_rows(R, S)
+    journal_row(R, S)
+    R.ck('cm_up', S.flag('controllers_active'),
+         'without the stack every cm_* row below would be vacuous',
+         controllers_active=S.fact('controllers_active') or "''")
+    cm_pids = S.fact('cm_pids').split()
+    for short, tool in H14_TOOLS:
+        label = 'cm_' + short
+        err = S.txt(label + '.err.txt')
+        named = [pid for pid in cm_pids if _names_pid(err, pid)]
+        R.ck('cm_refused.' + tool, int_fact(S, label + '_rc') == 1 and
+             int_fact(S, label + '_serial_speed_lines') == 0 and
+             'held by another process' in err and bool(named),
+             rc=S.fact(label + '_rc') or "''",
+             serial_speed_lines=S.fact(label + '_serial_speed_lines') or "''",
+             cm_pids=_ids(cm_pids), named=_ids(named))
+    rec = S.rec('tools_window')
+    names = joints_of(rec)
+    stamps = series(rec, names[0])[0] if names else []
+    drift = max((max(series(rec, j)[1] or [0.0]) - min(series(rec, j)[1] or [0.0])
+                 for j in ('joint1', 'joint2')), default=NAN)
+    new_logs = S.number('driver_warns_after', -1) - S.number('driver_warns_before', -2)
+    R.ck('cm_undisturbed', bool(rec) and abs(rate_hz(stamps) - 100.0) <= 2.0 and
+         max_gap(stamps) <= 0.050 and drift <= 2 * TICK and new_logs == 0,
+         'the H6 terms over the 12 s the tools ran against the live stack',
+         hz=rate_hz(stamps), gap_s=max_gap(stamps), arm_drift=drift, drift_bound=2 * TICK,
+         new_warn_error_lines=new_logs)
+    probe_pid = S.fact('probe_pid').strip()
+    for short, tool in H14_TOOLS:
+        label = 'fl_' + short
+        rc, lines = int_fact(S, label + '_rc'), int_fact(S, label + '_serial_speed_lines')
+        named = _names_pid(S.txt(label + '.err.txt'), probe_pid)
+        R.ck('flock_refused.' + tool, rc == 1 and named, rc=S.fact(label + '_rc') or "''",
+             probe_pid=probe_pid or "''", names_it=named)
+        R.ck('via_servobus.' + tool, rc == 1 and named and lines == 0,
+             'refused by the lock before begin(): no `serial speed` line on either stream',
+             rc=S.fact(label + '_rc') or "''", names_probe=named,
+             serial_speed_lines=S.fact(label + '_serial_speed_lines', 'missing') or "''")
+    alive = {short: S.fact('fl_%s_holder_alive' % short) for short, _ in H14_TOOLS}
+    held = bool(probe_pid) and all(value == 'true' for value in alive.values())
+    # ABORTED, never PASS or FAIL: an expired holder makes the flock rows no evidence at all.
+    R.row('holder_alive_throughout', 'PASS' if held else 'ABORTED',
+          kv(probe_pid=probe_pid or "''", **{k: v or "''" for k, v in alive.items()}) +
+          ('' if held else ' the flock-only stimulus did not last through stage B, so the '
+                           'flock_refused and via_servobus rows are not evidence; rerun H14'))
+    for label in H14_USAGE:
+        R.ck('usage.' + label, int_fact(S, label + '_rc') == 64 and
+             int_fact(S, label + '_serial_speed_lines') == 0,
+             'refused before the port was opened', rc=S.fact(label + '_rc') or "''",
+             serial_speed_lines=S.fact(label + '_serial_speed_lines') or "''")
+    R.ck('refuse_taken', int_fact(S, 'taken_rc') == 4 and
+         'id 3 already answers' in S.txt('taken.err.txt'),
+         'new id 3 answers, so the taken check refuses before anything reaches the silent 200',
+         rc=S.fact('taken_rc') or "''", expected=4)
+    R.ck('refuse_silent_start', int_fact(S, 'silent_start_rc') == 3,
+         rc=S.fact('silent_start_rc') or "''", expected=3)
+    R.ck('refuse_silent_calibrate', int_fact(S, 'cal_silent_rc') == 3,
+         rc=S.fact('cal_silent_rc') or "''", expected=3)
+    diffs = eeprom_diff(S, 'pre_eeprom', 'post_eeprom', BENCH_IDS, True, census=True)
+    unsafe = [i for i in SAFE_SILENT_IDS if i in (census(S, 'pre_eeprom') or ())]
+    R.ck('nothing_written', not diffs and not unsafe, '; '.join(diffs[:6]) or
+         'EEPROM and census identical before and after every refusal',
+         diffs=len(diffs), answering_write_targets=_ids(unsafe))
+    pre, post = S.rec('pre_eeprom'), S.rec('post_eeprom')
+    R.row('sram', 'NOTE', 'the stack legitimately writes 40/55; before -> after: %s' % ' '.join(
+        'id%d:40=%s->%s,55=%s->%s' % (i, _reg(_block(pre, i), 40), _reg(_block(post, i), 40),
+                                      _reg(_block(pre, i), 55), _reg(_block(post, i), 55))
+        for i in BENCH_IDS))
+    allowed = {'cm_' + short: cm_pids for short, _ in H14_TOOLS}
+    allowed.update({'fl_' + short: [probe_pid] for short, _ in H14_TOOLS})
+    allowed.update({label: () for label in H14_USAGE + ('taken', 'silent_start', 'cal_silent')})
+    left = holders_left(S, allowed)
+    probe = S.rec('released')
+    R.ck('released', probe.get('verdict') == 'acquired' and not left,
+         'no holder but the controller manager (stage A) or the probe (stage B) after any tool '
+         + ', '.join(left), verdict=probe.get('verdict', 'no_result'))
+
+
+def h15(R, S, C):
+    """
+    Gate set_id's round trip 4 -> 253 -> 4 (E.5), the first of the two EEPROM writers.
+
+    moved_eeprom is hil_eeprom's own reading of the bench between the two runs, taken by a path
+    set_id shares nothing with above ServoBus, so `moved` and `only_id_changed` do not rest on the
+    tool's word. back_eeprom is the bench as the tool's own way back left it -- restored_by_tool
+    -- BEFORE the helper's restore, which could otherwise mask a dirty round trip; restore_writes
+    then proves that restore had no EEPROM byte left to write.
+    """
+    start = 4
+    port_rows(R, S)
+    journal_row(R, S)
+    for label in ('move', 'back'):
+        R.ck(label + '_rc', int_fact(S, label + '_rc') == 0,
+             rc=S.fact(label + '_rc') or "''", expected=0)
+    moved_ids = sorted(set(BENCH_IDS) - {start} | {TEMP_ID})
+    R.ck('moved', census(S, 'moved_eeprom') == moved_ids,
+         census=_ids(census(S, 'moved_eeprom') or []), expected=_ids(moved_ids))
+    pre, moved, back = S.rec('pre_eeprom'), S.rec('moved_eeprom'), S.rec('back_eeprom')
+    wrong = eeprom_diff(S, pre, moved, [i for i in BENCH_IDS if i != start], True)
+    was, now = _block(pre, start), _block(moved, TEMP_ID)
+    if not was or not now:
+        wrong.append('no servo %d in pre or no servo %d in moved' % (start, TEMP_ID))
+    for reg in EEPROM_ADDRS if was and now else ():
+        want = TEMP_ID if reg == 5 else _reg(was, reg)
+        if not isinstance(_reg(now, reg), int) or not isinstance(want, int) or \
+                _reg(now, reg) != want:
+            wrong.append('%d reg %d: %s, expected %s' % (TEMP_ID, reg, _reg(now, reg), want))
+    R.ck('only_id_changed', not wrong, '; '.join(wrong[:6]) or
+         'servo %d reads as it did at %d but for register 5, ids 1-3 untouched' % (TEMP_ID, start),
+         diffs=len(wrong))
+    R.ck('lock_closed', _reg(now, 55) == 1 and _reg(_block(back, start), 55) == 1,
+         'the tools leave register 55 at 1 (C.0 verified lock)',
+         moved=_reg(now, 55), back=_reg(_block(back, start), 55))
+    _, scanned, _, _ = scan_table(S.txt('moved_scan.out.txt'))
+    R.ck('scan_sees_move', int_fact(S, 'moved_scan_rc') == 0 and sorted(scanned) == moved_ids,
+         'the hardware proof that scan reaches the top of its range',
+         rc=S.fact('moved_scan_rc') or "''", ids=_ids(sorted(scanned)), expected=_ids(moved_ids))
+    diffs = eeprom_diff(S, pre, back, BENCH_IDS, True)
+    R.ck('restored_by_tool', not diffs and census(S, 'back_eeprom') == list(BENCH_IDS),
+         '; '.join(diffs[:6]) or 'the round trip alone left EEPROM and census as found',
+         census=_ids(census(S, 'back_eeprom') or []))
+    # A refused restore (exit 3: ambiguous census, an unreadable register, a model or register-5/6
+    # difference) prints `writes: []` too, so the empty list counts only from a restore that ran
+    # to its end: its rc 0 and its RESULT ok (review fix F15/F24).
+    restore = S.rec('restore')
+    writes = restore.get('writes')
+    eeprom_writes = [w for w in writes if w.get('kind') == 'eeprom'] \
+        if isinstance(writes, list) else None
+    R.ck('restore_writes', restore.get('ok') is True and int_fact(S, 'restore_rc') == 0 and
+         eeprom_writes == [],
+         'hil_eeprom restore after the round trip ran and had no EEPROM byte to write',
+         rc=S.fact('restore_rc') or "''", result_ok=restore.get('ok'),
+         eeprom_writes='unrecorded' if eeprom_writes is None else len(eeprom_writes))
+    diffs = eeprom_diff(S, 'pre_eeprom', 'post_eeprom', BENCH_IDS, False, census=True)
+    R.ck('restored', not diffs, '; '.join(diffs[:6]) or
+         'EEPROM, 40, 55 and census as the scenario found them', diffs=len(diffs))
+    details = [tool_detail(S.txt(label + '.err.txt')) or {} for label in ('move', 'back')]
+    for key, field in (('ack_from', 'id_write_ack'), ('ack_ms', 'ack_ms'),
+                       ('verify_ms', 'verify_ms'), ('new_id_pings', 'new_id_pings'),
+                       ('late_ack_from', 'late_ack_from'), ('lock_before', 'lock_before')):
+        R.row(key, 'NOTE', 'move=%s back=%s' % tuple(
+            d.get(field, 'no detail line') for d in details))
+    R.row('torque_after_id_write', 'NOTE', 'register 40 at %d after the move %s, before it %s'
+          % (TEMP_ID, _reg(now, 40), _reg(was, 40)))
+
+
+def h16(R, S, C):
+    """
+    Gate calibrate_midpoint on id 2 and its refusal on the wheel id 3 (E.6) [Q1-Q3].
+
+    position_2048 is hil_eeprom's own read of the position, taken right after the tool; the tool's
+    word is not asked. offset_delta needs the offset register to have really moved, by as much as
+    the tool's own settled, torque-off position_before was off 2048 -- so a calibration of a servo
+    already at its midpoint could not pass it (the precondition in h_H16 aborts on one).
+    """
+    port_rows(R, S)
+    journal_row(R, S)
+    R.ck('rc', int_fact(S, 'cal_rc') == 0, rc=S.fact('cal_rc') or "''", expected=0)
+    read = S.rec('cal_pos')
+    value = read.get('value')
+    R.ck('position_2048', read.get('ok') is True and isinstance(value, int) and
+         abs(value - 2048) <= MIDPOINT_TOL, 'hil_eeprom read --addr 56 right after the tool',
+         read_ok=read.get('ok'), value=value, tol=MIDPOINT_TOL)
+    detail = tool_detail(S.txt('cal.err.txt'))
+    pre, cal, wheel = S.rec('pre_eeprom'), S.rec('cal_eeprom'), S.rec('wheel_eeprom')
+    before, after = _word(_block(pre, CALIB_ID), 31), _word(_block(cal, CALIB_ID), 31)
+    position = _int((detail or {}).get('position_before', ''))
+    if detail is None or None in (before, after, position):
+        R.ck('offset_delta', False, 'no detail line' if detail is None else
+             'unreadable: offset before %s, after %s, position_before %s'
+             % (before, after, (detail or {}).get('position_before')))
+    else:
+        moved, wanted = abs(decode11(after) - decode11(before)), abs(position - 2048)
+        R.ck('offset_delta', abs(moved - wanted) <= MIDPOINT_TOL,
+             '|offset change| against |position_before - 2048|, bit-11 decoded',
+             offset_before=decode11(before), offset_after=decode11(after), moved=moved,
+             position_before=position, wanted=wanted, tol=MIDPOINT_TOL)
+    diffs = _diffs(pre, cal, BENCH_IDS, EEPROM_ADDRS)
+    stray = [d['text'] for d in diffs if d['at'] not in ((CALIB_ID, 31), (CALIB_ID, 32))]
+    R.ck('only_offset_changed', bool(diffs) and not stray, '; '.join(stray[:6]) or
+         ('no EEPROM byte changed at all' if not diffs else
+          'only id %d registers 31-32' % CALIB_ID),
+         changed=len(diffs), stray=len(stray))
+    R.ck('lock_closed', _reg(_block(cal, CALIB_ID), 55) == 1, lock=_reg(_block(cal, CALIB_ID), 55))
+    R.ck('torque_off', _reg(_block(cal, CALIB_ID), 40) == 0, 'the lurch hazard of G.1.1 Q2',
+         torque=_reg(_block(cal, CALIB_ID), 40))
+    diffs = eeprom_diff(S, cal, wheel, BENCH_IDS, False)
+    names_mode = re.search(r'\bis in mode %d\b' % BENCH_MODES[WHEEL_ID],
+                           S.txt('wheel.err.txt')) is not None
+    R.ck('wheel_refused', int_fact(S, 'wheel_rc') == 4 and names_mode and not diffs,
+         '; '.join(diffs[:6]) or 'refused with nothing written', rc=S.fact('wheel_rc') or "''",
+         expected=4, names_mode=names_mode, diffs=len(diffs))
+    diffs = eeprom_diff(S, 'pre_eeprom', 'post_eeprom', BENCH_IDS, False, census=True)
+    R.ck('restored', not diffs, '; '.join(diffs[:6]) or
+         'EEPROM, 40, 55 and census as the scenario found them', diffs=len(diffs))
+    detail = detail or {}
+    for key in ('offset_sign', 'register40_after', 'torque_before', 'settle_ms', 'ack_ms',
+                'late_ack_from'):
+        R.row(key, 'NOTE', 'from the detail line: %s' % detail.get(key, 'no detail line'))
+    at_rest = _block(pre, CALIB_ID).get('volatile', {}).get('56')
+    after_tool = _int(detail.get('position_after', ''))
+    R.row('sag_on_torque_off', 'NOTE', 'position_before %s - pre 56 %s = %s' % (
+        position, at_rest, position - at_rest
+        if isinstance(position, int) and isinstance(at_rest, int) else '?'))
+    R.row('creep_after_tool', 'NOTE', 'cal_pos %s - position_after %s = %s' % (
+        value, after_tool, value - after_tool
+        if isinstance(value, int) and isinstance(after_tool, int) else '?'))
+    R.row('goal_register', 'NOTE', 'register 42 after the calibration %s, before it %s (G.2 R6)'
+          % (_block(cal, CALIB_ID).get('volatile', {}).get('42'),
+             _block(pre, CALIB_ID).get('volatile', {}).get('42')))
+
+
+def h17(R, S, C):
+    """
+    Gate the bench's EEPROM as the run found it (E.7): the run's start, and E.0's golden baseline.
+
+    initial_eeprom.snap is the pre-flight's snapshot of this run, so eeprom_as_found says the whole
+    run -- every scenario, the two EEPROM writers included -- left the EEPROM as it found it.
+    matches_baseline compares with the snapshot taken before any Phase 6 tool touched the bench.
+    """
+    port_rows(R, S)
+    initial = snap_file(os.path.join(S.path, 'initial_eeprom.snap'))
+    diffs = eeprom_diff(S, initial, 'final_eeprom', BENCH_IDS, True, census=True)
+    final_census = census(S, 'final_eeprom')
+    R.ck('eeprom_as_found', not diffs and final_census == list(BENCH_IDS),
+         '; '.join(diffs[:6]) or 'EEPROM and census as the pre-flight read them',
+         census=_ids(final_census or []), expected=_ids(BENCH_IDS), diffs=len(diffs))
+    R.ck('journal_clear', S.fact('journal_present') == 'false',
+         'a journal left behind means a restore failed or a guard path skipped guard_end',
+         journal_present=S.fact('journal_present') or "''")
+    path = os.path.join(S.path, 'baseline.snap')
+    if os.path.exists(path):
+        diffs = eeprom_diff(S, snap_file(path), 'final_eeprom', BENCH_IDS, True, census=True)
+        R.ck('matches_baseline', not diffs, '; '.join(diffs[:6]) or
+             'EEPROM and census as the golden baseline of E.0', diffs=len(diffs))
+    elif S.fact('baseline_source'):
+        R.ck('matches_baseline', False, 'a baseline was given (%s) but never reached the '
+             'scenario directory' % S.fact('baseline_source'))
+    else:
+        R.row('matches_baseline', 'SKIP', 'no baseline given (WAVESHARE_HIL_EEPROM_BASELINE '
+              'unset); the acceptance run always gives one (I.9)')
+    final = S.rec('final_eeprom')
+    R.row('sram', 'NOTE', 'the driver scenarios legitimately touch torque; initial -> final: %s'
+          % ' '.join('id%d:40=%s->%s,55=%s->%s' % (
+              i, _reg(_block(initial, i), 40), _reg(_block(final, i), 40),
+              _reg(_block(initial, i), 55), _reg(_block(final, i), 55)) for i in BENCH_IDS))
+
+
 CHECKERS = (('H1', h1), ('H1B', h1b), ('H2', h2), ('H3', h3), ('H4', h4), ('H5A', h5a),
             ('H5B', h5b), ('H5C', h5c), ('H6', h6), ('H7', h7), ('H8', h8), ('H9', h9),
-            ('H10', h10), ('H11', h11), ('H12', h12))
+            ('H10', h10), ('H11', h11), ('H12', h12), ('H13', h13), ('H14', h14), ('H15', h15),
+            ('H16', h16), ('H17', h17))
+TOOL_SCENARIOS = ('H13', 'H14', 'H15', 'H16', 'H17')
 
 
 # Directories that live beside the scenarios in the run directory and are not scenarios.
@@ -1873,7 +2503,7 @@ def unchecked_rows(R, run_dir):
               'recorded was gated: %s' % ','.join(orphans))
 
 
-def run(run_dir, allowed, seconds, port_free):
+def run(run_dir, allowed, seconds, port_free, expected=None):
     """Check every scenario in the run directory, write the report, return the exit code."""
     report = Report(allowed)
     aborted = {}
@@ -1881,18 +2511,35 @@ def run(run_dir, allowed, seconds, port_free):
         key, _, detail = line.partition('\t')
         if key.strip():
             aborted[key.strip()] = detail.strip()
+    # The scenario list hil_check.sh was asked to run. Without it a scenario that silently never
+    # ran -- its h_ function returned before scenario_begin, or the loop skipped it -- would be a
+    # SKIP, the same verdict as a scenario nobody asked for; with it, it is a FAIL (E.2).
+    expected = expected.split() if isinstance(expected, str) else list(expected or ())
+    missing = '%s was in the scenario list of this run, but left no directory and no abort'
     context = {}
     for name, checker in CHECKERS:
         scenario = Scenario(run_dir, name)
         report.prefix = ''
         if name in aborted:
             report.row(name, 'ABORTED', aborted[name])
+        elif not scenario.present() and name in expected:
+            report.row('%s.did_not_run' % name, 'FAIL', missing % name)
         elif not scenario.present():
             report.row(name, 'SKIP', 'scenario was not run')
         else:
             report.prefix = name
             checker(report, scenario, context)
     report.prefix = ''
+    # Names no checker knows. An abort of one is reported rather than dropped -- it is how a
+    # SCENARIOS entry with no h_ function surfaces (the loop aborts it as rc 127) -- and one that
+    # left nothing at all is did_not_run; a directory it left is unchecked_rows' business.
+    known = [name for name, _ in CHECKERS]
+    for name in sorted(set(aborted) - set(known)):
+        report.row(name, 'ABORTED', aborted[name])
+    for name in expected:
+        if name not in known and name not in aborted and \
+                not os.path.isdir(os.path.join(run_dir, name)):
+            report.row('%s.did_not_run' % name, 'FAIL', missing % name)
     unchecked_rows(report, run_dir)
     for row in report.rows:
         print('%-12s %-30s %s' % (row['verdict'], row['key'], row['detail']))
@@ -2003,6 +2650,9 @@ def _self_test():
 
     _self_test_limits_yaml(expect)
     _self_test_checkers(expect)
+    _self_test_unchecked_rows(expect)
+    _self_test_expected(expect)
+    _self_test_scenario_membership(expect)
 
     print('hil_gates --self-test: %d check(s) failed' % len(failures) if failures
           else 'hil_gates --self-test: all checks passed')
@@ -2062,7 +2712,7 @@ def _self_test_limits_yaml(expect):
 
 def _self_test_checkers(expect):
     """
-    Drive h1..h12 and the whole evaluator over a synthetic run tree (hil_fixture.py).
+    Drive h1..h17 and the whole evaluator over a synthetic run tree (hil_fixture.py).
 
     The primitives above cannot see a defect that stops a checker from running at all -- a local
     rebinding a module-level helper, a missing key, a new file label that is never written. That
@@ -2095,6 +2745,9 @@ def _self_test_checkers(expect):
         _self_test_soak_load(expect, root)
         _self_test_h1_ping(expect, root)
         _self_test_h12_clamps(expect, root)
+        _self_test_tools(expect, root)
+        _self_test_row_coverage(expect, root)
+        _self_test_unreadable_snapshots(expect, root)
         quiet, code = io.StringIO(), None
         try:
             with contextlib.redirect_stdout(quiet):
@@ -2268,6 +2921,575 @@ def _self_test_h12_clamps(expect, root):
                'else (red: %s)' % (what, value, ','.join(keys), ','.join(red) or 'none'))
 
 
+#
+# E.8: the injected defects of the tool scenarios. Each entry of TOOL_INJECTIONS is (description,
+# mutation, expected rows): the mutation makes ONE defect in a copy of one green fixture scenario
+# (hil_fixture.build_tools), and the expected rows are exactly the rows it must turn -- FAIL unless
+# another verdict is named -- while every other row of that scenario keeps its verdict. The table
+# is data rather than code so that _self_test_row_coverage can read it: a row of h13..h17 that no
+# entry names is a row nothing has ever seen fail, and the self-test fails on it.
+#
+# Where an entry names more rows than PHASE6_SPEC's tables list, it is because the row definitions
+# themselves make the defect visible in more than one place (phase6_evidence/DEVIATIONS.md, H step
+# 11): the injections are derived from the gates, never the other way round.
+#
+
+
+def _save(path, data):
+    with open(path, 'w') as handle:
+        json.dump(data, handle)
+
+
+def _set_facts(changes):
+    """Mutation: set facts in facts.json; a value of None deletes the fact."""
+    def mutate(path):
+        name = os.path.join(path, 'facts.json')
+        facts = _load(name) or {}
+        for key, value in changes.items():
+            if value is None:
+                facts.pop(key, None)
+            else:
+                facts[key] = value
+        _save(name, facts)
+    return mutate
+
+
+def _edit_json(label, change):
+    """Mutation: `change` edits <label>.json in place."""
+    def mutate(path):
+        name = os.path.join(path, label + '.json')
+        data = _load(name)
+        change(data)
+        _save(name, data)
+    return mutate
+
+
+def _edit_text(filename, change):
+    """Mutation: `change(text, facts)` returns the file's new text."""
+    def mutate(path):
+        name = os.path.join(path, filename)
+        text = change(_text(name), _load(os.path.join(path, 'facts.json')) or {})
+        with open(name, 'w') as handle:
+            handle.write(text)
+    return mutate
+
+
+def _delete(filename):
+    """Mutation: the file is gone."""
+    def mutate(path):
+        os.remove(os.path.join(path, filename))
+    return mutate
+
+
+def _each(*mutations):
+    """Mutation: several edits that together are ONE defect (a register in two snapshots)."""
+    def mutate(path):
+        for one in mutations:
+            one(path)
+    return mutate
+
+
+def _register(label, servo, reg, value):
+    """Mutation: one register of one servo in a snapshot's RESULT json; `value` may map the old."""
+    def change(data):
+        part = data['ids'][str(servo)]['eeprom' if reg < 40 else 'sram']
+        part[str(reg)] = value(part[str(reg)]) if callable(value) else value
+    return _edit_json(label, change)
+
+
+def _unreadable(label, value=True, flag=True):
+    """
+    Mutation: a snapshot byte hil_eeprom could not read.
+
+    hil_eeprom reports one as 'x' in the value, n one short, and ok false (E.1). `value` and
+    `flag` switch the two halves separately, so the non-vacuity self-test can prove that a row
+    reads BOTH: a gate that trusted ok alone would miss an 'x' written by a bug that forgot the
+    flag, and one that only looked at the values would miss ok false on a byte it never compares.
+    """
+    def change(data):
+        if value:
+            block = data['ids'][min(data['ids'], key=int)]
+            block['eeprom']['13'] = 'x'
+            block['n'] -= 1
+        if flag:
+            data['ok'] = False
+    return _edit_json(label, change)
+
+
+def _snap_file(filename, value=True, flag=True, servo=None, reg=13, to='x'):
+    """Mutation: the same in a .snap file, whose eeprom line holds register r at token r + 3."""
+    def change(text, facts):
+        lines, pending = text.splitlines(), value
+        for k, line in enumerate(lines):
+            tokens = line.split()
+            if flag and tokens == ['ok', 'true']:
+                lines[k] = 'ok false'
+            elif (pending and tokens[:1] == ['servo'] and tokens[2:3] == ['eeprom'] and
+                  servo in (None, int(tokens[1]))):
+                tokens[3 + reg] = to
+                lines[k], pending = ' '.join(tokens), False
+        return '\n'.join(lines) + '\n'
+    return _edit_text(filename, change)
+
+
+def _scan_rows(filenames, change):
+    """Mutation: `change` maps the data rows of scan tables (lists of 11 tokens) to new rows."""
+    def edit(text, facts):
+        lines = text.splitlines()
+        rows = change([line.split() for line in lines[1:-1]])
+        return '\n'.join(lines[:1] + ['%3s  %-4s%6s%7s%10s%9s%10s%11s%8s%8s%8s' % tuple(row)
+                                      for row in rows] + lines[-1:]) + '\n'
+    return _each(*(_edit_text(name, edit) for name in filenames))
+
+
+def _scan_cell(filenames, servo, column, value):
+    """Mutation: one cell of one servo's row, `value` mapping the old token to the new."""
+    def change(rows):
+        return [row[:column] + [value(row[column])] + row[column + 1:] if row[0] == str(servo)
+                else row for row in rows]
+    return _scan_rows(filenames, change)
+
+
+def _drop_samples(first, last):
+    """Change for _edit_json: a recording loses samples [first, last), i.e. a gap."""
+    def change(data):
+        del data['joint_states'][first:last]
+    return change
+
+
+def _red(*keys):
+    return {key: 'FAIL' for key in keys}
+
+
+def _tool_injections():
+    """Build TOOL_INJECTIONS, the E.2-E.7 tables' last column (see the comment above _save)."""
+    scans = ('scan.out.txt', 'scan_default.out.txt')    # a bench fault shows in BOTH scans
+    out = []
+    # The rows every tool scenario carries (E.2): the two port rows, and the journal for H13-H16.
+    for name in TOOL_SCENARIOS:
+        out += [('port_free_before=false', _set_facts({'port_free_before': 'false'}),
+                 _red(name + '.port_free_before')),
+                ('port_free_after=false', _set_facts({'port_free_after': 'false'}),
+                 _red(name + '.port_free_after'))]
+        if name != 'H17':
+            out += [('journal_left=true', _set_facts({'journal_left': 'true'}),
+                     _red(name + '.journal_cleared')),
+                    ('the fact journal_left deleted', _set_facts({'journal_left': None}),
+                     _red(name + '.journal_cleared'))]
+
+    # H13, scan (E.3).
+    out += [
+        ('scan_rc=7', _set_facts({'scan_rc': '7'}), _red('H13.rc')),
+        ("header column 'offset' renamed",
+         _edit_text('scan.out.txt', lambda t, f: t.replace(' offset\n', ' ofs\n', 1)),
+         _red('H13.table')),
+        ('an extra row for 253 in both scans',
+         _scan_rows(scans, lambda rows: rows + [['253'] + rows[-1][1:]]),
+         _red('H13.ids', 'H13.census_agrees')),
+        ('row 4 removed from both scans',
+         _scan_rows(scans, lambda rows: [row for row in rows if row[0] != '4']),
+         _red('H13.ids', 'H13.census_agrees', 'H13.fields.4')),
+        ('census [1,2,3,4,200] in both pre and post',
+         _each(_edit_json('pre_eeprom', lambda d: d.update(census=[1, 2, 3, 4, 200])),
+               _edit_json('post_eeprom', lambda d: d.update(census=[1, 2, 3, 4, 200]))),
+         _red('H13.census_agrees')),
+        ("id 2's offset negated in the table", _scan_cell(('scan.out.txt',), 2, 10,
+                                                          lambda v: str(-int(v))),
+         _red('H13.fields.2')),
+        ('id 3 at mode 0 / type pos in both tables and in both snapshots',
+         _each(_scan_cell(scans, 3, 1, lambda v: 'pos'), _scan_cell(scans, 3, 2, lambda v: '0'),
+               _register('pre_eeprom', 3, 33, 0), _register('post_eeprom', 3, 33, 0)),
+         _red('H13.modes')),
+        ('scan_seconds=0.4', _set_facts({'scan_seconds': '0.4'}), _red('H13.timing')),
+        ('scan_seconds=16', _set_facts({'scan_seconds': '16'}), _red('H13.timing')),
+        ('scan_serial_speed_lines=2', _set_facts({'scan_serial_speed_lines': '2'}),
+         _red('H13.serial_speed')),
+        ("the 'serial speed' line moved to stdout",
+         _each(_edit_text('scan.err.txt', lambda t, f: t.replace('serial speed 1000000\n', '')),
+               _edit_text('scan.out.txt', lambda t, f: 'serial speed 1000000\n' + t)),
+         _red('H13.serial_speed', 'H13.table')),
+        ('scan_default_rc=1', _set_facts({'scan_default_rc': '1'}), _red('H13.default_params')),
+        ('scan_default_skipped set',
+         _set_facts({'scan_default_skipped': 'the port under test is not /dev/ttyACM0'}),
+         {'H13.default_params': 'SKIP'}),
+        ('stale_scan_rc=0', _set_facts({'stale_scan_rc': '0'}), _red('H13.usage.stale')),
+        ('positional_scan_serial_speed_lines=1',
+         _set_facts({'positional_scan_serial_speed_lines': '1'}), _red('H13.usage.positional')),
+        ('post id 1 reg 13 + 1', _register('post_eeprom', 1, 13, lambda v: v + 1),
+         _red('H13.read_only')),
+        ('an x in post', _unreadable('post_eeprom'), _red('H13.read_only')),
+        ('probe verdict refused', _edit_json('released', lambda d: d.update(verdict='refused')),
+         _red('H13.released')),
+        ('scan_holders_after=999', _set_facts({'scan_holders_after': '999'}),
+         _red('H13.released'))]
+    for servo in BENCH_IDS:
+        out.append(('temp_C + 5 in row %d' % servo,
+                    _scan_cell(('scan.out.txt',), servo, 8, lambda v: str(int(v) + 5)),
+                    _red('H13.fields.%d' % servo)))
+
+    # H14, the refusals (E.4).
+    tools = (('scan', 'scan'), ('set_id', 'set_id'), ('calibrate', 'calibrate_midpoint'))
+    out += [
+        ('controllers_active=false', _set_facts({'controllers_active': 'false'}),
+         _red('H14.cm_up')),
+        ('a 0.2 s gap in tools_window', _edit_json('tools_window', _drop_samples(500, 520)),
+         _red('H14.cm_undisturbed')),
+        ('tools_window.json deleted', _delete('tools_window.json'), _red('H14.cm_undisturbed')),
+        ('driver_warns_after + 1', _set_facts({'driver_warns_after': '4'}),
+         _red('H14.cm_undisturbed')),
+        ('fl_scan_rc=127 with serial_speed_lines=none',
+         _set_facts({'fl_scan_rc': '127', 'fl_scan_serial_speed_lines': 'none'}),
+         _red('H14.via_servobus.scan', 'H14.flock_refused.scan')),
+        ('the fact fl_calibrate_serial_speed_lines deleted',
+         _set_facts({'fl_calibrate_serial_speed_lines': None}),
+         _red('H14.via_servobus.calibrate_midpoint')),
+        ('fl_set_id_rc=134', _set_facts({'fl_set_id_rc': '134'}),
+         _red('H14.via_servobus.set_id', 'H14.flock_refused.set_id')),
+        ('fl_scan_holder_alive=false', _set_facts({'fl_scan_holder_alive': 'false'}),
+         {'H14.holder_alive_throughout': 'ABORTED'}),
+        # Without the holder's pid no flock row is evidence either: each asks for "pid <probe_pid>"
+        # in its stderr, and released for no holder but the probe's -- so all eight move.
+        ('probe_pid empty', _set_facts({'probe_pid': ''}),
+         dict(_red('H14.released', *['H14.%s.%s' % (row, tool) for row in (
+             'flock_refused', 'via_servobus') for _, tool in tools]),
+             **{'H14.holder_alive_throughout': 'ABORTED'})),
+        ('bad_type_rc=134', _set_facts({'bad_type_rc': '134'}), _red('H14.usage.bad_type')),
+        ('taken_rc=3', _set_facts({'taken_rc': '3'}), _red('H14.refuse_taken')),
+        ("'id 3 already answers' removed from stderr",
+         _edit_text('taken.err.txt', lambda t, f: t.replace('id 3 already answers', '')),
+         _red('H14.refuse_taken')),
+        ('silent_start_rc=0', _set_facts({'silent_start_rc': '0'}),
+         _red('H14.refuse_silent_start')),
+        ('cal_silent_rc=0', _set_facts({'cal_silent_rc': '0'}),
+         _red('H14.refuse_silent_calibrate')),
+        ('post id 3 reg 33 = 0', _register('post_eeprom', 3, 33, 0),
+         _red('H14.nothing_written')),
+        ('an x in post', _unreadable('post_eeprom'), _red('H14.nothing_written')),
+        ('cm_scan_holders_after=999', _set_facts({'cm_scan_holders_after': '999'}),
+         _red('H14.released'))]
+    for short, tool in tools:
+        out += [
+            ('cm_%s_rc=0' % short, _set_facts({'cm_%s_rc' % short: '0'}),
+             _red('H14.cm_refused.' + tool)),
+            ('fl_%s_serial_speed_lines=1' % short,
+             _set_facts({'fl_%s_serial_speed_lines' % short: '1'}),
+             _red('H14.via_servobus.' + tool)),
+            # via_servobus asks for the holder's pid too, so the pid's absence turns it as well
+            ('the probe pid removed from fl_%s.err.txt' % short,
+             _edit_text('fl_%s.err.txt' % short,
+                        lambda t, f: re.sub(r'\bpid %s ?' % re.escape(f['probe_pid']), '', t)),
+             _red('H14.flock_refused.' + tool, 'H14.via_servobus.' + tool))]
+    for label in ('stale', 'bad_type', 'range', 'cal_range', 'missing', 'positional',
+                  'foreign_node'):
+        out.append(('%s_rc=0' % label, _set_facts({'%s_rc' % label: '0'}),
+                    _red('H14.usage.' + label)))
+
+    # H15, set_id 4 -> 253 -> 4 (E.5).
+    out += [
+        ('move_rc=6', _set_facts({'move_rc': '6'}), _red('H15.move_rc')),
+        ('back_rc=5', _set_facts({'back_rc': '5'}), _red('H15.back_rc')),
+        ('moved census [1,2,3,200,253]',
+         _edit_json('moved_eeprom', lambda d: d.update(census=[1, 2, 3, 200, 253])),
+         _red('H15.moved')),
+        ('the offset of 253 differs from pre[4]',
+         _register('moved_eeprom', TEMP_ID, 31, lambda v: v + 1), _red('H15.only_id_changed')),
+        ('an x in moved', _unreadable('moved_eeprom'), _red('H15.only_id_changed')),
+        ('moved[253].55=0', _register('moved_eeprom', TEMP_ID, 55, 0), _red('H15.lock_closed')),
+        ('back[4].55=0', _register('back_eeprom', 4, 55, 0), _red('H15.lock_closed')),
+        ('row 253 removed from moved_scan.out.txt',
+         _scan_rows(('moved_scan.out.txt',),
+                    lambda rows: [row for row in rows if row[0] != str(TEMP_ID)]),
+         _red('H15.scan_sees_move')),
+        ('back[1] reg 13 + 1', _register('back_eeprom', 1, 13, lambda v: v + 1),
+         _red('H15.restored_by_tool')),
+        ('an eeprom write in the restore RESULT',
+         _edit_json('restore', lambda d: d['writes'].append(
+             {'id': 4, 'reg': 5, 'from': 253, 'to': 4, 'bytes': 1, 'kind': 'eeprom'})),
+         _red('H15.restore_writes')),
+        # review fix F15/F24: a restore that refused (exit 3) prints `writes: []` too, so an empty
+        # list alone says nothing -- the row reads the helper's rc and its RESULT `ok` as well
+        ('restore_rc=3 (the restore refused; its RESULT still has writes [])',
+         _set_facts({'restore_rc': '3'}), _red('H15.restore_writes')),
+        ('the restore RESULT ok false, exit 3, writes []',
+         _edit_json('restore', lambda d: d.update(ok=False, exit=3, writes=[])),
+         _red('H15.restore_writes')),
+        ('post id 4 reg 5 = 253', _register('post_eeprom', 4, 5, 253), _red('H15.restored'))]
+
+    # H16, calibrate_midpoint (E.6). A calibration's register writes persist, so a defect in one
+    # shows in cal AND in wheel, the snapshot taken after it: injected into both, or wheel_refused
+    # (wheel == cal) would turn as well and the injection would not be one defect any more.
+    def persisted(servo, reg, value):
+        return _each(_register('cal_eeprom', servo, reg, value),
+                     _register('wheel_eeprom', servo, reg, value))
+
+    def offset_as_before(path):
+        before = _load(os.path.join(path, 'pre_eeprom.json'))['ids'][str(CALIB_ID)]['eeprom']
+        _each(persisted(CALIB_ID, 31, before['31']), persisted(CALIB_ID, 32, before['32']))(path)
+
+    out += [
+        ('cal_rc=6', _set_facts({'cal_rc': '6'}), _red('H16.rc')),
+        ('cal_pos.value=2060', _edit_json('cal_pos', lambda d: d.update(value=2060)),
+         _red('H16.position_2048')),
+        ('cal_pos.json with ok false', _edit_json('cal_pos', lambda d: d.update(ok=False,
+                                                                                value=None)),
+         _red('H16.position_2048')),
+        ('detail position_before=1500',
+         _edit_text('cal.err.txt', lambda t, f: re.sub(r'position_before=\d+',
+                                                       'position_before=1500', t)),
+         _red('H16.offset_delta')),
+        ('the detail line removed',
+         _edit_text('cal.err.txt', lambda t, f: ''.join(
+             line for line in t.splitlines(True) if ': detail ' not in line)),
+         _red('H16.offset_delta')),
+        ('cal id 1 reg 13 + 1', persisted(1, 13, lambda v: v + 1),
+         _red('H16.only_offset_changed')),
+        ('cal id 2 reg 33 = 1', persisted(CALIB_ID, 33, 1), _red('H16.only_offset_changed')),
+        ('cal offset equal to pre', offset_as_before,
+         _red('H16.only_offset_changed', 'H16.offset_delta')),
+        ('cal[2].55=0', persisted(CALIB_ID, 55, 0), _red('H16.lock_closed')),
+        ('cal[2].40=1', persisted(CALIB_ID, 40, 1), _red('H16.torque_off')),
+        ('wheel_rc=0', _set_facts({'wheel_rc': '0'}), _red('H16.wheel_refused')),
+        ('wheel id 3 reg 33 = 0', _register('wheel_eeprom', WHEEL_ID, 33, 0),
+         _red('H16.wheel_refused')),
+        ('post id 2 reg 31 differs', _register('post_eeprom', CALIB_ID, 31, lambda v: v + 1),
+         _red('H16.restored'))]
+
+    # H17, the bench as found (E.7). final is compared with the initial snapshot AND with the
+    # golden baseline, so a changed final turns both rows; the two sources are injected alone.
+    out += [
+        ('final id 2 reg 31 differs', _register('final_eeprom', 2, 31, lambda v: v + 1),
+         _red('H17.eeprom_as_found', 'H17.matches_baseline')),
+        ('final census + 253', _edit_json('final_eeprom', lambda d: d['census'].append(253)),
+         _red('H17.eeprom_as_found', 'H17.matches_baseline')),
+        ('an x in initial', _snap_file('initial_eeprom.snap'), _red('H17.eeprom_as_found')),
+        ('journal_present=true', _set_facts({'journal_present': 'true'}),
+         _red('H17.journal_clear')),
+        ('baseline id 3 reg 33 = 0', _snap_file('baseline.snap', flag=False, servo=3, reg=33,
+                                                to='0'), _red('H17.matches_baseline')),
+        ('no baseline given (the file absent, baseline_source empty)',
+         _each(_delete('baseline.snap'), _set_facts({'baseline_source': ''})),
+         {'H17.matches_baseline': 'SKIP'}),
+        ('a baseline given whose copy is missing', _delete('baseline.snap'),
+         _red('H17.matches_baseline'))]
+    return tuple(out)
+
+
+TOOL_INJECTIONS = _tool_injections()
+
+# The rows that read a snapshot, and the snapshots each reads (_self_test_unreadable_snapshots).
+SNAPSHOT_ROWS = (
+    ('H13.read_only', ('pre_eeprom', 'post_eeprom')),
+    ('H13.census_agrees', ('pre_eeprom',)),
+    ('H13.fields.1', ('pre_eeprom',)), ('H13.fields.2', ('pre_eeprom',)),
+    ('H13.fields.3', ('pre_eeprom',)), ('H13.fields.4', ('pre_eeprom',)),
+    ('H14.nothing_written', ('pre_eeprom', 'post_eeprom')),
+    ('H15.only_id_changed', ('pre_eeprom', 'moved_eeprom')),
+    ('H15.restored_by_tool', ('pre_eeprom', 'back_eeprom')),
+    ('H15.restored', ('pre_eeprom', 'post_eeprom')),
+    ('H16.only_offset_changed', ('pre_eeprom', 'cal_eeprom')),
+    ('H16.wheel_refused', ('cal_eeprom', 'wheel_eeprom')),
+    ('H16.restored', ('pre_eeprom', 'post_eeprom')),
+    ('H17.eeprom_as_found', ('initial_eeprom.snap', 'final_eeprom')),
+    ('H17.matches_baseline', ('baseline.snap', 'final_eeprom')))
+
+
+def _verdicts(root, directory, name):
+    """Run checker `name` over root/directory and return {row key: verdict}."""
+    report = Report(())
+    report.prefix = name
+    dict(CHECKERS)[name](report, Scenario(root, directory), {})
+    return {row['key']: row['verdict'] for row in report.rows}
+
+
+def _injected(root, name, tag, mutate):
+    """Copy root/name to a sibling whose name leads with '_', apply `mutate`, return verdicts."""
+    import shutil
+
+    copy = '_%s_%s' % (tag, name)
+    shutil.rmtree(os.path.join(root, copy), ignore_errors=True)
+    shutil.copytree(os.path.join(root, name), os.path.join(root, copy))
+    mutate(os.path.join(root, copy))
+    return _verdicts(root, copy, name)
+
+
+def _self_test_tools(expect, root):
+    """
+    Prove every row of h13..h17 by differential injection (E.8), the H12 pattern for all of them.
+
+    The baseline is asserted first: every row of the green fixture is PASS or NOTE, and there are
+    rows at all -- a checker that emits nothing would otherwise make every injection below look
+    like a row that did not move, which is not the same thing as a row that cannot. Then each
+    entry of TOOL_INJECTIONS runs over its own copy, and the rows that changed verdict must be
+    exactly the entry's rows, with exactly the entry's verdicts.
+    """
+    base = {}
+    for name in TOOL_SCENARIOS:
+        try:
+            base[name] = _verdicts(root, name, name)
+        except Exception as exc:                                        # noqa: BLE001
+            base[name] = {}
+            expect(False, '%s runs over the green fixture (raised %s: %s)'
+                   % (name, type(exc).__name__, exc))
+            continue
+        unhappy = sorted(key for key, verdict in base[name].items()
+                         if verdict not in ('PASS', 'NOTE'))
+        expect(bool(base[name]) and not unhappy,
+               'the green %s fixture emits rows and every one is PASS or NOTE (%d rows; not: %s)'
+               % (name, len(base[name]), ','.join(unhappy) or 'none'))
+    for number, (what, mutate, rows) in enumerate(TOOL_INJECTIONS):
+        name = next(iter(rows)).split('.')[0]
+        try:
+            got = _injected(root, name, 'inj%03d' % number, mutate)
+        except Exception as exc:                                        # noqa: BLE001
+            expect(False, '%s: %s (raised %s: %s)' % (name, what, type(exc).__name__, exc))
+            continue
+        changed = {key: got.get(key, 'MISSING') for key in set(base[name]) | set(got)
+                   if got.get(key) != base[name].get(key)}
+        expect(changed == rows, '%s: %s turns exactly %s (changed: %s)' % (
+            name, what, kv(**rows), kv(**changed) or 'nothing'))
+
+
+def _self_test_row_coverage(expect, root):
+    """Every non-NOTE row of h13..h17 over the green fixture is in some injection's rows (E.8)."""
+    emitted = set()
+    for name in TOOL_SCENARIOS:
+        try:
+            emitted |= {key for key, verdict in _verdicts(root, name, name).items()
+                        if verdict != 'NOTE'}
+        except Exception:                                               # noqa: BLE001
+            pass                                        # _self_test_tools has already said so
+    injected = set()
+    for _, _, rows in TOOL_INJECTIONS:
+        injected |= set(rows)
+    expect(bool(emitted) and emitted == injected,
+           'every non-NOTE row of h13..h17 has an injected defect, and every injection a row '
+           '(no injection: %s; no such row: %s)' % (
+               ','.join(sorted(emitted - injected)) or 'none',
+               ','.join(sorted(injected - emitted)) or 'none'))
+
+
+def _self_test_unreadable_snapshots(expect, root):
+    """
+    Prove an 'x' or ok false in any snapshot a row reads turns that row red (E.8, non-vacuity).
+
+    A snapshot hil_eeprom could not read completely is not evidence that nothing changed: a
+    comparison that skipped the byte it could not read, or that read the missing value as equal,
+    would pass a bench it never saw. Each half of an unreadable byte is injected on its own (see
+    _unreadable), into each snapshot each row reads.
+    """
+    for key, labels in SNAPSHOT_ROWS:
+        name, row = key.split('.', 1)
+        for label in labels:
+            for kind, value, flag in (('an x', True, False), ('ok false', False, True)):
+                if label.endswith('.snap'):
+                    mutate = _snap_file(label, value=value, flag=flag)
+                else:
+                    mutate = _unreadable(label, value=value, flag=flag)
+                try:
+                    got = _injected(root, name, 'unreadable', mutate).get(key)
+                except Exception as exc:                                # noqa: BLE001
+                    got = 'raised %s: %s' % (type(exc).__name__, exc)
+                expect(got == 'FAIL', '%s in %s turns %s red (got %s)' % (kind, label, key, got))
+
+
+def _self_test_unchecked_rows(expect):
+    """Prove a stray scenario directory no checker claims gives FAIL unchecked_scenarios (E.8)."""
+    import shutil
+    import tempfile
+
+    root = tempfile.mkdtemp(prefix='hil_gates_unchecked_')
+    try:
+        for name, _ in CHECKERS:
+            os.makedirs(os.path.join(root, name))
+        os.makedirs(os.path.join(root, '_scratch'))
+        os.makedirs(os.path.join(root, 'roslog'))
+        clean = Report(())
+        unchecked_rows(clean, root)
+        expect(not clean.rows, 'every CHECKERS directory, roslog and a _ directory are claimed '
+               '(rows: %s)' % [row['key'] for row in clean.rows])
+        os.makedirs(os.path.join(root, 'H99'))
+        stray = Report(())
+        unchecked_rows(stray, root)
+        found = [row for row in stray.rows if row['key'] == 'unchecked_scenarios']
+        expect(len(found) == 1 and found[0]['verdict'] == 'FAIL' and 'H99' in found[0]['detail'],
+               'a stray H99 directory gives FAIL unchecked_scenarios naming it (rows: %s)'
+               % [(row['key'], row['verdict']) for row in stray.rows])
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def _self_test_expected(expect):
+    """Prove an expected scenario with no directory and no abort is FAIL did_not_run (E.8)."""
+    import shutil
+    import tempfile
+
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import hil_fixture
+
+    root = tempfile.mkdtemp(prefix='hil_gates_expected_')
+
+    def rows(expected, aborted=''):
+        with open(os.path.join(root, 'aborted.txt'), 'w') as handle:
+            handle.write(aborted)
+        with contextlib.redirect_stdout(io.StringIO()):
+            run(root, (), '0s', True, expected=expected)
+        return {row['key']: row['verdict']
+                for row in (_load(os.path.join(root, 'hil_check.json')) or {}).get('rows', [])}
+
+    try:
+        hil_fixture.build(root)
+        shutil.rmtree(os.path.join(root, 'H13'))
+        got = rows('H13')
+        expect(got.get('H13.did_not_run') == 'FAIL',
+               'run(expected="H13") with no H13 directory gives FAIL H13.did_not_run '
+               '(H13 rows: %s)'
+               % {k: v for k, v in got.items() if k.startswith('H13')})
+        got = rows('H13', 'H13\tport held\n')
+        expect(got.get('H13') == 'ABORTED' and 'H13.did_not_run' not in got,
+               'an aborted H13 is ABORTED, not did_not_run (H13 rows: %s)'
+               % {k: v for k, v in got.items() if k.startswith('H13')})
+        got = rows('H14')
+        expect(got.get('H13') == 'SKIP' and 'H13.did_not_run' not in got,
+               'an H13 nobody asked for stays a SKIP (H13 rows: %s)'
+               % {k: v for k, v in got.items() if k.startswith('H13')})
+        got = rows('H13 H99')
+        expect(got.get('H99.did_not_run') == 'FAIL',
+               'an expected name no checker knows, with no directory, is did_not_run too '
+               '(H99 rows: %s)' % {k: v for k, v in got.items() if k.startswith('H99')})
+        got = rows('H13 H99', 'H99\tno h_H99 function\n')
+        expect(got.get('H99') == 'ABORTED',
+               'and an abort of a name no checker knows (a missing h_ function) is reported '
+               '(H99 rows: %s)' % {k: v for k, v in got.items() if k.startswith('H99')})
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def _self_test_scenario_membership(expect):
+    """
+    Prove the default SCENARIOS of hil_check.sh and CHECKERS name the same set (E.8).
+
+    run() walks CHECKERS and the shell walks SCENARIOS, and nothing else keeps the two in step: a
+    scenario that runs and no checker claims is caught at run time by unchecked_rows, but a
+    checker whose scenario the default list forgot is only a SKIP -- this is where it fails
+    instead. The ORDER is checked too, for the one property that depends on it (R14): the tool
+    scenarios, the two EEPROM writers among them, run before the soak, and H17 runs last.
+    """
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'hil_check.sh')
+    found = re.findall(r'^SCENARIOS=\$\{WAVESHARE_HIL_SCENARIOS:-"([^"]*)"\}$', _text(script),
+                       re.MULTILINE)
+    expect(len(found) == 1, 'hil_check.sh has one default SCENARIOS list (found %d)' % len(found))
+    names = found[0].split() if found else []
+    known = [name for name, _ in CHECKERS]
+    expect(sorted(names) == sorted(known),
+           'the default SCENARIOS and CHECKERS are the same set (only in SCENARIOS: %s; only in '
+           'CHECKERS: %s)' % (','.join(sorted(set(names) - set(known))) or 'none',
+                              ','.join(sorted(set(known) - set(names))) or 'none'))
+    order = {name: k for k, name in enumerate(names)}
+    expect('H11' in order and names[-1:] == ['H17'] and
+           all(order.get(name, len(names)) < order['H11'] for name in TOOL_SCENARIOS[:-1]),
+           'H13-H16 run before the soak H11 and H17 runs last (R14): %s' % ' '.join(names))
+
+
 def main(argv):
     """Run the self-test, or check one run directory and write its report."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[1])
@@ -2277,13 +3499,16 @@ def main(argv):
                         help='the frozen key list, passed in by hil_check.sh')
     parser.add_argument('--seconds', default='0s')
     parser.add_argument('--port-free', default='false')
+    parser.add_argument('--expected', default=None,
+                        help='the scenario list hil_check.sh ran; a name in it that left no '
+                             'directory and no abort is FAIL <name>.did_not_run')
     args = parser.parse_args(argv)
     if args.self_test:
         return _self_test()
     if not args.run_dir:
         parser.error('one of --self-test and --run-dir is required')
     return run(args.run_dir, args.allow_inconclusive.split(), args.seconds,
-               args.port_free == 'true')
+               args.port_free == 'true', args.expected)
 
 
 if __name__ == '__main__':

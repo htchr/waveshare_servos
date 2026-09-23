@@ -209,6 +209,43 @@ std::size_t parse_sync_read_burst(
   const uint8_t * buffer, std::size_t length, const std::vector<uint8_t> & ids,
   std::vector<FeedbackBlock> * out, SyncReadStats * stats);
 
+// What one checked transaction (ServoBus::checked_ping/checked_read/checked_write) saw on the wire.
+// The vendored calls collapse all of this into one int: SCS::Read checks neither the responder
+// id nor the length byte (src/SCS.cpp:173-203), SCS::Ack rejects an ack from any id but the
+// addressed one (src/SCS.cpp:279), and none of them notices a second reply behind the first --
+// which is what two servos on one id look like (PHASE6_SPEC B.4, R5, R10).
+enum class ReplyKind : uint8_t
+{
+  NOT_OPEN,       // closed bus; nothing sent
+  INVALID_ID,     // id 0xfe or 0xff; nothing sent
+  INVALID_COUNT,  // a count outside 1..checked_max_bytes, or no data to write; nothing sent
+  SILENT,         // 0 bytes in the reply window
+  ONE,            // exactly one well-formed frame from the addressed id, nothing after it
+  EXTRA,          // one well-formed frame, then more bytes within the drain window (a doubled twin)
+  WRONG_ID,       // a well-formed frame of the expected length from another id (ping/read only)
+  STATUS_ONLY,    // read only: the first well-formed frame is a bare 6-byte status frame (length
+                  //   byte 2, no payload) where a READ reply was expected -- typically a late ack
+  GARBLED         // bytes arrived but no well-formed frame (collision, noise, bad length or
+                  //   checksum)
+};
+
+// A short snake_case name for a kind, for a message or a key=value detail line: no spaces, so a
+// detail line stays one token per field.
+const char * to_string(ReplyKind kind);
+
+struct Reply
+{
+  ReplyKind kind = ReplyKind::NOT_OPEN;
+  int from_id = -1;             // id byte of the well-formed frame, if any
+  uint8_t status = 0;           // its error byte
+  std::vector<uint8_t> data;    // READ payload (count bytes) when kind == ONE or EXTRA
+  std::size_t frame_bytes = 0;  // length of that frame (6 for a ping reply or a bare status frame)
+  std::size_t bytes = 0;        // bytes received in the reply window
+  std::size_t extra_bytes = 0;  // bytes drained after the frame
+  uint32_t elapsed_us = 0;      // request written -> frame complete (or window end)
+  explicit operator bool() const noexcept {return kind == ReplyKind::ONE;}
+};
+
 class ServoBus : public SMS_STS
 {
 public:
@@ -394,8 +431,60 @@ public:
   // README's "how often a transaction fails" number means (PHASE3 2.18).
   const SyncReadStats & sync_read_stats() const noexcept {return sync_read_stats_;}
 
+  // The Phase 6 tools' transactions (PHASE6_SPEC B.4), built from the protected vendored helpers
+  // and never used by the driver. Each one: refuse a closed bus, an unaddressable id or a count
+  // outside 1..checked_max_bytes without sending; rFlushSCS(), the request, wFlushSCS(); ONE
+  // readSCS of exactly the expected reply under its window; gate the header, the length byte,
+  // the checksum and the id; and, only if a byte arrived, drain what follows so a second reply is
+  // counted instead of left for the next transaction. A silent id therefore costs exactly one
+  // window, which is what keeps a 254-id scan near 3.8 s.
+  static constexpr std::size_t checked_max_bytes = 64;
+  static constexpr uint32_t checked_drain_ms = 2;
+  Reply checked_ping(uint8_t id);
+  Reply checked_read(uint8_t id, uint8_t first, uint8_t count);
+  // A frame from ANY id is accepted as the ack and its id returned in from_id -- an id write may be
+  // acked from the new id, which SCS::Ack would call a failure (src/SCS.cpp:279). Callers never
+  // treat an ack as proof; they verify by reading back. The window is ack_timeout_ms rather than
+  // io_timeout_ms (an EEPROM commit takes longer), and it must stay below 1000 ms: readSCS puts
+  // the whole of it into a timeval's tv_usec (src/SCSerial.cpp:147).
+  Reply checked_write(
+    uint8_t id, uint8_t first, const uint8_t * data, uint8_t count, uint32_t ack_timeout_ms);
+
+  // RESET, "reset control table to factory value" (context/motor_reset_command_email.png, the
+  // protocol manual's 1.3.7), which include/INST.h does not define. What it does on the ST3025 is
+  // measured, not documented (factory_reset_evidence/FACTORY_RESET_SPEC.md 1): EEPROM 6..39 back
+  // to the factory table with the id KEPT, the baud register to 0 (1 Mbaud), torque off, goal 0
+  // and the lock closed; the ack comes from the addressed id at the OLD rate, 25 ms later when the
+  // flash was rewritten.
+  static constexpr uint8_t inst_reset = 0x06;
+  // The checked transaction of a RESET, for factory_reset only: no parameters, so the frame is
+  // FF FF id 02 06 ~sum; an ack from any other id is WRONG_ID. The window is ack_timeout_ms for
+  // checked_write's reason, and must stay below 1000 ms for it too.
+  Reply checked_reset(uint8_t id, uint32_t ack_timeout_ms);
+
+  // Re-time the line of an open bus to another supported rate on the descriptor it already holds,
+  // so the lock and TIOCEXCL are never let go: a close() and open() would leave a moment in which
+  // another process could take the port. For factory_reset, which moves a servo to 1 Mbaud. Input
+  // already received is discarded (at the old rate it is noise). False with nothing changed on a
+  // closed bus or an unsupported rate; false with the line in an unknown state if the kernel
+  // refuses the settings. The vendored SCSerial::setBaudRate cannot do this: it maps no 1000000,
+  // leaving its speed_t uninitialised, and never calls tcsetattr (src/SCSerial.cpp:94-125).
+  bool set_baudrate(int baudrate) noexcept;
+
 private:
   void drop_lock() noexcept;
+
+  // The one body behind the four checked calls: the refusals, the request, one readSCS of
+  // payload_bytes + 6 under window_ms, the drain, and the frame gate. `params` is what writeBuf
+  // sends after the address (nullptr for a ping and a RESET, the length for a READ, the bytes for
+  // a WRITE).
+  Reply checked_transaction(
+    uint8_t id, uint8_t instruction, uint8_t first, uint8_t * params, uint8_t param_bytes,
+    uint8_t payload_bytes, uint32_t window_ms, bool count_ok);
+
+  // drain_input()'s body, uncounted: the checked calls drain after every reply, and counting
+  // those in SyncReadStats::drains would let one scan swamp the control loop's error count.
+  std::size_t discard_input(uint32_t max_ms) noexcept;
 
   // The one body behind write_goal_positions() and write_goal_speeds(). The two differ only in
   // the record they build, the base register and the chunk limit; the refusal ORDER (1.16-1.18),

@@ -28,13 +28,28 @@
 // counter lives behind `mutex_`, and the setters take it, so a test may call them between two
 // driver calls without a race. Never hold a `FakeServo &` from servo() across a driver call --
 // use snapshot().
+//
+// What the Phase 6 tools need on top of that (PHASE6_SPEC D.1): a log of every request frame and
+// a raw byte count (the proof of "sent nothing"), an EEPROM shadow with the three lock policies
+// and a power cycle, an id write that moves the servo, the offset model behind a 128 write to
+// register 40, and the failure knobs of a bus with two servos on one id, a slow EEPROM commit, a
+// firmware that does not ack. Every knob defaults to off, and every side effect fires only on a
+// write the driver never makes (register 5, 128 to register 40, 31-32 with the offset model on),
+// so the Phase 2-5 suites see exactly the fake they were written against.
+//
+// What factory_reset needs on top of that (factory_reset_evidence/FACTORY_RESET_SPEC.md, section
+// 1 is the bench measurement it models): the RESET instruction, a per-servo factory table, and a
+// baud model in which a servo hears only the line rate its register 6 names. The driver never
+// sends a RESET and the baud model is off by default, so every earlier suite is untouched again.
 
 #ifndef FAKE_SERVO_BUS_HPP_
 #define FAKE_SERVO_BUS_HPP_
 
 #include <errno.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <pty.h>
+#include <termios.h>
 #include <unistd.h>
 
 #include <array>
@@ -45,6 +60,7 @@
 #include <deque>
 #include <map>
 #include <mutex>
+#include <ostream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -61,6 +77,8 @@ constexpr uint8_t kInstRead = 0x02;
 constexpr uint8_t kInstWrite = 0x03;
 constexpr uint8_t kInstSyncWrite = 0x83;
 constexpr uint8_t kInstSyncRead = 0x82;   // include/INST.h:23 (PHASE3 4.H1)
+// Not in include/INST.h: context/motor_reset_command_email.png and the protocol manual's 1.3.7.
+constexpr uint8_t kInstReset = 0x06;
 constexpr uint8_t kBroadcastId = 0xfe;
 
 // The registers the harness and its tests name (include/SMS_STS.h).
@@ -78,6 +96,52 @@ constexpr uint8_t kRegMoving = 66;
 constexpr uint8_t kRegPresentCurrent = 69;
 // SMS_STS::FeedBack() reads registers 56..70 in one transaction (src/SMS_STS.cpp:123).
 constexpr uint8_t kFeedbackLength = 15;
+
+// The registers the Phase 6 tools name (PHASE6_SPEC D.1; context/sts3215_memory_table.xlsx).
+constexpr uint8_t kRegModelL = 3;          // "main and sub version": a little-endian word at 3-4
+constexpr uint8_t kRegId = 5;
+constexpr uint8_t kRegBaud = 6;
+constexpr uint8_t kRegResponseLevel = 8;   // 0 = answer nothing but READ and PING
+constexpr uint8_t kRegOffset = 31;         // a word at 31-32, sign-magnitude on bit 11
+constexpr uint8_t kRegLock = 55;           // the EEPROM write lock; SRAM, 0 = writes persist
+constexpr uint8_t kEepromLast = 39;        // EEPROM is 0..39, SRAM starts at 40
+// Register 40 = 128: "current position correction is 2048" (SMS_STS::CalibrationOfs).
+constexpr uint8_t kCalibrateMidpoint = 128;
+
+// What a WRITE to EEPROM (0..39) does while register 55 reads 1. The memory table says the write
+// is applied and lost at power-off (row 50), which is `volatile_when_locked` and the policy the
+// tool tests run under; `drop_when_locked` is a firmware that refuses it outright. The default,
+// `apply_always`, is the fake every earlier suite was written against: it ignores the lock.
+enum class EepromPolicy
+{
+  apply_always,
+  drop_when_locked,
+  volatile_when_locked
+};
+
+// Which id acks a write that covers register 5. A servo may answer from the id it was addressed
+// by, from the id it has just taken, or not at all; SCS::Ack calls the second a failure
+// (src/SCS.cpp:279), which is why the tools never trust an ack.
+enum class IdWriteAck
+{
+  old_id,
+  new_id,
+  none
+};
+
+// Two servos on one id, as far as the wire can show it. `doubled` is two replies in bit
+// synchrony, back to back; `garbled` is the collision that corrupts every reply; `garbled_reads`
+// is twins at different positions, whose pings agree and whose READ replies do not;
+// `doubled_reads` is twins whose pings happen to collide into one clean reply while a READ reply
+// comes back twice. set_twin() can limit any of them to the next n replies it acts on.
+enum class TwinReply
+{
+  none,
+  doubled,
+  garbled,
+  garbled_reads,
+  doubled_reads
+};
 
 // One servo: a 256-byte register file, the two failure flags of bus.hpp:46-47, the status byte
 // every reply carries, and the transaction counters PHASE2_SPEC 10.4 asserts against.
@@ -125,7 +189,76 @@ struct FakeServo
   uint8_t reply_id_override = 0;  // 0 = none; otherwise the id this servo's frame claims
   int reply_length_delta = 0;     // added to the length byte, checksum repaired, same wire length
   int reply_delay_polls = 0;      // held back this many 1 ms poll windows
+
+  // Phase 6 (PHASE6_SPEC D.1). What survives a power cycle: mem[0..39] as it was last committed
+  // under the EEPROM policy. add_servo() and the test-side setters keep it in step with mem.
+  std::array<uint8_t, kEepromLast + 1> eeprom{};
+  int calibrations = 0;           // 128 writes to register 40 the offset model acted on
+
+  // The Phase 6 knobs, per servo and kept HERE rather than beside the bus-level ones, so that an
+  // id write carries them to the new key together with the registers and the counters.
+  IdWriteAck id_write_ack = IdWriteAck::old_id;
+  bool offset_model = false;
+  int physical = 0;               // the offset model's shaft angle, ticks; present derives from it
+  uint8_t register40_after = 0;   // what register 40 reads after a 128 the model acted on
+  TwinReply twin = TwinReply::none;
+  int twin_replies = -1;          // replies the twin still acts on; -1 = every one
+  int silent_read_address = -1;   // a READ starting here gets no reply; -1 = none
+  int silent_reads = -1;          // READs there still to go unanswered; -1 = every one
+  bool garble_write_acks = false;  // a write's ack goes out with a broken checksum
+  bool write_acks = true;         // false = register 8 is 0: writes apply and are never acked
+  std::array<bool, 256> ignore_write{};   // acked, and that byte is not applied
+  bool vanish_after_id_write = false;
+  unsigned eeprom_commit_ms = 0;
+  // Until then the servo is committing EEPROM: every request to it is ignored (D.1 #13).
+  std::chrono::steady_clock::time_point busy_until{};
+  // The outbox ticket of the ack that waits for that commit, while it may still be queued; 0 =
+  // none. A request that finds the commit over and the ack still queued gets the ack (answer()).
+  uint64_t commit_ack = 0;
+  int pings_to_drop = 0;          // the next this-many pings are ignored
+
+  // factory_reset (FACTORY_RESET_SPEC 1, 2). What a RESET puts back into registers 6..39: the id
+  // (5) is kept, as measured, and 0..4 are the read-only version bytes, so the table's entries
+  // for 0..5 are never used. All zeros unless a test sets them.
+  std::array<uint8_t, kEepromLast + 1> factory{};
+  bool reset_supported = true;    // false: a RESET is ignored and never acked
+  std::array<bool, kEepromLast + 1> reset_skips{};   // registers a RESET leaves as they are
+  bool reset_keeps_sram = false;  // true: a RESET leaves torque, goal and lock as they were
+  int resets = 0;                 // RESET requests that reached this servo
 };
+
+// One request frame as the responder parsed it, whatever it was addressed to: a present servo,
+// an absent or unknown id, or the broadcast id. `params` is everything between the instruction
+// and the checksum, so a READ's is {address, length} and a WRITE's {address, bytes...}.
+struct FrameRecord
+{
+  uint8_t id = 0;
+  uint8_t instruction = 0;
+  std::vector<uint8_t> params;
+};
+
+// One addressed (non-broadcast) INST_WRITE, in the order the frames arrived.
+struct WriteRecord
+{
+  uint8_t id = 0;
+  uint8_t address = 0;
+  std::vector<uint8_t> bytes;
+};
+
+inline bool operator==(const WriteRecord & a, const WriteRecord & b)
+{
+  return a.id == b.id && a.address == b.address && a.bytes == b.bytes;
+}
+
+// So a failed comparison of two write lists prints "(4,5,{253})" and not a byte dump.
+inline std::ostream & operator<<(std::ostream & out, const WriteRecord & write)
+{
+  out << "(" << static_cast<int>(write.id) << "," << static_cast<int>(write.address) << ",{";
+  for (std::size_t i = 0; i < write.bytes.size(); i++) {
+    out << (i == 0 ? "" : ",") << static_cast<int>(write.bytes[i]);
+  }
+  return out << "})";
+}
 
 // Sign-magnitude, the encoding SMS_STS uses for position, speed and current on bit 15 and for
 // load on bit 10 (src/SMS_STS.cpp:146-147,168-169,188-189,254-255).
@@ -169,6 +302,11 @@ public:
       throw std::runtime_error(std::string("ttyname failed: ") + std::strerror(errno));
     }
     port_ = name;
+    // Close-on-exec on both ends (PHASE6_SPEC D.1 #3): the CLI tests spawn the real tools on this
+    // bus, and a child that inherited either descriptor would keep the pty open behind the test.
+    if (::fcntl(master_, F_SETFD, FD_CLOEXEC) == -1 || ::fcntl(slave_, F_SETFD, FD_CLOEXEC) == -1) {
+      throw std::runtime_error(std::string("fcntl(FD_CLOEXEC) failed: ") + std::strerror(errno));
+    }
     // The slave descriptor stays open for the whole life of the bus. Closing it makes the master's
     // poll() report POLLHUP -- which is reported regardless of the events mask -- for every
     // interval in which no slave is open, so the poll timeout would never apply and the responder
@@ -203,7 +341,10 @@ public:
   {
     const std::lock_guard<std::mutex> lock(mutex_);
     FakeServo servo;
-    servo.mem[kRegMode] = mode;
+    seed(&servo, kRegMode, mode);
+    // A servo's register 5 IS its id; the tools read it back and refuse a servo whose register
+    // disagrees with the id it answered at (PHASE6_SPEC D.1 #2).
+    seed(&servo, kRegId, id);
     servos_[id] = servo;
   }
 
@@ -218,10 +359,15 @@ public:
     return servos_.at(id);
   }
 
+  // A test-side seed is the state the servo was delivered in, so an EEPROM register is committed
+  // with it, and with the offset model on it is the PRESENT position the seed keeps: the model's
+  // shaft angle follows (resync_physical), never the other way round.
   void set_byte(uint8_t id, uint8_t reg, uint8_t value)
   {
     const std::lock_guard<std::mutex> lock(mutex_);
-    servos_.at(id).mem[reg] = value;
+    FakeServo & s = servos_.at(id);
+    seed(&s, reg, value);
+    resync_physical(&s);
   }
 
   // little endian, sign-magnitude on `bit`
@@ -230,8 +376,9 @@ public:
     const uint16_t raw = sign_magnitude_encode(value, bit);
     const std::lock_guard<std::mutex> lock(mutex_);
     FakeServo & s = servos_.at(id);
-    s.mem[reg] = static_cast<uint8_t>(raw & 0xff);
-    s.mem[static_cast<uint8_t>(reg + 1)] = static_cast<uint8_t>(raw >> 8);
+    seed(&s, reg, static_cast<uint8_t>(raw & 0xff));
+    seed(&s, static_cast<uint8_t>(reg + 1), static_cast<uint8_t>(raw >> 8));
+    resync_physical(&s);
   }
 
   // ReadLoad decodes its sign from bit 10, not bit 15 (src/SMS_STS.cpp:188-189).
@@ -405,6 +552,276 @@ public:
     }
   }
 
+  // ---- Phase 6 (PHASE6_SPEC D.1) ----
+
+  // For the close-on-exec self-test only; nothing else may touch the pty behind the responder.
+  int master_fd() const {return master_;}
+  int slave_fd() const {return slave_;}
+
+  // Every request frame answer() was handed since construction or the last clear_frames(), in
+  // arrival order, whatever it was addressed to. A copy under the mutex.
+  std::vector<FrameRecord> frames() const
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    return frames_;
+  }
+
+  // Starts a new observation window: the frame log AND the raw byte count, so "sent nothing
+  // after this point" is one clear_frames() and one bytes_received() == 0.
+  void clear_frames()
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    frames_.clear();
+    bytes_received_.store(0);
+  }
+
+  std::size_t frames_received() const
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    return frames_.size();
+  }
+
+  // INST_PING frames per id, absent and unknown ids included: the coverage gate of a scan.
+  std::map<uint8_t, int> ping_counts() const
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    std::map<uint8_t, int> counts;
+    for (const FrameRecord & frame : frames_) {
+      if (frame.instruction == kInstPing) {
+        counts[frame.id]++;
+      }
+    }
+    return counts;
+  }
+
+  // Every addressed INST_WRITE in order, answered or not: compared as a WHOLE list, this is what
+  // makes "wrote nothing else" provable.
+  std::vector<WriteRecord> writes() const
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<WriteRecord> list;
+    for (const FrameRecord & frame : frames_) {
+      if (frame.instruction == kInstWrite && frame.id != kBroadcastId && !frame.params.empty()) {
+        list.push_back(
+          WriteRecord{frame.id, frame.params[0],
+            std::vector<uint8_t>(frame.params.begin() + 1, frame.params.end())});
+      }
+    }
+    return list;
+  }
+
+  // Every raw byte read off the master, counted before consume() can drop garbage or a
+  // bad-checksum frame: "sent nothing" is this being 0, never an empty frame log (D.1 #4).
+  uint64_t bytes_received() const {return bytes_received_.load();}
+
+  // id writes that would have put two servos on one key and were refused
+  uint64_t id_collisions() const
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    return id_collisions_;
+  }
+
+  void set_id_write_ack(uint8_t id, IdWriteAck ack)
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    servos_.at(id).id_write_ack = ack;
+  }
+
+  void set_eeprom_policy(EepromPolicy policy)
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    eeprom_policy_ = policy;
+  }
+
+  // what register 55 reads after power_cycle()
+  void set_power_up_lock(uint8_t value)
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    power_up_lock_ = value;
+  }
+
+  // Every servo: EEPROM back from the shadow, torque off, the lock at its power-up value, any
+  // commit abandoned, and the map re-keyed by register 5 -- so an id write that was never
+  // committed moves the servo back.
+  void power_cycle()
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<uint8_t> keys;
+    for (auto & entry : servos_) {
+      FakeServo & s = entry.second;
+      for (std::size_t reg = 0; reg <= kEepromLast; reg++) {
+        s.mem[reg] = s.eeprom[reg];
+      }
+      s.mem[kRegTorqueEnable] = 0;
+      s.mem[kRegLock] = power_up_lock_;
+      s.busy_until = {};
+      s.commit_ack = 0;
+      present_from_physical(&s);
+      keys.push_back(entry.first);
+    }
+    for (const uint8_t key : keys) {
+      rekey(key, servos_.at(key).mem[kRegId]);
+    }
+  }
+
+  // Off: register 40 = 128 is stored like any byte ("calibration unsupported"). On: the servo
+  // keeps a shaft angle, present = wrap4096(physical - offset), and 128 re-centres it (D.1 #7).
+  void set_offset_model(uint8_t id, bool on)
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    FakeServo & s = servos_.at(id);
+    s.offset_model = on;
+    resync_physical(&s);
+  }
+
+  void set_register40_after(uint8_t id, uint8_t value)
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    servos_.at(id).register40_after = value;
+  }
+
+  // `replies` > 0: the twin acts on the next that-many replies it would change (a ping is not one
+  // for the *_reads kinds) and is gone after them -- the twin heard once among clean replies.
+  void set_twin(uint8_t id, TwinReply twin, int replies = -1)
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    FakeServo & s = servos_.at(id);
+    s.twin = twin;
+    s.twin_replies = replies;
+  }
+
+  // `count` > 0: only the next that-many READs starting at `address` go unanswered.
+  void set_silent_read(uint8_t id, int address, int count = -1)
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    FakeServo & s = servos_.at(id);
+    s.silent_read_address = address;
+    s.silent_reads = count;
+  }
+
+  // A collision on the ack alone: the write applies, its ack arrives with a broken checksum.
+  void set_garble_write_acks(uint8_t id, bool garble)
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    servos_.at(id).garble_write_acks = garble;
+  }
+
+  void set_write_acks(uint8_t id, bool acks)
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    servos_.at(id).write_acks = acks;
+  }
+
+  void set_ignore_write(uint8_t id, uint8_t address, bool ignore)
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    servos_.at(id).ignore_write[address] = ignore;
+  }
+
+  void set_vanish_after_id_write(uint8_t id)
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    servos_.at(id).vanish_after_id_write = true;
+  }
+
+  void set_eeprom_commit_ms(uint8_t id, unsigned ms)
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    servos_.at(id).eeprom_commit_ms = ms;
+  }
+
+  // reply_id_override, reply_length_delta and reply_checksum_corrupt act on sync-read frames
+  // always, and on addressed replies (ping, READ, write ack) only while this is on
+  void set_faults_apply_to_addressed(bool apply)
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    faults_apply_to_addressed_ = apply;
+  }
+
+  void drop_pings(uint8_t id, int count)
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    servos_.at(id).pings_to_drop = count;
+  }
+
+  // ---- factory_reset (FACTORY_RESET_SPEC 2, "Fake bus") ----
+
+  // The ids every RESET frame was addressed to, in arrival order, answered or not.
+  std::vector<uint8_t> resets() const
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<uint8_t> ids;
+    for (const FrameRecord & frame : frames_) {
+      if (frame.instruction == kInstReset) {
+        ids.push_back(frame.id);
+      }
+    }
+    return ids;
+  }
+
+  // One entry of the table a RESET restores (registers 6..39 only; see FakeServo::factory).
+  void set_factory_byte(uint8_t id, uint8_t reg, uint8_t value)
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    servos_.at(id).factory.at(reg) = value;
+  }
+
+  // little endian, sign-magnitude on `bit`, like set_word
+  void set_factory_word(uint8_t id, uint8_t reg, int value, int bit = 15)
+  {
+    const uint16_t raw = sign_magnitude_encode(value, bit);
+    const std::lock_guard<std::mutex> lock(mutex_);
+    FakeServo & s = servos_.at(id);
+    s.factory.at(reg) = static_cast<uint8_t>(raw & 0xff);
+    s.factory.at(reg + 1u) = static_cast<uint8_t>(raw >> 8);
+  }
+
+  // The factory table made equal to the servo's EEPROM as it stands, apart from `changes`: the
+  // bench servo whose registers are all factory but a few.
+  void set_factory_from_eeprom(uint8_t id, const std::map<uint8_t, uint8_t> & changes = {})
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    FakeServo & s = servos_.at(id);
+    for (std::size_t reg = 0; reg <= kEepromLast; reg++) {
+      s.factory[reg] = s.mem[reg];
+    }
+    for (const auto & change : changes) {
+      s.factory.at(change.first) = change.second;
+    }
+  }
+
+  void set_reset_supported(uint8_t id, bool supported)
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    servos_.at(id).reset_supported = supported;
+  }
+
+  void set_reset_skip(uint8_t id, uint8_t reg, bool skip)
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    servos_.at(id).reset_skips.at(reg) = skip;
+  }
+
+  // A firmware whose RESET does not re-initialise SRAM (M4 and M5 measured that the ST3025's does).
+  void set_reset_keeps_sram(uint8_t id, bool keeps)
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    servos_.at(id).reset_keeps_sram = keeps;
+  }
+
+  // Off by default. On: a servo hears an addressed request only when the line runs at the rate its
+  // register 6 names (0..7 = 1000000, 500000, 250000, 128000, 115200, 76800, 57600, 38400); any
+  // other request is noise to it and goes unanswered. The line rate is the pty's own termios
+  // speed, which ServoBus sets through the slave. Replies are never filtered: an ack goes out at
+  // the rate its request came at, even when that request moved the servo to another rate
+  // (FACTORY_RESET_SPEC M3). Sync reads and writes are the driver's, which never changes a rate,
+  // and are not modelled.
+  void set_baud_model(bool on)
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    baud_model_ = on;
+  }
+
 private:
   // Short enough that wait_quiet costs a couple of milliseconds, and irrelevant to latency:
   // poll() returns the moment a byte arrives, whatever the timeout says.
@@ -441,6 +858,8 @@ private:
       std::array<uint8_t, 256> chunk{};
       const ssize_t n = ::read(master_, chunk.data(), chunk.size());
       if (n > 0) {
+        // Here and not in consume(), which throws garbage and mis-summed frames away unseen.
+        bytes_received_.fetch_add(static_cast<uint64_t>(n));
         pending_.insert(pending_.end(), chunk.begin(), chunk.begin() + n);
         consume();
       }
@@ -484,6 +903,9 @@ private:
     const uint8_t instruction = frame[4];
     const std::vector<uint8_t> params(frame.begin() + 5, frame.end() - 1);
     const std::lock_guard<std::mutex> lock(mutex_);
+    // Before every return below: the log proves a request was SENT, answered or not, and a ping
+    // to an empty id is exactly what a scan's coverage gate counts (PHASE6_SPEC D.1 #4).
+    frames_.push_back(FrameRecord{id, instruction, params});
     if (id == kBroadcastId) {
       if (instruction == kInstSyncWrite) {
         record_sync_write(params);
@@ -497,10 +919,35 @@ private:
       return;                         // nothing on the bus: silence, and the caller pays a timeout
     }
     FakeServo & s = it->second;
+    // A request at another rate than the servo's is noise to it (set_baud_model).
+    if (baud_model_ && line_rate() != rate_of_register(s.mem[kRegBaud])) {
+      return;
+    }
+    // Still committing EEPROM: the request is ignored as though the servo were absent. A
+    // timestamp and never a sleep -- answer() runs with mutex_ held (D.1 #13).
+    if (std::chrono::steady_clock::now() < s.busy_until) {
+      return;
+    }
+    // The commit is over but its ack is still queued -- its due time passed while the responder
+    // slept in poll(). A servo sends that ack the moment its commit ends, before it hears anything
+    // else, so the ack goes out now and this request, which found it finishing, goes unheard.
+    // Answering first would put a reply AHEAD of the ack in one read window, an order no servo
+    // produces; the Phase 6 tool tests caught exactly that, at commit times one ping period apart.
+    if (s.commit_ack != 0) {
+      const uint64_t ticket = s.commit_ack;
+      s.commit_ack = 0;
+      if (emit_queued(ticket)) {
+        return;
+      }
+    }
+    if (instruction == kInstPing && s.pings_to_drop > 0) {
+      s.pings_to_drop--;
+      return;                         // a ping lost on the wire; the servo never saw it
+    }
     s.requests++;
     if (instruction == kInstPing) {
       s.pings++;
-      send(id, s.status, {});
+      reply(s, id, {}, false);
       return;
     }
     if (instruction == kInstRead && params.size() >= 2) {
@@ -513,28 +960,262 @@ private:
           return;                     // on the bus, answering pings, but never the feedback read
         }
       }
+      if (static_cast<int>(address) == s.silent_read_address && s.silent_reads != 0) {
+        if (s.silent_reads > 0) {
+          s.silent_reads--;
+        }
+        return;
+      }
       std::vector<uint8_t> payload;
       payload.reserve(length);
       for (size_t i = 0; i < length; i++) {
         payload.push_back(s.mem[(address + i) & 0xff]);
       }
-      send(id, s.status, payload);
+      reply(s, id, payload, true);
       return;
     }
     if (instruction == kInstWrite && !params.empty()) {
       s.writes++;
       const uint8_t address = params[0];
-      for (size_t i = 1; i < params.size(); i++) {
-        s.mem[(address + i - 1) & 0xff] = params[i];
-      }
       if (address == kRegTorqueEnable) {
         s.torque_enable_writes++;
       }
       if (address == kRegMode) {
         s.mode_writes++;
       }
-      send(id, s.status, {});
+      answer_write(id, s, params);
+      return;
     }
+    if (instruction == kInstReset) {
+      s.resets++;
+      answer_reset(id, s);
+    }
+  }
+
+  // A RESET, FACTORY_RESET_SPEC 1 (measured on the ST3025): registers 6..39 back to the factory
+  // table, committed to the shadow whatever the lock says -- a flash write of its own, not a WRITE
+  // under the EEPROM policy -- with register 5 kept; then torque off, goal 0 and the lock closed;
+  // then the ack from the addressed id, as late as the commit when a byte changed (25 ms on the
+  // bench, 0.8 ms when nothing did).
+  void answer_reset(uint8_t id, FakeServo & s)
+  {
+    if (!s.reset_supported) {
+      return;                         // an instruction this firmware does not know: no reply
+    }
+    bool changed = false;
+    for (std::size_t reg = kRegBaud; reg <= kEepromLast; reg++) {
+      if (s.reset_skips[reg]) {
+        continue;
+      }
+      changed = changed || s.mem[reg] != s.factory[reg] || s.eeprom[reg] != s.factory[reg];
+      s.mem[reg] = s.factory[reg];
+      s.eeprom[reg] = s.factory[reg];
+    }
+    if (!s.reset_keeps_sram) {
+      s.mem[kRegTorqueEnable] = 0;
+      s.mem[kRegGoalPosition] = 0;
+      s.mem[kRegGoalPosition + 1] = 0;
+      s.mem[kRegLock] = 1;
+    }
+    present_from_physical(&s);
+    const unsigned commit_ms = changed ? s.eeprom_commit_ms : 0;
+    if (commit_ms > 0) {
+      s.busy_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(commit_ms);
+    }
+    if (s.write_acks) {
+      s.commit_ack = reply(
+        s, id, {}, false,
+        commit_ms > 0 ? s.busy_until : std::chrono::steady_clock::time_point{}, true);
+    }
+  }
+
+  // The rate register 6 names, or -1 for a value outside 0..7.
+  static int rate_of_register(uint8_t value)
+  {
+    constexpr std::array<int, 8> kRates = {
+      1000000, 500000, 250000, 128000, 115200, 76800, 57600, 38400};
+    return value < kRates.size() ? kRates[value] : -1;
+  }
+
+  // The rate the pty line runs at, as ServoBus set it through the slave; -1 for any other speed.
+  int line_rate() const
+  {
+    struct termios settings{};
+    if (::tcgetattr(slave_, &settings) != 0) {
+      return -1;
+    }
+    switch (::cfgetospeed(&settings)) {
+      case B1000000:
+        return 1000000;
+      case B500000:
+        return 500000;
+      case B115200:
+        return 115200;
+      case B57600:
+        return 57600;
+      case B38400:
+        return 38400;
+      case B19200:
+        return 19200;
+      case B9600:
+        return 9600;
+      default:
+        return -1;
+    }
+  }
+
+  // An addressed INST_WRITE, PHASE6_SPEC D.1 #5-#13. The bytes first, each under the EEPROM
+  // policy; then the side effects of the registers the driver never writes (31-32 and 128 at 40
+  // with the offset model on, 5 always); then the ack, from the id the knobs name and as late as
+  // the commit takes. With every knob at its default this is exactly the old loop and send().
+  void answer_write(uint8_t id, FakeServo & s, const std::vector<uint8_t> & params)
+  {
+    const uint8_t address = params[0];
+    // the lock as the write found it: one frame is one decision, whatever bytes it carries
+    const bool locked = s.mem[kRegLock] != 0;
+    bool eeprom_applied = false;
+    bool offset_written = false;
+    bool id_written = false;          // the frame covered register 5, applied or not
+    bool id_applied = false;
+    bool calibrate = false;
+    for (size_t i = 1; i < params.size(); i++) {
+      const uint8_t reg = static_cast<uint8_t>((address + i - 1) & 0xff);
+      id_written = id_written || reg == kRegId;
+      if (s.ignore_write[reg]) {
+        continue;
+      }
+      if (reg == kRegTorqueEnable && params[i] == kCalibrateMidpoint && s.offset_model) {
+        calibrate = true;             // 128 is a command here, not a value to store
+        continue;
+      }
+      if (store(&s, reg, params[i], locked)) {
+        eeprom_applied = eeprom_applied || reg <= kEepromLast;
+        offset_written = offset_written || reg == kRegOffset || reg == kRegOffset + 1;
+        id_applied = id_applied || reg == kRegId;
+      }
+    }
+    if (calibrate) {
+      // "current position correction is 2048": the offset that puts present at 2048, written
+      // to 31-32 as an EEPROM write under the policy like any other.
+      const int wanted = s.physical - 2048;
+      const int offset = wanted > 2047 ? 2047 : (wanted < -2047 ? -2047 : wanted);
+      const uint16_t raw = sign_magnitude_encode(offset, 11);
+      const std::array<uint8_t, 2> bytes = {
+        static_cast<uint8_t>(raw & 0xff), static_cast<uint8_t>(raw >> 8)};
+      for (size_t k = 0; k < bytes.size(); k++) {
+        const uint8_t reg = static_cast<uint8_t>(kRegOffset + k);
+        if (!s.ignore_write[reg] && store(&s, reg, bytes[k], locked)) {
+          eeprom_applied = true;
+          offset_written = true;
+        }
+      }
+      s.mem[kRegTorqueEnable] = s.register40_after;
+      s.calibrations++;
+    }
+    if (offset_written) {
+      present_from_physical(&s);
+    }
+    const unsigned commit_ms = eeprom_applied ? s.eeprom_commit_ms : 0;
+    if (commit_ms > 0) {
+      s.busy_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(commit_ms);
+    }
+    // The id the servo answers to from now on: register 5 if this frame changed it, else the key
+    // it was addressed at. `s` stays valid across rekey(): a node extract moves the element
+    // without copying it.
+    const uint8_t now_id = id_applied ? s.mem[kRegId] : id;
+    const bool vanish = id_written && s.vanish_after_id_write;
+    bool ack = s.write_acks && !vanish;
+    uint8_t ack_from = id;
+    if (id_written) {
+      ack = ack && s.id_write_ack != IdWriteAck::none;
+      ack_from = (s.id_write_ack == IdWriteAck::new_id) ? now_id : id;
+      rekey(id, now_id);
+    }
+    if (vanish) {
+      s.absent = true;                // gone under both ids (context/motor_reset_command_email.png)
+    }
+    if (ack) {
+      // Due at the very time point the commit ends, so a request that finds the servo free also
+      // finds its ack due (answer()).
+      s.commit_ack = reply(
+        s, ack_from, {}, false,
+        commit_ms > 0 ? s.busy_until : std::chrono::steady_clock::time_point{}, true);
+    }
+  }
+
+  // One byte under the EEPROM policy. SRAM always takes it. Returns whether mem changed hands,
+  // i.e. whether the servo acts on it now; the shadow says whether it outlives a power cycle.
+  bool store(FakeServo * s, uint8_t reg, uint8_t value, bool locked) const
+  {
+    if (reg > kEepromLast) {
+      s->mem[reg] = value;
+      return true;
+    }
+    if (locked && eeprom_policy_ == EepromPolicy::drop_when_locked) {
+      return false;
+    }
+    s->mem[reg] = value;
+    if (!locked || eeprom_policy_ == EepromPolicy::apply_always) {
+      s->eeprom[reg] = value;
+    }
+    return true;
+  }
+
+  // A test-side seed: mem, and the shadow with it for an EEPROM register.
+  static void seed(FakeServo * s, uint8_t reg, uint8_t value)
+  {
+    s->mem[reg] = value;
+    if (reg <= kEepromLast) {
+      s->eeprom[reg] = value;
+    }
+  }
+
+  static int offset_of(const FakeServo & s)
+  {
+    return sign_magnitude_decode(
+      static_cast<uint16_t>(s.mem[kRegOffset] | (s.mem[kRegOffset + 1] << 8)), 11);
+  }
+
+  static int present_of(const FakeServo & s)
+  {
+    return sign_magnitude_decode(
+      static_cast<uint16_t>(
+        s.mem[kRegPresentPosition] | (s.mem[kRegPresentPosition + 1] << 8)));
+  }
+
+  // After a test-side seed: keep the present position the test wrote, move the shaft to match.
+  static void resync_physical(FakeServo * s)
+  {
+    if (s->offset_model) {
+      s->physical = present_of(*s) + offset_of(*s);
+    }
+  }
+
+  // After the bus moved the offset: the shaft stays where it is and present follows it.
+  static void present_from_physical(FakeServo * s)
+  {
+    if (!s->offset_model) {
+      return;
+    }
+    const int present = ((s->physical - offset_of(*s)) % 4096 + 4096) % 4096;
+    s->mem[kRegPresentPosition] = static_cast<uint8_t>(present & 0xff);
+    s->mem[kRegPresentPosition + 1] = static_cast<uint8_t>(present >> 8);
+  }
+
+  // Move the servo keyed `from` to `to`, counters and knobs included. Two servos cannot share a
+  // key, so a move onto a taken one is refused and counted, and the register keeps the write.
+  void rekey(uint8_t from, uint8_t to)
+  {
+    if (from == to) {
+      return;
+    }
+    if (servos_.count(to) != 0) {
+      id_collisions_++;
+      return;
+    }
+    auto node = servos_.extract(from);
+    node.key() = to;
+    servos_.insert(std::move(node));
   }
 
   // ff ff fe mesLen 83 MemAddr nLen {ID data(nLen)}... ~chk (src/SCS.cpp:124-151)
@@ -631,9 +1312,9 @@ private:
         frame[5] = static_cast<uint8_t>(frame[5] ^ 0x01);
       }
       if (s.reply_delay_polls > 0) {
-        outbox_.emplace_back(
-          std::chrono::steady_clock::now() +
-          std::chrono::milliseconds(s.reply_delay_polls * kPollTimeoutMs), std::move(frame));
+        outbox_.push_back(
+          Outgoing{std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(s.reply_delay_polls * kPollTimeoutMs), std::move(frame)});
         continue;
       }
       frames.push_back(std::move(frame));
@@ -653,9 +1334,9 @@ private:
       return;
     }
     if (sync_read_delay_ms_ > 0) {
-      outbox_.emplace_back(
-        std::chrono::steady_clock::now() + std::chrono::milliseconds(sync_read_delay_ms_),
-        std::move(burst));
+      outbox_.push_back(
+        Outgoing{std::chrono::steady_clock::now() + std::chrono::milliseconds(sync_read_delay_ms_),
+          std::move(burst)});
       return;
     }
     emit(burst);
@@ -681,8 +1362,8 @@ private:
     bool emitted = false;
     size_t kept = 0;
     for (size_t i = 0; i < outbox_.size(); i++) {
-      if (outbox_[i].first <= now) {
-        emit(outbox_[i].second);
+      if (outbox_[i].due <= now) {
+        emit(outbox_[i].bytes);
         emitted = true;
       } else if (kept != i) {
         // Guarded, because kept == i is the ordinary case and self-move-assigning a std::vector
@@ -697,10 +1378,25 @@ private:
     return emitted;
   }
 
+  // The one queued entry carrying `ticket`, sent now whatever its due time. Responder thread only,
+  // like the rest of the outbox. Returns false when it already went out.
+  bool emit_queued(uint64_t ticket)
+  {
+    for (size_t i = 0; i < outbox_.size(); i++) {
+      if (outbox_[i].ticket == ticket) {
+        emit(outbox_[i].bytes);
+        outbox_.erase(outbox_.begin() + static_cast<std::ptrdiff_t>(i));
+        return true;
+      }
+    }
+    return false;
+  }
+
   // The framing send() has always done: ff ff ID (nLen+2) Err data ~chk, nLen + 6 bytes
   // (src/SCS.cpp:182-185). Split out of send() so a sync-read burst can be assembled before it is
   // written, while the reply framing is still written down exactly once in the harness: send() is
-  // byte for byte what it was, and every existing case is untouched (PHASE3 4.H10).
+  // byte for byte what it was, and every existing case is untouched (PHASE3 4.H10). Phase 6
+  // renamed send() to reply(), which with every knob at its default still is.
   static std::vector<uint8_t> frame_bytes(
     uint8_t id, uint8_t error, const std::vector<uint8_t> & payload)
   {
@@ -727,12 +1423,51 @@ private:
     }
   }
 
-  void send(uint8_t id, uint8_t error, const std::vector<uint8_t> & payload)
+  // Every addressed reply -- a ping's, a READ's, a write's ack -- from `from`, carrying the
+  // servo's status byte. The Phase 6 knobs act here (PHASE6_SPEC D.1 #8, #13, #14): the
+  // sync-read faults when they are switched on for addressed replies, the twin, and the delay of
+  // an ack that waits for its EEPROM commit, which goes through the outbox and never a sleep.
+  // `due` is that commit's end ({} = send now); `write_ack` marks a write's ack. Returns the outbox
+  // ticket of a queued reply, or 0. A twin limited to n replies counts down here.
+  uint64_t reply(
+    FakeServo & s, uint8_t from, const std::vector<uint8_t> & payload, bool read_reply,
+    std::chrono::steady_clock::time_point due = {}, bool write_ack = false)
   {
     if (payload.size() > 253u) {
-      return;   // the length byte counts Inst and the checksum too; a longer reply would truncate
+      return 0;   // the length byte counts Inst and the checksum; a longer reply would truncate
     }
-    emit(frame_bytes(id, error, payload));
+    const bool faulty = faults_apply_to_addressed_;
+    std::vector<uint8_t> frame = frame_bytes(
+      (faulty && s.reply_id_override != 0) ? s.reply_id_override : from, s.status, payload);
+    if (faulty && s.reply_length_delta != 0) {
+      frame[3] = static_cast<uint8_t>(static_cast<int>(frame[3]) + s.reply_length_delta);
+      repair_checksum(&frame);
+    }
+    if (faulty && s.reply_checksum_corrupt) {
+      frame[5] = static_cast<uint8_t>(frame[5] ^ 0x01);   // as the sync-read knob does
+    }
+    const bool garbling = s.twin == TwinReply::garbled ||
+      (s.twin == TwinReply::garbled_reads && read_reply);
+    const bool doubling = s.twin == TwinReply::doubled ||
+      (s.twin == TwinReply::doubled_reads && read_reply);
+    const bool twin_acts = s.twin_replies != 0 && (garbling || doubling);
+    if (twin_acts && s.twin_replies > 0) {
+      s.twin_replies--;
+    }
+    if ((twin_acts && garbling) || (write_ack && s.garble_write_acks)) {
+      frame.back() = static_cast<uint8_t>(~frame.back());
+    }
+    if (twin_acts && doubling) {
+      const std::vector<uint8_t> copy = frame;
+      frame.insert(frame.end(), copy.begin(), copy.end());
+    }
+    if (due != std::chrono::steady_clock::time_point{}) {
+      const uint64_t ticket = ++next_ticket_;
+      outbox_.push_back(Outgoing{due, std::move(frame), ticket});
+      return ticket;
+    }
+    emit(frame);
+    return 0;
   }
 
   int master_ = -1;
@@ -748,15 +1483,32 @@ private:
   SyncReadReplyOrder reply_order_ = SyncReadReplyOrder::request;
   size_t sync_read_truncate_bytes_ = 0;
   unsigned sync_read_delay_ms_ = 0;
+  // the Phase 6 bus-level state, all under mutex_ (PHASE6_SPEC D.1)
+  std::vector<FrameRecord> frames_;
+  uint64_t id_collisions_ = 0;
+  EepromPolicy eeprom_policy_ = EepromPolicy::apply_always;
+  uint8_t power_up_lock_ = 0;
+  bool faults_apply_to_addressed_ = false;
+  bool baud_model_ = false;           // factory_reset, under mutex_ like the rest
   // touched only by the responder thread
   std::deque<uint8_t> pending_;
-  // Replies held back until their time comes: {due, bytes}. An outbox and not a sleep, because
-  // answer() runs with mutex_ held (PHASE3 4.H8, 2.93).
-  std::vector<std::pair<std::chrono::steady_clock::time_point, std::vector<uint8_t>>> outbox_;
+  // Replies held back until their time comes. An outbox and not a sleep, because answer() runs
+  // with mutex_ held (PHASE3 4.H8, 2.93). `ticket` names a commit's ack (0 for every other entry)
+  // so answer() can send that one early; tickets count up from 1 and are never reused.
+  struct Outgoing
+  {
+    std::chrono::steady_clock::time_point due;
+    std::vector<uint8_t> bytes;
+    uint64_t ticket = 0;
+  };
+  std::vector<Outgoing> outbox_;
+  uint64_t next_ticket_ = 0;
   std::atomic<bool> stop_{false};
   // poll() calls that timed out with nothing queued and nothing half-parsed; wait_quiet's clock
   std::atomic<uint64_t> idle_polls_{0};
   std::atomic<uint64_t> bad_checksums_{0};
+  // raw bytes read off the master; the responder adds, a test reads and clear_frames() zeroes
+  std::atomic<uint64_t> bytes_received_{0};
   // wait_quiet() is const, so its give-up counter is mutable
   mutable std::atomic<uint64_t> quiet_timeouts_{0};
   // declared last, so every member it touches is alive before it starts

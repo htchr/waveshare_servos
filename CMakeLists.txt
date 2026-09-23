@@ -80,15 +80,33 @@ target_link_libraries(waveshare_servos
     servo_bus
 )
 
-# Tools
-add_executable(set_id src/set_id.cpp)
-target_link_libraries(set_id PRIVATE scservo rclcpp::rclcpp)
+# Tools (jazzy.md Phase 6). Their logic is a ROS-free library the tests drive against the fake
+# bus in-process; each executable is one line. They reach the bus only through servo_bus, which
+# PUBLIC-links the same scservo target as the plugin (Phase 6 item 4), so they take the same
+# exclusive lock and are refused while the controller manager holds the port.
+add_library(servo_tools STATIC src/servo_tools.cpp)
+set_target_properties(servo_tools PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_compile_features(servo_tools PUBLIC cxx_std_17)
+target_include_directories(servo_tools PUBLIC $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/src>)
+target_link_libraries(servo_tools PUBLIC servo_bus)
 
-add_executable(calibrate_midpoint src/calibrate_midpoint.cpp)
-target_link_libraries(calibrate_midpoint PRIVATE scservo rclcpp::rclcpp)
+# tool_main.cpp reads the global parameter overrides through rcl's own API
+# (rcl_arguments_get_param_overrides, rcl_yaml_node_struct_fini), so it names rcl and
+# rcl_yaml_param_parser itself rather than leaning on rclcpp to carry them (review fix F33).
+find_package(rcl REQUIRED)
+find_package(rcl_yaml_param_parser REQUIRED)
+add_library(tool_cli STATIC src/tool_params.cpp src/tool_main.cpp)
+target_link_libraries(tool_cli PUBLIC servo_tools rclcpp::rclcpp rcl::rcl
+  rcl_yaml_param_parser::rcl_yaml_param_parser)
+
+foreach(tool IN ITEMS scan set_id calibrate_midpoint factory_reset)
+  add_executable(${tool} src/${tool}.cpp)
+  target_link_libraries(${tool} PRIVATE tool_cli)
+endforeach()
 
 if(WAVESHARE_SERVOS_WERROR_DEPRECATED AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-  foreach(driver_target IN ITEMS waveshare_servos servo_bus set_id calibrate_midpoint)
+  foreach(driver_target IN ITEMS
+      waveshare_servos servo_bus servo_tools tool_cli scan set_id calibrate_midpoint factory_reset)
     target_compile_options(${driver_target} PRIVATE -Werror=deprecated-declarations)
   endforeach()
 endif()
@@ -116,7 +134,7 @@ install(TARGETS waveshare_servos
   RUNTIME DESTINATION bin
 )
 install(
-  TARGETS set_id calibrate_midpoint
+  TARGETS scan set_id calibrate_midpoint factory_reset
   DESTINATION lib/${PROJECT_NAME}
 )
 
@@ -257,6 +275,33 @@ if(BUILD_TESTING)
     ${CMAKE_CURRENT_SOURCE_DIR}/test
   )
 
+  # Its rclcpp-backed cases create a node and a context, so it gets a private graph like the
+  # other ROS tests: 85 is not 77 (hil_check.sh), 86 (test_tools_cli) or 88 (test_example_launch).
+  ament_add_gmock(test_tool_params test/test_tool_params.cpp
+    ENV ROS_DOMAIN_ID=85 ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST)
+  target_link_libraries(test_tool_params tool_cli)
+
+  # The tools' bus logic against the fake bus, in-process. TIMEOUT 240, not the default 60: every
+  # scan case pings all 254 ids three times at 5 ms (C.1, about 3.8 s a scan), and there are a
+  # dozen of them.
+  ament_add_gmock(test_servo_tools test/test_servo_tools.cpp TIMEOUT 240)
+  target_link_libraries(test_servo_tools servo_tools)
+  target_include_directories(test_servo_tools PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test)
+
+  # Spawns the BUILT executables against a FakeBus pty (fake ids 11-14, never the bench's 1-4) and
+  # holds /dev/ttyACM0 with DefaultPortGuard while it does. Domain 86: not 77 (hil_check.sh), not 88
+  # (test_example_launch). Do NOT link util (openpty is in libc). src/ is named because the test
+  # reads defaults::kPort and servo_bus exports only include/.
+  ament_add_gmock(test_tools_cli test/test_tools_cli.cpp TIMEOUT 240
+    ENV ROS_DOMAIN_ID=86 ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
+        "WAVESHARE_TOOL_SCAN=$<TARGET_FILE:scan>" "WAVESHARE_TOOL_SET_ID=$<TARGET_FILE:set_id>"
+        "WAVESHARE_TOOL_CALIBRATE_MIDPOINT=$<TARGET_FILE:calibrate_midpoint>"
+        "WAVESHARE_TOOL_FACTORY_RESET=$<TARGET_FILE:factory_reset>")
+  target_link_libraries(test_tools_cli servo_bus)
+  target_include_directories(test_tools_cli PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/test)
+  add_dependencies(test_tools_cli scan set_id calibrate_midpoint factory_reset)
+
   # The example description renders to different XML depending on use_mock_hardware, and which
   # <plugin> ros2_control ends up loading is decided there, at xacro render time, before any
   # ResourceManager exists -- so no gmock test above can reach it. This one renders the text and
@@ -272,7 +317,7 @@ if(BUILD_TESTING)
   # the only motorless test that runs the real bringup -- ros2_control_node, robot_state_publisher
   # and the spawners -- which is what the ENV and RUN_SERIAL below are for.
   #
-  # ENV gives it a private ROS graph. The domain must NOT be 77: test/hil_check.sh:51 re-execs
+  # ENV gives it a private ROS graph. The domain must NOT be 77: test/hil_check.sh:69 re-execs
   # itself with ROS_DOMAIN_ID=77, and on a shared domain this test would discover the bench's
   # controller manager (or the bench ours) and assert against the wrong stack. LOCALHOST discovery
   # keeps it off the LAN as well. ENV is not an add_launch_test keyword -- that function parses
@@ -325,6 +370,26 @@ if(BUILD_TESTING)
   add_executable(hil_port_probe test/hil/port_probe.cpp)
   target_compile_features(hil_port_probe PRIVATE cxx_std_17)
 
+  # The bench's EEPROM oracle and repair tool. Independent of servo_tools ON PURPOSE: a bug shared
+  # by the tools and the repair would hide itself. Not installed.
+  add_executable(hil_eeprom test/hil/eeprom.cpp test/hil/eeprom_core.cpp)
+  target_link_libraries(hil_eeprom servo_bus)
+  target_include_directories(hil_eeprom PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test/hil)
+  # TIMEOUT 180, not the default 60: every restore case pays for hil_eeprom's own census, 254 ids
+  # at two 5 ms pings each (E.1), before and after its writes -- 2.5 s a census, 56 s in all,
+  # measured.
+  ament_add_gmock(test_hil_eeprom test/test_hil_eeprom.cpp test/hil/eeprom_core.cpp TIMEOUT 180
+    ENV "WAVESHARE_HIL_EEPROM_BIN=$<TARGET_FILE:hil_eeprom>")
+  target_link_libraries(test_hil_eeprom servo_bus)
+  target_include_directories(test_hil_eeprom PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/test ${CMAKE_CURRENT_SOURCE_DIR}/test/hil)
+  add_dependencies(test_hil_eeprom hil_eeprom)
+  # Both take the real /dev/ttyACM0 (test_tools_cli's DefaultPortGuard for its whole run,
+  # compare_opens_no_port for one case), so `ctest -j` must never run them side by side: one would
+  # find the port busy because of the other. hil_check is RUN_SERIAL already.
+  set_tests_properties(test_tools_cli test_hil_eeprom
+    PROPERTIES RESOURCE_LOCK waveshare_default_port)
+
   # The gate logic is the part of the bench check that can be proved without a bench: the
   # self-test runs the three invariant gates over synthetic series with injected defects and
   # needs no hardware, no ROS and no run directory (PHASE2_SPEC 11.2, 12.3).
@@ -345,6 +410,7 @@ if(BUILD_TESTING)
     RESULT_FILE "${AMENT_TEST_RESULTS_DIR}/${PROJECT_NAME}/hil_check.xunit.xml"
     ENV "WAVESHARE_HIL_STOP_WHEELS=$<TARGET_FILE:hil_stop_wheels>"
         "WAVESHARE_HIL_PORT_PROBE=$<TARGET_FILE:hil_port_probe>"
+        "WAVESHARE_HIL_EEPROM=$<TARGET_FILE:hil_eeprom>"
         "WAVESHARE_HIL_HELPERS=${CMAKE_CURRENT_SOURCE_DIR}/test/hil"
     SKIP_RETURN_CODE 77
     # Added in Phase 5, and it fixes a real defect rather than tidying one. The script writes its

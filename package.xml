@@ -13,6 +13,12 @@
   <depend>pluginlib</depend>
   <depend>rclcpp</depend>
   <depend>rclcpp_lifecycle</depend>
+  <!-- The tools read rcl's global parameter overrides directly (src/tool_main.cpp,
+       test/test_tool_params.cpp): rcl_arguments_get_param_overrides and
+       rcl_yaml_node_struct_fini. rclcpp re-exports both packages today; they are declared
+       because this package calls them. -->
+  <depend>rcl</depend>
+  <depend>rcl_yaml_param_parser</depend>
 
   <test_depend>ament_cmake_gmock</test_depend>
   <test_depend>ament_lint_auto</test_depend>

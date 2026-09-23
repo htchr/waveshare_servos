@@ -7,8 +7,14 @@
 #
 # Environment: WAVESHARE_HIL_PORT (default /dev/ttyACM0), WAVESHARE_HIL_OUT (default
 # ./hil_check.d), WAVESHARE_HIL_WS (default: the workspace this package was built from),
-# WAVESHARE_HIL_HELPERS and WAVESHARE_HIL_STOP_WHEELS / _PORT_PROBE (set by CMake), and
+# WAVESHARE_HIL_HELPERS and WAVESHARE_HIL_STOP_WHEELS / _PORT_PROBE / _EEPROM (set by CMake), and
 # WAVESHARE_HIL_SOAK_S (H11's soak length in seconds, default 600, clamped to at least 40).
+# Phase 6 (PHASE6_SPEC E.2) adds WAVESHARE_HIL_JOURNAL (the EEPROM journal of H13-H16, default
+# $HOME/.local/state/waveshare_servos/hil_eeprom_journal.snap), WAVESHARE_HIL_EEPROM_BASELINE (E.0's
+# golden snapshot, which H17.matches_baseline compares with; it SKIPs without one) and
+# WAVESHARE_HIL_TOOLS (the directory scan, set_id and calibrate_midpoint are run from; the install
+# tree by default -- the override exists only for the H14 red run of the pre-Phase-6 binaries,
+# which ignore `port`, and is refused on any port but /dev/ttyACM0).
 # Exit codes: 0 every check PASS/SKIP or an allowed INCONCLUSIVE; 1 a FAIL; 2 an abort; 77 skip.
 #
 # The safety machinery of PHASE2_SPEC 12.4 -- the clean-environment re-exec, HIL_TAG, killing
@@ -24,6 +30,18 @@ STOP_WHEELS=${WAVESHARE_HIL_STOP_WHEELS:-}
 PORT_PROBE=${WAVESHARE_HIL_PORT_PROBE:-}
 OUT=${WAVESHARE_HIL_OUT:-$PWD/hil_check.d}
 WS=${WAVESHARE_HIL_WS:-$(cd "$HELPERS/../../../.." && pwd)}
+# Phase 6 (E.2). Every one of these is forwarded through the env -i below, or it is dropped there
+# without a word. TOOLS stays empty unless given; the pre-flight fills in the install tree.
+EEPROM=${WAVESHARE_HIL_EEPROM:-}
+JOURNAL=${WAVESHARE_HIL_JOURNAL:-$HOME/.local/state/waveshare_servos/hil_eeprom_journal.snap}
+# The port the journal was taken on (review fix F3): written with it, removed with it, and the
+# pre-flight applies a journal only to that port -- restore cannot tell one bench's servos from
+# another's of the same model. Beside the journal rather than in its name, so a replug that
+# renumbers the adapter shows the journal and stops the run instead of hiding it.
+JOURNAL_PORT=$JOURNAL.port
+BASELINE=${WAVESHARE_HIL_EEPROM_BASELINE:-}
+TOOLS=${WAVESHARE_HIL_TOOLS:-}
+JOURNAL_OURS=0          # 1 from the moment guard_begin writes the journal, 0 once it is removed
 
 # INCONCLUSIVE is legal for exactly these two keys, because for those two the bench itself cannot
 # supply the stimulus (PHASE2_SPEC 12.4/12.5). Adding a third is a spec change, reviewed as one,
@@ -55,6 +73,8 @@ if [ -z "${HIL_CLEAN:-}" ]; then
     WAVESHARE_HIL_STOP_WHEELS="$STOP_WHEELS" WAVESHARE_HIL_PORT_PROBE="$PORT_PROBE" \
     WAVESHARE_HIL_SCENARIOS="${WAVESHARE_HIL_SCENARIOS:-}" \
     WAVESHARE_HIL_SOAK_S="${WAVESHARE_HIL_SOAK_S:-}" \
+    WAVESHARE_HIL_EEPROM="$EEPROM" WAVESHARE_HIL_JOURNAL="$JOURNAL" \
+    WAVESHARE_HIL_EEPROM_BASELINE="$BASELINE" WAVESHARE_HIL_TOOLS="$TOOLS" \
     bash --noprofile --norc "${BASH_SOURCE[0]}"
 fi
 
@@ -111,8 +131,11 @@ kill_tagged() {
   return 0
 }
 
+# The last two are Phase 6's own processes (E.2), so port_rescue may escalate on this run's hung
+# tools and on a hung hil_eeprom too; like everything here they are signalled only when they carry
+# this run's HIL_TAG. Old binaries run from WAVESHARE_HIL_TOOLS do not match the first pattern.
 STACK_PATTERNS=("^$CM_BIN" "^$RSP_BIN" "ros2 launch waveshare_servos" "controller_manager/spawner"
-  "hil_record.py")
+  "hil_record.py" "lib/waveshare_servos/(scan|set_id|calibrate_midpoint)" "hil_eeprom")
 
 teardown_stack() {
   local i
@@ -408,6 +431,156 @@ diagnostics() {  # capture /diagnostics through the CLI (12.3: the recorder does
   return 0
 }
 
+# ------------------------------------------------------------------ Phase 6: tools and EEPROM (E.2)
+# $1 = label, $2 = tool, rest = its argv verbatim (so a positional argument can be tested).
+# *.out.txt / *.err.txt, not *.stdout, so scenario_end's log.txt stays the driver's.
+# Every fact is written on every path, so a row can never read a missing fact as a pass.
+tool() {
+  local label=$1 name=$2 t0 rc
+  shift 2
+  if [ ! -x "$TOOLS/$name" ]; then
+    : > "$SDIR/$label.out.txt"
+    echo "no binary $TOOLS/$name" > "$SDIR/$label.err.txt"
+    fact "${label}_rc" 127
+    fact "${label}_seconds" 0
+    fact "${label}_serial_speed_lines" none       # not a number: every gate reading it FAILs
+    fact "${label}_holders_after" "$(port_holders)"
+    return 127
+  fi
+  t0=$(now)
+  timeout -k 5 -s INT 60 "$TOOLS/$name" "$@" > "$SDIR/$label.out.txt" 2> "$SDIR/$label.err.txt"
+  rc=$?
+  fact "${label}_rc" "$rc"
+  fact "${label}_seconds" "$(python3 -c "print('%.3f' % ($(now) - $t0))")"
+  fact "${label}_serial_speed_lines" \
+    "$(cat "$SDIR/$label.out.txt" "$SDIR/$label.err.txt" | grep -c 'serial speed')"
+  fact "${label}_holders_after" "$(port_holders)"
+  return $rc
+}
+
+# $1 = label, rest = hil_eeprom arguments; refuses while the port is held, as readback does
+eeprom() {
+  local label=$1 rc
+  shift
+  local lim=(-s KILL 60)
+  [ "$1" = restore ] && lim=(-k 30 -s TERM 90)   # TERM is deferred to the end of a sequence (E.1)
+  if [ -n "$(port_holders)" ]; then
+    echo '{"ok": false, "error": "port_busy_skipped"}' > "$SDIR/$label.json"
+    fact "${label}_rc" busy
+    return 1
+  fi
+  timeout "${lim[@]}" "$EEPROM" --port "$PORT" "$@" > "$SDIR/$label.txt" 2>&1
+  rc=$?
+  sed -n 's/^RESULT //p' "$SDIR/$label.txt" | tail -1 > "$SDIR/$label.json"
+  [ -s "$SDIR/$label.json" ] || echo '{"ok": false, "error": "no_result"}' > "$SDIR/$label.json"
+  fact "${label}_rc" "$rc"
+  return $rc
+}
+
+eeprom_offline() {  # compare only: opens no port, so no port check
+  local label=$1 rc
+  shift
+  timeout -s KILL 30 "$EEPROM" "$@" > "$SDIR/$label.txt" 2>&1
+  rc=$?
+  sed -n 's/^RESULT //p' "$SDIR/$label.txt" | tail -1 > "$SDIR/$label.json"
+  [ -s "$SDIR/$label.json" ] || echo '{"equal": false, "error": "no_result"}' > "$SDIR/$label.json"
+  fact "${label}_rc" "$rc"
+  return $rc
+}
+
+snap_is_bench() {  # $1 = snapshot RESULT json. True only for a complete snapshot of the bench.
+  python3 - "$1" << 'EOF'
+import json, sys
+d = json.load(open(sys.argv[1]))
+ids = d.get('ids', {})
+ok = (d.get('ok') is True and d.get('census') == [1, 2, 3, 4]
+      and all(ids.get(str(i), {}).get('n') == 39 for i in (1, 2, 3, 4)))
+sys.exit(0 if ok else 1)
+EOF
+}
+
+# The journal (R13) is the scenario's own pre snapshot, copied to $JOURNAL before the first tool
+# call. guard_begin writes it only from a complete snapshot of the bench and never over a journal
+# it does not know; guard_end removes it only once the bench is back as that snapshot says, and
+# otherwise restores from it. Returns: 0 go on, 1 abort this scenario only, 2 abort the run.
+guard_begin() {
+  local why= rc
+  if [ -e "$JOURNAL" ]; then
+    ABORT_REASON="journal $JOURNAL exists and is not this scenario's; an unknown journal is never \
+overwritten -- the next run's pre-flight restores it, or see it by hand"
+    abort_scenario "$SCEN" "$ABORT_REASON"
+    return 2
+  fi
+  eeprom pre_eeprom snapshot --ids 1,2,3,4 --census --out "$SDIR/pre_eeprom.snap"
+  rc=$?
+  if [ "$rc" != 0 ]; then
+    why="the pre_eeprom snapshot failed (rc $rc; see pre_eeprom.txt, or port_busy_skipped in \
+pre_eeprom.json)"
+  elif ! snap_is_bench "$SDIR/pre_eeprom.json"; then
+    why="pre_eeprom is not a complete snapshot of the bench (ok, census exactly 1 2 3 4, 39 \
+readable EEPROM bytes each)"
+  elif [ ! -s "$SDIR/pre_eeprom.snap" ] || grep -Eq '(^| )x( |$)' "$SDIR/pre_eeprom.snap"; then
+    why="pre_eeprom.snap is empty or holds an unreadable byte"
+  else
+    # The journal is this run's from its first byte on, so an INT/TERM that lands while it is
+    # written still has cleanup_all restore (a no-op: no tool has run) and remove it, instead of
+    # leaving it for the next pre-flight as a crashed run's (review fix F25). Its port record goes
+    # first, so a journal never exists without one (F3).
+    JOURNAL_OURS=1
+    if ! { mkdir -p "$(dirname "$JOURNAL")" && printf '%s\n' "$PORT" > "$JOURNAL_PORT" &&
+      cp "$SDIR/pre_eeprom.snap" "$JOURNAL.tmp" && mv "$JOURNAL.tmp" "$JOURNAL"; }; then
+      rm -f "$JOURNAL.tmp" "$JOURNAL_PORT"
+      JOURNAL_OURS=0
+      why="could not write the journal $JOURNAL"
+    elif ! cmp -s "$SDIR/pre_eeprom.snap" "$JOURNAL"; then
+      rm -f "$JOURNAL" "$JOURNAL_PORT"   # written a moment ago by this function; no tool has run
+      JOURNAL_OURS=0
+      why="the journal $JOURNAL does not read back as pre_eeprom.snap"
+    fi
+  fi
+  if [ -n "$why" ]; then
+    abort_scenario "$SCEN" "guard_begin: $why; no tool was called"
+    return 1
+  fi
+  fact journal_written true
+  return 0
+}
+
+# $1 = full (EEPROM, 40, 55 and census) or eeprom_only (H14, whose stack legitimately changes SRAM
+# 40 and 55). Called on EVERY return path after a successful guard_begin.
+guard_end() {
+  local mode=()
+  [ "${1:-full}" = eeprom_only ] && mode=(--eeprom-only)
+  eeprom post_eeprom snapshot --ids 1,2,3,4 --census --out "$SDIR/post_eeprom.snap"
+  if eeprom_offline guard_compare compare "${mode[@]}" "$SDIR/pre_eeprom.snap" \
+    "$SDIR/post_eeprom.snap"; then
+    rm -f "$JOURNAL" "$JOURNAL_PORT"
+    JOURNAL_OURS=0
+    fact journal_left false
+    return 0
+  fi
+  # No --allow-regs: the journal is this scenario's own, so every difference is ours to undo.
+  # The scenario's rows still compare against the first post snapshot and still FAIL.
+  hil_log "the bench EEPROM differs from pre_eeprom; restoring from the journal"
+  eeprom guard_restore restore --from "$JOURNAL"
+  eeprom post2_eeprom snapshot --ids 1,2,3,4 --census --out "$SDIR/post2_eeprom.snap"
+  if eeprom_offline guard_compare2 compare "${mode[@]}" "$SDIR/pre_eeprom.snap" \
+    "$SDIR/post2_eeprom.snap"; then
+    rm -f "$JOURNAL" "$JOURNAL_PORT"
+    JOURNAL_OURS=0
+    fact journal_left false
+    return 0
+  fi
+  fact journal_left true
+  ABORT_REASON="bench EEPROM not restored; journal $JOURNAL kept"
+  abort_scenario "$SCEN" "$ABORT_REASON"
+  return 2
+}
+
+holder_alive() {  # $1 = a pid announced by a HOLDING line; true while that process still lives
+  [ -n "$1" ] && [ -d "/proc/$1" ] && echo true || echo false
+}
+
 # ------------------------------------------------------------------ the ten scenarios (12.5)
 h_H1() {
   # H1 is the shipped entry point: the one scenario that runs bringup/launch/example.launch.py and
@@ -420,7 +593,7 @@ h_H1() {
   # Until Phase 5 this scenario passed no port and called abort_scenario on any port but
   # /dev/ttyACM0, which cost more than the one scenario it looked like: run() turns an ABORTED row
   # into exit code 2 -- the line is 'if counts[...ABORTED...] or not port_free: return 2', at
-  # hil_gates.py:1905-1906 -- so a bench on a second adapter reported the whole suite FAIL rather
+  # hil_gates.py:2557-2558 -- so a bench on a second adapter reported the whole suite FAIL rather
   # than skipping the scenario it could not run.
   #
   # What that skip bought, and what passing the port gives up: the packaged default is no longer
@@ -765,7 +938,7 @@ h_H9() {
   # that cannot distinguish "the service was never there" from "the component refused the
   # transition". Without these two files a red H9.cycle_state has no explanation anywhere in the
   # run tree. The redirection is on the r2 wrapper, so `$?` on the next line is still r2's own
-  # status (r2 returns the timeout/ros2 status at r2:139) and the recorded facts do not change.
+  # status (r2 returns the timeout/ros2 status at r2:157) and the recorded facts do not change.
   r2 30 control set_hardware_component_state bench inactive \
     > /dev/null 2> "$SDIR/cycle_inactive.stderr"
   fact cycle_inactive_rc $?
@@ -841,7 +1014,7 @@ h_H10() {
 # recorded: the counters, not the samples, are the measurement, and a ten-minute /joint_states
 # capture is tens of MB for nothing.
 #
-# THE RUNTIME BUDGET, against ctest's TIMEOUT 2400 (CMakeLists.txt:350). The baseline is not the
+# THE RUNTIME BUDGET, against ctest's TIMEOUT 2400 (CMakeLists.txt:416). The baseline is not the
 # 998 s of PHASE3 5.17 any more -- that arithmetic (998 + 600 + 40 = 1638) predates Phase 4. The
 # measurement to reason from is the archived post-Phase-4 full run, which took 26m58s = 1618 s
 # with SOAK_S at its 600 s default
@@ -880,9 +1053,25 @@ h_H10() {
 # missing from it entirely and took H1B at its low end.) Still ample; not ample enough to keep
 # adding scenarios without re-measuring.
 #
+# Phase 5's own full run then MEASURED those fifteen scenarios at 29m09s = 1749 s
+# (phase5_evidence/phase5_run1/hil_check.txt, summary line), and that is the number Phase 6
+# (PHASE6_SPEC E.2) builds on. Its five scenarios are ESTIMATES again, to be replaced by the
+# begin/end deltas of their first real runs:
+#   H13 ~25 s: the guard's snapshots with census at ~3 s each (two, three when guard_end has to
+#     restore) and two 4-5 s scans, explicit and default port; the stale-name and positional
+#     scans exit 64 before the port opens.
+#   H14 ~80 s: one stack with a 12 s recorder, a 25 s flock hold, eleven tool runs and the guard's
+#     two snapshots. It holds only because H14 waits on its recorder's pid and never with a bare
+#     `wait`, which would sit out the stack's 420 s watchdog (0.2.6, E.4).
+#   H15 ~35 s: two set_id runs, one scan, four snapshots and a restore that writes nothing.
+#   H16 ~25 s: two calibrate runs, one read, four snapshots and a restore.
+#   H17 ~8 s: one snapshot with census.
+# So ~+175 s, ~1925 s in all, ~475 s of margin under TIMEOUT 2400 (G.2 R9).
+#
 # The SOAK_S rule follows from that margin: WAVESHARE_HIL_SOAK_S is 600 above, and raising it adds
-# its own difference second for second. At 900 the run is ~2080-2125 s, 275-320 s inside the
-# timeout, so 900 is the last value that fits -- above it, raise ctest's TIMEOUT 2400 with it.
+# its own difference second for second. At 750 the run is ~2075 s, ~325 s inside the timeout --
+# about what 900 left before Phase 6 -- so 750 is the last value that fits; above it, raise
+# ctest's TIMEOUT 2400 with it.
 h_H11() {
   scenario_begin H11 || return $?
   # The tail of this function -- the park move, the 20 s recording, the 12 s diagnostics capture
@@ -1013,7 +1202,7 @@ h_H12() {
   # true here: a FAIL says the code under test did the wrong thing, and this says the bench never
   # managed to ask it the question. An ABORTED row is louder than a FAIL in exactly the right way
   # -- run() returns 2 for any ABORTED row, not 1 ('if counts[...ABORTED...] or not port_free:
-  # return 2', hil_gates.py:1905-1906) -- and it cannot be mistaken for a limiter regression.
+  # return 2', hil_gates.py:2557-2558) -- and it cannot be mistaken for a limiter regression.
   #
   # Returning 0 rather than 2 is deliberate. The run loop treats any rc=2 from a scenario as
   # "aborted_all" and aborts every scenario AFTER it with the message "an earlier scenario left
@@ -1115,6 +1304,186 @@ so the limited stack was not started -- see arm_pre.txt for where the arm actual
   scenario_end
 }
 
+# ------------------------------------------------------------------ Phase 6: H13-H17 (E.3-E.7)
+# Every tool scenario runs between guard_begin and guard_end (E.2): the journal is written before
+# the first tool call from a complete snapshot of the bench, and guard_end -- on every return path
+# once guard_begin succeeded -- compares, restores from the journal if it must, and returns 2 when
+# it could not, which aborts every later scenario so no row runs on a changed bench. The tools are
+# run directly from $TOOLS (tool()), never through `ros2 run`, so their exit codes are their own.
+
+# H13: scan, read-only (E.3). Four scans: the explicit port, no parameter at all (only when the
+# port under test IS the default one), the stale name beside the new one, and a positional port.
+h_H13() {
+  scenario_begin H13 || return $?
+  guard_begin
+  local g=$?
+  if [ "$g" != 0 ]; then scenario_end; [ "$g" = 2 ] && return 2; return 0; fi
+  tool scan scan --ros-args -p port:="$PORT"
+  if [ "$PORT" = /dev/ttyACM0 ]; then
+    tool scan_default scan
+  else
+    fact scan_default_skipped "the port under test is $PORT, and a bare scan opens /dev/ttyACM0"
+  fi
+  tool stale_scan scan --ros-args -p device_port:="$PORT" -p port:="$PORT"
+  tool positional_scan scan "$PORT" --ros-args -p port:="$PORT"
+  guard_end full
+  g=$?
+  probe released
+  scenario_end
+  return $g
+}
+
+# H14: every tool refuses a held port, and the refusals write nothing (E.4). SAFETY: every set_id
+# and calibrate call addresses only ids no servo answers -- 200, 201, and 300, which narrows to 44
+# -- and guard_begin has just proved the census is exactly 1 2 3 4, so even a tool whose refusals
+# are all broken writes nothing to a servo; the pre-Phase-6 binaries meet this too (the H step 12
+# red run). Every command names -p port:="$PORT" (R16). Not run here, by R16: bare set_id or
+# calibrate, any id 0, 254, 255 or 510, and any bench id as a start id -- the CLI tests cover them.
+h_H14() {
+  scenario_begin H14 || return $?
+  guard_begin
+  local g=$?
+  if [ "$g" != 0 ]; then scenario_end; [ "$g" = 2 ] && return 2; return 0; fi
+  # Stage A: the controller manager holds the port, and the tools must not disturb its bus.
+  start_stack "" "[joint3, joint4]"
+  fact driver_warns_before "$(grep -c '\[WARN\]\|\[ERROR\]' "$CM_LOG")"
+  fact cm_pids "$(port_holders)"
+  $RECORD record --duration 12 --label tools_window --out "$SDIR/tools_window.json" &
+  local rec=$!
+  sleep 1
+  tool cm_scan scan --ros-args -p port:="$PORT"
+  tool cm_set_id set_id --ros-args -p port:="$PORT" -p start_id:=200 -p new_id:=201
+  tool cm_calibrate calibrate_midpoint --ros-args -p port:="$PORT" -p id:=200
+  # On the recorder's pid, never a bare `wait`: that would also wait for the stack's backgrounded
+  # wrappers, i.e. for the 420 s watchdog (0.2.6).
+  wait "$rec"
+  fact driver_warns_after "$(grep -c '\[WARN\]\|\[ERROR\]' "$CM_LOG")"
+  stop_stack TERM
+  # Stage B: a flock-only holder. A tool that opens with a raw SMS_STS::begin gets past it and
+  # prints `serial speed`; one that goes through ServoBus is refused first (via_servobus).
+  wait_port_free 15
+  timeout -s KILL 60 "$PORT_PROBE" --port "$PORT" --hold 25 --no-exclusive \
+    > "$SDIR/flock_holder.txt" 2>&1 &
+  local holder=$! probe_pid
+  probe_pid=$(wait_holding "$SDIR/flock_holder.txt" 20)
+  fact probe_pid "$probe_pid"
+  tool fl_scan scan --ros-args -p port:="$PORT"
+  fact fl_scan_holder_alive "$(holder_alive "$probe_pid")"
+  tool fl_set_id set_id --ros-args -p port:="$PORT" -p start_id:=200 -p new_id:=201
+  fact fl_set_id_holder_alive "$(holder_alive "$probe_pid")"
+  tool fl_calibrate calibrate_midpoint --ros-args -p port:="$PORT" -p id:=200
+  fact fl_calibrate_holder_alive "$(holder_alive "$probe_pid")"
+  wait "$holder"
+  # Stage C: refusals with the port free; the expected exit code of each is on its line.
+  tool stale set_id --ros-args -p device_port:="$PORT" -p port:="$PORT" -p start_id:=200 \
+    -p new_id:=201                                                                        # 64
+  tool bad_type set_id --ros-args -p port:="$PORT" -p start_id:=200 -p new_id:=201.0      # 64
+  tool range set_id --ros-args -p port:="$PORT" -p start_id:=200 -p new_id:=300           # 64
+  tool cal_range calibrate_midpoint --ros-args -p port:="$PORT" -p id:=300               # 64
+  tool missing set_id --ros-args -p port:="$PORT" -p start_id:=200                       # 64
+  tool positional set_id "$PORT" --ros-args -p port:="$PORT" -p start_id:=200 -p new_id:=201  # 64
+  tool foreign_node set_id --ros-args -p port:="$PORT" -p setid:port:="$PORT" -p start_id:=200 \
+    -p new_id:=201                                                                        # 64
+  # 4: id 3 answers. A tool without the taken check reaches the silent 200 and exits 3 instead;
+  # nothing is written either way.
+  tool taken set_id --ros-args -p port:="$PORT" -p start_id:=200 -p new_id:=3
+  tool silent_start set_id --ros-args -p port:="$PORT" -p start_id:=200 -p new_id:=201    # 3
+  tool cal_silent calibrate_midpoint --ros-args -p port:="$PORT" -p id:=200              # 3
+  guard_end eeprom_only
+  g=$?
+  probe released
+  scenario_end
+  return $g
+}
+
+# H15: set_id round trip 4 -> 253 -> 4 (E.5), an EEPROM writer, journaled. 253 is the top of scan's
+# range, so moved_scan is the hardware proof that scan reaches it (R15).
+h_H15() {
+  scenario_begin H15 || return $?
+  guard_begin
+  local g=$?
+  if [ "$g" != 0 ]; then scenario_end; [ "$g" = 2 ] && return 2; return 0; fi
+  # The precondition guard_begin already checked, repeated next to the write it protects: never
+  # write on an unexpected bench, and 253 is silent only when the census is exactly 1 2 3 4.
+  if ! snap_is_bench "$SDIR/pre_eeprom.json"; then
+    abort_scenario H15 "pre_eeprom is not a complete snapshot of exactly ids 1-4, so 253 may not \
+be silent; nothing was written"
+    guard_end full
+    g=$?
+    scenario_end
+    return $g
+  fi
+  tool move set_id --ros-args -p port:="$PORT" -p start_id:=4 -p new_id:=253
+  eeprom moved_eeprom snapshot --ids 1,2,3,253 --census --out "$SDIR/moved_eeprom.snap"
+  tool moved_scan scan --ros-args -p port:="$PORT"
+  tool back set_id --ros-args -p port:="$PORT" -p start_id:=253 -p new_id:=4
+  # The state the tool itself left, BEFORE the helper's restore can mask it (restored_by_tool).
+  eeprom back_eeprom snapshot --ids 1,2,3,4 --census --out "$SDIR/back_eeprom.snap"
+  eeprom restore restore --from "$SDIR/pre_eeprom.snap"
+  guard_end full
+  g=$?
+  scenario_end
+  return $g
+}
+
+# $1 = pre_eeprom's RESULT json. True when H16's calibration is observable: the snapshot is sound,
+# id 2 is in mode 0 and rests at least 100 ticks from 2048 (about 1026 on this bench).
+h16_observable() {
+  python3 - "$1" << 'EOF'
+import json, sys
+d = json.load(open(sys.argv[1]))
+two = d.get('ids', {}).get('2', {})
+at = two.get('volatile', {}).get('56')
+if isinstance(at, int) and at & 0x8000:
+    at = -(at & 0x7fff)
+sys.exit(0 if d.get('ok') is True and two.get('eeprom', {}).get('33') == 0 and
+         isinstance(at, int) and abs(at - 2048) >= 100 else 1)
+EOF
+}
+
+# H16: calibrate_midpoint on id 2, and the refusal on the wheel id 3 (E.6) [Q1-Q3], journaled.
+h_H16() {
+  scenario_begin H16 || return $?
+  guard_begin
+  local g=$?
+  if [ "$g" != 0 ]; then scenario_end; [ "$g" = 2 ] && return 2; return 0; fi
+  if ! h16_observable "$SDIR/pre_eeprom.json"; then
+    abort_scenario H16 "id 2 is not in mode 0, or rests within 100 ticks of 2048, in \
+pre_eeprom: the calibration would be unobservable, so this scenario may never PASS; nothing was \
+written"
+    guard_end full
+    g=$?
+    scenario_end
+    return $g
+  fi
+  tool cal calibrate_midpoint --ros-args -p port:="$PORT" -p id:=2
+  # Immediately: the independent position read, before anything can let the servo creep.
+  eeprom cal_pos read --id 2 --addr 56 --word
+  eeprom cal_eeprom snapshot --ids 1,2,3,4 --census --out "$SDIR/cal_eeprom.snap"
+  tool wheel calibrate_midpoint --ros-args -p port:="$PORT" -p id:=3                     # 4 [Q1]
+  eeprom wheel_eeprom snapshot --ids 1,2,3,4 --out "$SDIR/wheel_eeprom.snap"
+  # The offset first, then the goal, then the torque (E.1 restore steps 4-5).
+  eeprom restore restore --from "$SDIR/pre_eeprom.snap"
+  guard_end full
+  g=$?
+  scenario_end
+  return $g
+}
+
+# H17: the bench as found (E.7). Last in the list: every other scenario has run by now.
+h_H17() {
+  scenario_begin H17 || return $?
+  eeprom final_eeprom snapshot --ids 1,2,3,4 --census --out "$SDIR/final_eeprom.snap"
+  cp "$OUT/initial_eeprom.snap" "$SDIR/initial_eeprom.snap" ||
+    hil_log "no initial_eeprom.snap from the pre-flight; H17.eeprom_as_found has nothing to match"
+  fact baseline_source "$BASELINE"
+  if [ -n "$BASELINE" ]; then
+    cp "$BASELINE" "$SDIR/baseline.snap" || hil_log "could not copy the baseline '$BASELINE'"
+  fi
+  fact journal_present "$([ -e "$JOURNAL" ] && echo true || echo false)"
+  scenario_end
+}
+
 # ------------------------------------------------------------------ pre-flight and the run
 : > "$OUT/run.log"
 : > "$OUT/aborted.txt"
@@ -1137,6 +1506,19 @@ cleanup_all() {
   SCEN=exit
   SDIR=$OUT
   teardown_stack
+  # A journal THIS run wrote and no guard_end removed (an interrupt between guard_begin and
+  # guard_end) is restored here, and removed only once the restore succeeded. One this run did not
+  # write is left alone for the next pre-flight. A SIGKILL or a ctest timeout skips this trap
+  # (0.2.12); the next run's pre-flight covers that case.
+  if [ "$JOURNAL_OURS" = 1 ] && [ -e "$JOURNAL" ] && [ -z "$(port_holders)" ]; then
+    if eeprom exit_restore restore --from "$JOURNAL"; then
+      rm -f "$JOURNAL" "$JOURNAL_PORT"
+      hil_log "restored the bench EEPROM from this run's journal"
+    else
+      hil_log "restoring from this run's journal failed (see exit_restore.txt); $JOURNAL is kept \
+for the next pre-flight"
+    fi
+  fi
   if [ -z "$(port_holders)" ]; then
     timeout -s KILL 20 "$STOP_WHEELS" --port "$PORT" --ids 3,4 > "$OUT/final_stop_wheels.txt" 2>&1
     hil_log "final stop_wheels rc=$?"
@@ -1148,48 +1530,131 @@ cleanup_all() {
 trap cleanup_all EXIT
 trap 'hil_log "interrupted"; exit 130' INT TERM
 
+# The Phase 6 pre-flight (E.2), after the traps and before anything reads the bench.
+[ -x "$EEPROM" ] || { hil_log "missing helper binary '$EEPROM'"; exit 2; }
+# The pre-Phase-6 binaries ignore `port` and always open /dev/ttyACM0, so the override that runs
+# them (H step 12's red run) is refused on any other port: they would reach a bench not under test.
+if [ -n "$TOOLS" ] && [ "$PORT" != /dev/ttyACM0 ]; then
+  hil_log "the tools override is for the pre-Phase-6 binaries, which ignore 'port' and always \
+open /dev/ttyACM0; refusing to run them against $PORT"
+  exit 2
+fi
+# A journal left by a run that died between guard_begin and guard_end (a SIGKILL, a ctest timeout)
+# is applied, but only to the registers Phase 6's scenarios change -- never over a deliberate
+# change elsewhere -- only on the port it was taken on (F3), and the run stops when it cannot be.
+if [ -e "$JOURNAL" ]; then
+  hil_log "journal from $(date -r "$JOURNAL" '+%F %T') found; bench EEPROM was left changed by an \
+earlier run"
+  journal_port=$(head -n 1 "$JOURNAL_PORT" 2> /dev/null)
+  if [ "$journal_port" != "$PORT" ]; then
+    hil_log "the journal $JOURNAL was taken on port '${journal_port:-(no record in $JOURNAL_PORT)}', \
+and this run's port is '$PORT'; a journal is applied only to the bench it came from, so it was NOT \
+applied and is kept -- run on that port, or check the journal and remove it by hand"
+    exit 2
+  fi
+  # A held port is named as what it is, never as a journal that cannot be applied (F10).
+  if [ -n "$(port_holders)" ]; then
+    hil_log "port $PORT is held by [$(port_holders)]; the journal $JOURNAL was NOT applied and is \
+kept -- stop that process and run again"
+    exit 2
+  fi
+  rm -f "$SDIR/preflight_restore.txt" "$SDIR/preflight_restore.json"
+  if eeprom preflight_restore restore --from "$JOURNAL" --allow-regs 5,31,32,33,40,55; then
+    rm -f "$JOURNAL" "$JOURNAL_PORT"
+    hil_log "restored the bench EEPROM from the journal and removed it"
+  elif [ ! -e "$SDIR/preflight_restore.txt" ]; then
+    hil_log "port $PORT became busy [$(port_holders)] before the restore; the journal $JOURNAL was \
+NOT applied and is kept -- stop that process and run again"
+    exit 2
+  else
+    while IFS= read -r line; do
+      hil_log "  $line"
+    done < <(grep -v '^RESULT ' "$SDIR/preflight_restore.txt" 2> /dev/null)
+    hil_log "bench EEPROM differs from the journal outside the registers Phase 6 writes (or the \
+journal is unreadable); not restoring automatically -- see $JOURNAL"
+    exit 2
+  fi
+fi
+[ -n "$TOOLS" ] || TOOLS=$prefix/lib/waveshare_servos
+hil_log "tools from $TOOLS"
+# H17.eeprom_as_found compares the end of the run with THIS file: one left by an earlier run in the
+# same $OUT must not stand in for a snapshot that failed now (review fix F14).
+rm -f "$OUT/initial_eeprom.snap" "$OUT/initial_eeprom.txt" "$OUT/initial_eeprom.json"
+if ! eeprom initial_eeprom snapshot --ids 1,2,3,4 --census --out "$OUT/initial_eeprom.snap"; then
+  rm -f "$OUT/initial_eeprom.snap"
+  hil_log "pre-flight initial_eeprom snapshot failed (see initial_eeprom.txt/.json); the start of \
+this run was not read, so H17.eeprom_as_found will FAIL"
+fi
+
 timeout 20 ros2 daemon stop > /dev/null 2>&1
 readback initial_readback --read-only --registers --ids 1,2,3,4 > /dev/null
 
-# H11 goes last so its ten minutes are spent only after every fast row has reported, and so an
-# abort in it costs nothing else (PHASE3 5.13). That is why H12 runs before it and not after it,
-# even though the list then stops being in numeric order: the number is a name, the position is a
-# cost decision, and H12's three short stacks are an estimated 60-80 s (the budget block above
-# h_H11 shows the arithmetic), which is worth spending before the soak rather than after it.
+# H11 goes last but one so its ten minutes are spent only after every fast row has reported, and
+# so an abort in it costs nothing but H17 (PHASE3 5.13). That is why H12 runs before it and not
+# after it, even though the list then stops being in numeric order: the number is a name, the
+# position is a cost decision, and H12's three short stacks are an estimated 60-80 s (the budget
+# block above h_H11 shows the arithmetic), which is worth spending before the soak rather than
+# after it. Phase 6's H13-H16 run before it for the same reason, and H15 and H16 above all: they
+# write EEPROM under a journal, and running them before the soak closes that journal long before
+# the ctest budget edge -- a ctest timeout ends this script without its EXIT trap (0.2.12), so the
+# only scenarios it can land in are H11 and H17, and neither holds a journal (R14). H17 is last
+# because it compares the EEPROM every other scenario left behind with the run's start.
 #
 # The report is NOT printed in this order, and nothing keeps the two orders in step. hil_gates.py's
 # run() walks its own CHECKERS tuple and prints the rows in THAT order (`for name, checker in
-# CHECKERS` at hil_gates.py:1880, the tuple at :1831-1833, which today is numeric); a scenario's
-# position in the line below is a cost decision and says nothing about where its rows land in
-# hil_check.txt. What the two lists do have to agree on is their MEMBERSHIP, and that is checked
-# rather than assumed: a scenario that ran on the bench and that no checker in CHECKERS claims
-# produces a FAIL row naming its directory (unchecked_rows(), hil_gates.py:1554-1580) -- the row
-# that exists because H12 was added here, given a controller YAML and its constants, and gated by
-# nothing at all.
-SCENARIOS=${WAVESHARE_HIL_SCENARIOS:-"H1 H1B H2 H3 H4 H5A H5B H5C H6 H7 H8 H9 H10 H12 H11"}
+# CHECKERS` at hil_gates.py:2520, the tuple at :2464-2467, which today is numeric); a
+# scenario's position in the line below is a cost decision and says nothing about where its rows
+# land in hil_check.txt. What the two lists do have to agree on is their MEMBERSHIP, and that is
+# checked rather than assumed, twice: a scenario that ran on the bench and that no checker in
+# CHECKERS claims produces a FAIL row naming its directory (unchecked_rows(),
+# hil_gates.py:2477-2503) -- the row that exists because H12 was added here, given a controller
+# YAML and its constants, and gated by nothing at all -- and the default list below is parsed by
+# the gate self-test and must name exactly CHECKERS' set (_self_test_scenario_membership, which
+# also holds H13-H16 before H11 and H17 last). The list is also handed to the gates as --expected,
+# so a scenario in it that left no directory and no abort is FAIL <name>.did_not_run.
+SCENARIOS=${WAVESHARE_HIL_SCENARIOS:-"H1 H1B H2 H3 H4 H5A H5B H5C H6 H7 H8 H9 H10 H12 H13 H14 H15 H16 H11 H17"}
 aborted_all=0
+abort_all_reason=
 for s in $SCENARIOS; do
   SCEN=run
   SDIR=$OUT
   if [ "$aborted_all" = 1 ]; then
-    abort_scenario "$s" "an earlier scenario left the port held by a process this suite may not kill"
+    abort_scenario "$s" "$abort_all_reason"
     continue
   fi
   hil_log "=== $s ==="
+  ABORT_REASON=
   "h_$s"
   rc=$?
   SCEN=run
   SDIR=$OUT
   hil_log "$s finished rc=$rc"
-  [ "$rc" = 2 ] && aborted_all=1
+  # 127 is bash's "command not found": a SCENARIOS name with no h_ function. Before Phase 6 that
+  # was a log line only, and the scenario a SKIP in the report; it is an abort now (E.2).
+  if [ "$rc" = 127 ]; then
+    if declare -F "h_$s" > /dev/null; then
+      abort_scenario "$s" "h_$s returned 127"
+    else
+      abort_scenario "$s" "no h_$s function"
+    fi
+  fi
+  # A 2 aborts every later scenario, carrying the reason the scenario gave (guard_end's "bench
+  # EEPROM not restored", guard_begin's unknown journal) rather than always the port-held text.
+  if [ "$rc" = 2 ]; then
+    aborted_all=1
+    abort_all_reason="after $s: ${ABORT_REASON:-an earlier scenario left the port held by a \
+process this suite may not kill}"
+  fi
 done
 
 SCEN=report
 SDIR=$OUT
 port_free=$([ -z "$(port_holders)" ] && echo true || echo false)
 elapsed=$((SECONDS - STARTED))
+# --expected: a scenario in the list that left no directory and no abort is FAIL did_not_run.
 $GATES --run-dir "$OUT" --allow-inconclusive "$HIL_INCONCLUSIVE_ALLOWED" \
-  --seconds "$((elapsed / 60))m$((elapsed % 60))s" --port-free "$port_free" |
+  --seconds "$((elapsed / 60))m$((elapsed % 60))s" --port-free "$port_free" \
+  --expected "$SCENARIOS" |
   tee "$OUT/hil_check.txt"
 rc=${PIPESTATUS[0]}
 hil_log "report written to $OUT/hil_check.txt and $OUT/hil_check.json (rc=$rc)"

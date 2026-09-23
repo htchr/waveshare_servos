@@ -421,25 +421,55 @@ Four things a reader could reasonably expect from the numbers above, and which n
 
 ## Additional Tools
 
-Also included are some helper functions wrapped in ros2 nodes for ease-of-use.
+Four command-line tools talk to the servos directly. Each takes the hardware interface's `port` (default `/dev/ttyACM0`) and `baudrate` (default `1000000`) parameters and takes the bus exclusively, exactly as the hardware interface does -- so **stop the controller manager first**: while anything holds the port a tool refuses with exit code 1 and names the process. The old parameter names `device_port` and `baud_rate` are refused, not ignored, and so is a parameter addressed to another node name.
 
-### Change Motor ID
+### Find the servos on a bus
 
-To control multiple motors, they will need different IDs.
+```bash
+ros2 run waveshare_servos scan --ros-args -p port:=/dev/ttyACM0
+```
 
-To set a new ID, plug in 1 motor at a time (make sure to turn off power in between), and run:
+Pings every id from 0 to 253 (about 4 s at 1 Mbaud) and prints one row per servo that answers: id, type, mode, model (registers 3-4), baud-rate register (and the rate it stands for), position, supply voltage, temperature, status byte and position offset. Read-only. Use the `id` column as `<param name="id">` and the `type` column (`pos` for a mode 0 servo, `vel` for mode 1) as `<param name="type">`. The hardware interface cannot use id 0; scan says so on that row.
+
+### Change a servo's id
+
+New servos all ship with the same id, and two servos on one id answer on top of each other -- no tool can tell them apart -- so connect only the servo you are renumbering (power off before plugging it in), then run:
 
 ```bash
 ros2 run waveshare_servos set_id --ros-args -p start_id:=<old> -p new_id:=<new>
 ```
 
-### Set Midpoint
+Both ids are required. `new_id` must be 1..253 and must not already answer, or set_id refuses and changes nothing. It checks that the servo answers on the new id and no longer on the old one, and that its other settings did not change. The id is stored in EEPROM: power-cycle the servo and run `scan` to confirm it survived.
 
-The following command will set the middle position (tick 2048, pi radians, 180 degrees) of a given motor:
+### Set the midpoint
 
 ```bash
 ros2 run waveshare_servos calibrate_midpoint --ros-args -p id:=<id>
 ```
+
+`id` is required. Makes the servo's present position read tick 2048 (pi rad, 180 degrees) and checks that it does. Position-mode (mode 0) servos only; a wheel is refused. The servo's torque is switched off first and left off, so an arm may sag; the hardware interface turns it back on when it activates. The servo's goal register keeps the value it had before the calibration, which now names a different angle, so the first activation afterwards can briefly move the joint toward it until the hardware interface's first command replaces it.
+
+### Reset a servo to its factory settings
+
+```bash
+ros2 run waveshare_servos factory_reset --ros-args -p id:=<id>
+```
+
+`id` is required. Sends the protocol's RESET instruction (0x06) to that one servo and checks the result by reading the servo back. On the ST3025 a reset puts every EEPROM setting back to its factory value except the id: the baud rate goes back to 1 Mbaud, the offset to 0 (undoing `calibrate_midpoint`), the mode to 0 (position), and the angle limits, protection limits and control gains to their defaults. The tool lists every register that changed. The servo keeps its id, so a reset cannot rescue a servo that answers at no id: `scan` has to find it first. Only the addressed servo is reset, never the whole bus, and the tool refuses if two servos may share that id. The torque is switched off first and left off. If the servo was at another baud rate, the tool follows it to 1 Mbaud to check it, and says so: `scan` and the hardware interface then need `baudrate` 1000000 for that servo. A joint declared `vel` gets its mode back when the hardware interface configures it.
+
+Exit codes, shared by all four tools:
+
+- 0: done and verified.
+- 1: the port is held by another process. Nothing was sent.
+- 2: the port cannot be opened, or it disappeared before anything was written.
+- 3: the servo did not answer (scan: none did).
+- 4: refused before any EEPROM write; calibrate_midpoint says so if it had already switched the torque off.
+- 5: a write (or factory_reset's reset) did not take, and the servo's EEPROM is as it was.
+- 6: the servo's state changed or is unknown. Read the message and run `scan`.
+- 7 (scan only): a servo answered oddly, for example two servos on one id, or unreadable registers.
+- 64: bad parameters. The port was not opened.
+- 70: an internal error. Please report it with the message.
+- 130: interrupted. scan stops between ids and prints what it found. set_id stops only before its first write, calibrate_midpoint only before it opens the EEPROM lock, and factory_reset only before it sends the reset (both say so if they had already switched the torque off); a signal after that is held until the change has been made and checked, and the EEPROM lock is closed.
 
 
 ## License
