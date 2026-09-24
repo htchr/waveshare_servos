@@ -29,7 +29,9 @@ endforeach()
 
 # Vendored Waveshare/Feetech SCServo library: third-party, read-only sources.
 # Built on its own so its warnings can be handled here instead of in the sources.
-# It is linked into the plugin and the tools, never installed or exported.
+# It is linked into the plugin and the tools, and the library is never installed or exported; its
+# headers are, because the plugin's public header includes servo_bus.hpp, which includes SMS_STS.h
+# (and so SCSerial.h, SCS.h and INST.h).
 add_library(scservo STATIC
   src/SCS.cpp
   src/SCSCL.cpp
@@ -80,10 +82,10 @@ target_link_libraries(waveshare_servos
     servo_bus
 )
 
-# Tools (jazzy.md Phase 6). Their logic is a ROS-free library the tests drive against the fake
-# bus in-process; each executable is one line. They reach the bus only through servo_bus, which
-# PUBLIC-links the same scservo target as the plugin (Phase 6 item 4), so they take the same
-# exclusive lock and are refused while the controller manager holds the port.
+# Tools. Their logic is a ROS-free library the tests drive against the fake bus in-process; each
+# executable is one line. They reach the bus only through servo_bus, which PUBLIC-links the same
+# scservo target as the plugin, so they take the same exclusive lock and are refused while the
+# controller manager holds the port.
 add_library(servo_tools STATIC src/servo_tools.cpp)
 set_target_properties(servo_tools PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_compile_features(servo_tools PUBLIC cxx_std_17)
@@ -92,7 +94,7 @@ target_link_libraries(servo_tools PUBLIC servo_bus)
 
 # tool_main.cpp reads the global parameter overrides through rcl's own API
 # (rcl_arguments_get_param_overrides, rcl_yaml_node_struct_fini), so it names rcl and
-# rcl_yaml_param_parser itself rather than leaning on rclcpp to carry them (review fix F33).
+# rcl_yaml_param_parser itself rather than leaning on rclcpp to carry them.
 find_package(rcl REQUIRED)
 find_package(rcl_yaml_param_parser REQUIRED)
 add_library(tool_cli STATIC src/tool_params.cpp src/tool_main.cpp)
@@ -137,6 +139,8 @@ install(
   TARGETS scan set_id calibrate_midpoint factory_reset
   DESTINATION lib/${PROJECT_NAME}
 )
+install(FILES LICENSE THIRD_PARTY.md DESTINATION share/${PROJECT_NAME})
+install(FILES LICENSES/Apache-2.0.txt DESTINATION share/${PROJECT_NAME}/LICENSES)
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gmock REQUIRED)
@@ -162,7 +166,8 @@ if(BUILD_TESTING)
   # (add_launch_test.cmake:62-69).
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
-  # The sources carry no license header, so the two linters that ask for one are
+  # The package's own sources carry no license header (two keep an upstream
+  # Apache-2.0 header; see THIRD_PARTY.md), so the two linters that ask for one are
   # switched off: ament_copyright entirely, and cpplint's legal/copyright rule.
   # The license of the package is declared in package.xml and LICENSE.
   set(ament_cmake_copyright_FOUND TRUE)
@@ -187,6 +192,14 @@ if(BUILD_TESTING)
     src/SMSCL.cpp
     src/SMS_STS.cpp
   )
+  # This find_package()s every <test_depend> in package.xml, QUIET. A test_depend whose CMake
+  # config warns therefore puts that warning in this package's build, and controller_manager is one:
+  # find_package(controller_manager) reaches tl_expected through parameter_traits, which prints a
+  # CMake deprecation warning (measured on Jazzy, 2026-09: build stderr goes from 0 to 944 bytes).
+  # That is why package.xml declares controller_manager as an <exec_depend> only, although
+  # test/test_example_launch.py imports it. `rosdep install` installs every dependency type except
+  # doc, so a clean checkout still gets it. Python-only test dependencies install no CMake config,
+  # so find_package() finds nothing for them and prints nothing.
   ament_lint_auto_find_test_dependencies()
 
   # cpplint, registered here rather than by ament_lint_auto so its copyright rule
@@ -282,7 +295,7 @@ if(BUILD_TESTING)
   target_link_libraries(test_tool_params tool_cli)
 
   # The tools' bus logic against the fake bus, in-process. TIMEOUT 240, not the default 60: every
-  # scan case pings all 254 ids three times at 5 ms (C.1, about 3.8 s a scan), and there are a
+  # scan case pings all 254 ids three times at 5 ms (about 3.8 s a scan), and there are a
   # dozen of them.
   ament_add_gmock(test_servo_tools test/test_servo_tools.cpp TIMEOUT 240)
   target_link_libraries(test_servo_tools servo_tools)
@@ -312,6 +325,12 @@ if(BUILD_TESTING)
   # ament_add_pytest_test() checks the path itself and stops the configure with a FATAL_ERROR if
   # it is missing (ament_add_pytest_test.cmake:64-71).
   ament_add_pytest_test(test_urdf_xacro test/test_urdf_xacro.py TIMEOUT 60)
+
+  # The release documents, checked against the code and the vendored files: no motors, no port,
+  # no ROS graph. Each reads the source tree through its own __file__.
+  ament_add_pytest_test(test_release_metadata test/test_release_metadata.py TIMEOUT 60)
+  ament_add_pytest_test(test_readme test/test_readme.py TIMEOUT 60)
+  ament_add_pytest_test(test_vendored_files test/test_vendored_files.py TIMEOUT 60)
 
   # Brings the example up on mock hardware and waits for the controllers to become active. It is
   # the only motorless test that runs the real bringup -- ros2_control_node, robot_state_publisher
@@ -376,7 +395,7 @@ if(BUILD_TESTING)
   target_link_libraries(hil_eeprom servo_bus)
   target_include_directories(hil_eeprom PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test/hil)
   # TIMEOUT 180, not the default 60: every restore case pays for hil_eeprom's own census, 254 ids
-  # at two 5 ms pings each (E.1), before and after its writes -- 2.5 s a census, 56 s in all,
+  # at two 5 ms pings each, before and after its writes -- 2.5 s a census, 56 s in all,
   # measured.
   ament_add_gmock(test_hil_eeprom test/test_hil_eeprom.cpp test/hil/eeprom_core.cpp TIMEOUT 180
     ENV "WAVESHARE_HIL_EEPROM_BIN=$<TARGET_FILE:hil_eeprom>")
@@ -392,7 +411,7 @@ if(BUILD_TESTING)
 
   # The gate logic is the part of the bench check that can be proved without a bench: the
   # self-test runs the three invariant gates over synthetic series with injected defects and
-  # needs no hardware, no ROS and no run directory (PHASE2_SPEC 11.2, 12.3).
+  # needs no hardware, no ROS and no run directory.
   ament_add_test(hil_gates_self_test
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test/hil/hil_gates.py"
             --self-test
@@ -413,7 +432,7 @@ if(BUILD_TESTING)
         "WAVESHARE_HIL_EEPROM=$<TARGET_FILE:hil_eeprom>"
         "WAVESHARE_HIL_HELPERS=${CMAKE_CURRENT_SOURCE_DIR}/test/hil"
     SKIP_RETURN_CODE 77
-    # Added in Phase 5, and it fixes a real defect rather than tidying one. The script writes its
+    # It fixes a real defect rather than tidying one. The script writes its
     # own report (hil_check.txt / hil_check.json) but never a JUnit file, so the RESULT_FILE above
     # was always absent afterwards -- and without this flag ament treats an absent result file as
     # an error even when the command exited 0, synthesising

@@ -55,7 +55,8 @@
                          io_timeout_ms 5, ping_attempts 3, max_read_fails 50,
                          allow_missing_servos false, protocol sms_sts, feedback_mode auto,
                          encoder_steps 4096, current_per_count_a 0.006,
-                         torque_constant_nm_per_a 0.8825985 -->
+                         torque_constant_nm_per_a 0.8825985. Each is described in the README,
+                         "Hardware parameters". -->
                 </xacro:unless>
             </hardware>
 
@@ -68,7 +69,9 @@
                  is what the framework enforces, and a disagreement makes the description behave
                  differently depending on a controller-manager flag. They only bite when the
                  controller manager runs with enforce_command_limits: true; this example ships with
-                 it off, and the driver clamps position commands to these same values on its own. -->
+                 it off, and the driver clamps position commands to these same values on its own.
+                 The driver ignores the velocity min/max: a wheel's speed is bounded by its
+                 joint's max_speed (9.2039 rad/s by default). -->
             <joint name="joint1">
                 <param name="id">1</param>
                 <param name="type">pos</param>
@@ -122,8 +125,8 @@
                  joints because the reference bench carries four servos (ids 1-4), and a
                  three-joint example on a four-servo bus leaves one servo unread and unwritten.
                  A mirrored wheel pair is what `inverted` exists for - the right-hand wheel of a
-                 differential drive would add a param inverted of true, which flips its two
-                 command interfaces together with its position, velocity and load states, so that
+                 differential drive would add <param name="inverted">true</param>, which flips its
+                 velocity command together with its position, velocity and load states, so that
                  one positive velocity drives the pair forward. It is deliberately left off here,
                  because the URDF beside this file is a serial chain rather than a mirrored pair,
                  so an inverted joint4 would spin its servo opposite to the model RViz draws, and

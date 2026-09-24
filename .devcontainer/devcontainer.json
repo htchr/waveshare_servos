@@ -5,6 +5,9 @@
   "runArgs": [
     "--privileged",
     "--network=host",
+    "--cap-add=sys_nice",
+    "--ulimit", "rtprio=99",
+    "--ulimit", "memlock=-1",
     "-e", "DISPLAY=${localEnv:DISPLAY}"
   ],
   "workspaceMount": "source=${localWorkspaceFolder},target=/home/ubuntu/waveshare_ws/src/waveshare_servos,type=bind",

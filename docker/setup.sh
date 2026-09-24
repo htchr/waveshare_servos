@@ -10,6 +10,8 @@ if [ ! -w "$WS" ]; then
 fi
 
 source "/opt/ros/$ROS_DISTRO/setup.bash"
+echo "RT limits in this container: rtprio=$(ulimit -r) memlock=$(ulimit -l) (want 99 / unlimited)"
+id -nG | grep -qw dialout || echo "WARNING: $(id -un) is not in dialout"
 cd "$WS"
-rosdep install --from-paths ./src --ignore-src -r -y
+rosdep install --from-paths ./src --ignore-src -y
 colcon build --symlink-install

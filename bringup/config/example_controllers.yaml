@@ -13,13 +13,14 @@ controller_manager:
     # command produces no error. Both halves measured on 4.48.0.
     #
     # Reasons to leave it off in an example: the driver already clamps position commands to the
-    # <command_interface> min/max and bounds goal speed at the servo's 6000-count ceiling, so
-    # nothing is left unprotected; and with it on, a position joint whose MEASURED position is more
-    # than 0.0087 rad outside its URDF <limit> makes the JointSaturationLimiter throw and the
-    # controller manager deactivate the controller - so a servo somebody moved by hand would stop
-    # the demo instead of being clamped, pre-empting the driver's gentler "hold where you started"
-    # behaviour. test/hil/controllers/bench.yaml keeps it off too. Turn it on once you know your
-    # servos start inside their declared range.
+    # <command_interface> min/max and bounds goal speed at each joint's max_speed (6000 steps/s,
+    # 9.2 rad/s, by default), so nothing is left unprotected; and with it on, a position joint
+    # whose MEASURED position is more than 0.0087 rad outside its limits makes the
+    # JointSaturationLimiter throw, which nothing in the controller manager's loop catches
+    # (ros2_control 4.48, read from its source), so a servo somebody moved by hand would abort
+    # ros2_control_node instead of being clamped, pre-empting the driver's gentler "hold where you
+    # started" behaviour. test/hil/controllers/bench.yaml keeps it off too. Turn it on once you know
+    # your servos start inside their declared range.
     enforce_command_limits: false
 
     joint_state_broadcaster:
@@ -139,9 +140,9 @@ diff_drive_controller:
     # Each limit on its own stays inside the 9.2 rad/s the wheel command interfaces declare:
     # linear.x 0.4 m/s is 8.0 rad/s per wheel, angular.z 2.0 rad/s is +-4.0 rad/s per wheel. The two
     # COMBINED are not bounded by either: linear.x 0.4 with angular.z 2.0 asks for 12.0 rad/s on the
-    # outer wheel, which the driver clamps at its 6000-count ceiling (9.2038847 rad/s) and which
-    # enforce_command_limits: true would clamp at 9.2. Pick a pair whose sum fits if you need these
-    # limits to be the only clamp.
+    # outer wheel, which the driver clamps at the joint's max_speed (9.2038847 rad/s by default)
+    # and which enforce_command_limits: true would clamp at 9.2. Pick a pair whose sum fits if you
+    # need these limits to be the only clamp.
     linear.x.max_velocity: 0.4
     linear.x.min_velocity: -0.4
     linear.x.max_acceleration: 1.0

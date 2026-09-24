@@ -22,12 +22,13 @@
     </link>
 
     <!-- effort and velocity below are declared caps, not measured figures: 9.2 rad/s is just under
-         the servo's 6000-count goal-speed ceiling (9.2038847 rad/s) and 1.0 N m is the same cap the
-         hardware-verified bench description under test/hil declares. Keep them numerically equal to
-         the <command_interface> min/max in the ros2_control block beside this file: ros2_control
-         merges the two and enforces whichever is tighter. lower/upper are read only for revolute
-         and prismatic joints and are silently discarded for continuous ones, which is why joint3
-         and joint4 declare none - a wheel joint's position is unbounded once the driver unwraps it.
+         the driver's default max_speed, 6000 steps/s (9.2038847 rad/s), and 1.0 N m is the same
+         cap the hardware-verified bench description under test/hil declares. Keep them
+         numerically equal to the <command_interface> min/max in the ros2_control block beside
+         this file: ros2_control merges the two and enforces whichever is tighter. lower/upper are
+         read only for revolute and prismatic joints and are silently discarded for continuous
+         ones, which is why joint3 and joint4 declare none - a wheel joint's position is unbounded
+         once the driver unwraps it.
          The <limit> element itself is kept on the wheels on purpose: a joint_trajectory_controller
          older than 4.42.0 dereferences a null limits pointer at load time when a continuous joint
          has none. -->
@@ -105,6 +106,8 @@
         </visual>
     </link>
 
+    <!-- A copy of this file must include its own copy of the ros2_control file: change the
+         package name in this line. -->
     <xacro:include filename="$(find waveshare_servos)/description/ros2_control/example.ros2_control.xacro"/>
 
     <xacro:example_ws_ros2_control name="example_ws_ros2_control"

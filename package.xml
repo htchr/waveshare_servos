@@ -2,99 +2,84 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>waveshare_servos</name>
-  <version>0.1.0</version>
-  <description>ros2_control package for Waveshare ST servo motors</description>
+  <version>1.0.0</version>
+  <description>
+    ros2_control hardware interface for Waveshare ST series serial bus servos (Feetech SMS/STS
+    protocol), tested with the ST3025 on the Waveshare Bus Servo Adapter. Position and velocity
+    joints, multi-turn wheel positions, synchronized bus reads and writes, and command-line tools
+    to scan a bus, change a servo id, calibrate the midpoint and factory-reset a servo.
+  </description>
   <maintainer email="jhat@uw.edu">lab</maintainer>
-  <license>GPL-3.0-or-later</license>
+  <license file="LICENSE">GPL-3.0-or-later</license>
+  <!-- bringup/launch/example.launch.py and include/visibility_controls.h carry Apache-2.0
+       headers (see THIRD_PARTY.md). -->
+  <license file="LICENSES/Apache-2.0.txt">Apache-2.0</license>
+  <url type="repository">https://github.com/htchr/waveshare_servos</url>
+  <url type="bugtracker">https://github.com/htchr/waveshare_servos/issues</url>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
 
+  <!-- The plugin and its public header. -->
   <depend>hardware_interface</depend>
   <depend>pluginlib</depend>
   <depend>rclcpp</depend>
   <depend>rclcpp_lifecycle</depend>
-  <!-- The tools read rcl's global parameter overrides directly (src/tool_main.cpp,
-       test/test_tool_params.cpp): rcl_arguments_get_param_overrides and
-       rcl_yaml_node_struct_fini. rclcpp re-exports both packages today; they are declared
-       because this package calls them. -->
+  <!-- The tools read rcl's global parameter overrides directly (src/tool_main.cpp). -->
   <depend>rcl</depend>
   <depend>rcl_yaml_param_parser</depend>
 
-  <test_depend>ament_cmake_gmock</test_depend>
-  <test_depend>ament_lint_auto</test_depend>
-  <test_depend>ament_lint_common</test_depend>
-  <test_depend>ros2_control_test_assets</test_depend>
-
-  <!-- test/hil/hil_record.py, the recorder of the hil_check bench test, imports all five of
-       these, and only when that test actually runs against hardware.
-
-       Two of them have a SECOND user since Phase 5, and it is not hardware-gated: rclpy is
-       imported at module scope by test/test_example_launch.py (it creates the node the service
-       calls there reuse), and sensor_msgs is imported at module scope by
-       controller_manager.test_utils (test_utils.py:34, `from sensor_msgs.msg import
-       JointState`), which that same test imports. So rclpy and sensor_msgs are needed by every
-       run of the launch test, motors or no motors; dropping them because hil_check skips would
-       break test_example_launch at its first import on a clean checkout. control_msgs,
-       std_msgs and trajectory_msgs are still hil_record.py's alone. -->
-  <test_depend>control_msgs</test_depend>
-  <test_depend>rclpy</test_depend>
-  <test_depend>sensor_msgs</test_depend>
-  <test_depend>std_msgs</test_depend>
-  <test_depend>trajectory_msgs</test_depend>
-
-  <!-- The two motorless tests added in Phase 5: test/test_urdf_xacro.py, which renders the
-       example description with xacro and reads the XML back, and test/test_example_launch.py,
-       which brings the example up on mock hardware. ament_cmake_pytest and
-       launch_testing_ament_cmake provide the CMake functions that register the two
-       (ament_add_pytest_test, add_launch_test); launch_testing and launch are imported by the
-       launch test, ament_index_python by both, and xacro by both as well (the launch test's
-       pre-flight guard renders the description before it will let the launch start).
-       launch_testing_ros is imported by neither, but controller_manager.test_utils imports it at
-       module scope (test_utils.py:33, `from launch_testing_ros import WaitForTopics`), so the
-       launch test's very first import fails without it. xacro is exec_depend below as well; it is
-       repeated here because it is the one dependency a test needs that nothing in the build or
-       the runtime pulls in on its own, and the duplication costs nothing.
-
-       launch is listed even though launch_testing already depends on it, because a test that
-       writes `from launch import LaunchDescription` should declare launch. The usual objection
-       to adding a test_depend does not apply here, and this was measured rather than assumed:
-       ament_lint_auto_find_test_dependencies() calls find_package(${dep} QUIET) for every
-       <test_depend> (ament_lint_auto_find_test_dependencies.cmake:35-40), and `launch` is an
-       ament_python package that installs no CMake config at all (there is no
-       /opt/ros/jazzy/share/launch/cmake), so that call finds nothing, says nothing and leaves
-       launch_FOUND unset; a probe project configured with find_package(ament_cmake REQUIRED)
-       followed by find_package(launch QUIET) printed launch_FOUND=0 with a 0-byte stderr, the
-       same as the launch_testing entry already here. Contrast controller_manager below, which
-       does ship a config and does cost a warning.
-
-       controller_manager is DELIBERATELY NOT REPEATED HERE, though test/test_example_launch.py
-       imports it. ament_lint_auto_find_test_dependencies() find_package()es every <test_depend>
-       (ament_lint_auto_find_test_dependencies.cmake:35-40), and find_package(controller_manager)
-       reaches tl_expected through parameter_traits, which prints a CMake deprecation warning.
-       Measured, not assumed: adding the line takes this package's build stderr.log from 0 bytes
-       to that warning, and removing it takes it back to 0 bytes. jazzy.md makes a warning-free
-       build a phase gate, and the dependency is already covered anyway: controller_manager is an
-       <exec_depend> below, and `rosdep install` installs every dependency type except doc by
-       default, so a clean checkout resolves it regardless. Re-adding it buys nothing and costs
-       the gate. -->
-  <test_depend>ament_cmake_pytest</test_depend>
-  <test_depend>ament_index_python</test_depend>
-  <test_depend>launch</test_depend>
-  <test_depend>launch_testing</test_depend>
-  <test_depend>launch_testing_ament_cmake</test_depend>
-  <test_depend>launch_testing_ros</test_depend>
-  <test_depend>xacro</test_depend>
-
+  <!-- The example bringup (launch/, config/, description/) and the ros2 commands the README
+       tells you to run. -->
   <exec_depend>controller_manager</exec_depend>
   <exec_depend>diff_drive_controller</exec_depend>
   <exec_depend>joint_state_broadcaster</exec_depend>
   <exec_depend>joint_trajectory_controller</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
   <exec_depend>robot_state_publisher</exec_depend>
   <exec_depend>ros2controlcli</exec_depend>
   <exec_depend>ros2launch</exec_depend>
+  <exec_depend>ros2run</exec_depend>
+  <exec_depend>ros2topic</exec_depend>
   <exec_depend>rviz2</exec_depend>
   <exec_depend>velocity_controllers</exec_depend>
   <exec_depend>xacro</exec_depend>
+
+  <!-- Test-only dependencies. The tests also use controller_manager, launch, launch_ros and
+       xacro: those are exec_depends above and are not repeated, because `rosdep install`
+       installs every dependency type except doc, and a test_depend on controller_manager puts a
+       CMake warning in the build (see ament_lint_auto_find_test_dependencies() in
+       CMakeLists.txt). -->
+  <!-- Test build tooling. CMakeLists.txt registers cpplint itself, without its copyright rule. -->
+  <test_depend>ament_cmake_cpplint</test_depend>
+  <test_depend>ament_cmake_gmock</test_depend>
+  <test_depend>ament_cmake_pytest</test_depend>
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+  <test_depend>launch_testing_ament_cmake</test_depend>
+  <!-- The gmock tests (test/*.cpp). -->
+  <test_depend>lifecycle_msgs</test_depend>
+  <test_depend>rcutils</test_depend>
+  <test_depend>ros2_control_test_assets</test_depend>
+  <!-- The Python tests. launch_testing_ros and sensor_msgs are imported by
+       controller_manager.test_utils, which test_example_launch.py imports, so every run of that
+       test needs them, motors or not. -->
+  <test_depend>ament_index_python</test_depend>
+  <test_depend>launch_testing</test_depend>
+  <test_depend>launch_testing_ros</test_depend>
+  <test_depend>python3-pytest</test_depend>
+  <test_depend>rclpy</test_depend>
+  <test_depend>sensor_msgs</test_depend>
+  <!-- test/test_release_metadata.py -->
+  <test_depend>python3-catkin-pkg-modules</test_depend>
+  <test_depend>python3-docutils</test_depend>
+  <!-- The bench test: test/hil_check.sh and its recorder test/hil/hil_record.py (which also
+       uses rclpy and sensor_msgs). -->
+  <test_depend>builtin_interfaces</test_depend>
+  <test_depend>control_msgs</test_depend>
+  <test_depend>python3-yaml</test_depend>
+  <test_depend>std_msgs</test_depend>
+  <test_depend>trajectory_msgs</test_depend>
 
   <export>
     <build_type>ament_cmake</build_type>
