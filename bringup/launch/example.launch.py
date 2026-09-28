@@ -14,140 +14,146 @@
 
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, RegisterEventHandler, TimerAction
+from launch.actions import DeclareLaunchArgument
 from launch.conditions import IfCondition
-from launch.event_handlers import OnProcessExit
 from launch.substitutions import Command, FindExecutable, LaunchConfiguration, PathJoinSubstitution
 
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
 
 
 def generate_launch_description():
-    # Declare arguments
-    declared_arguments = []
-    declared_arguments.append(
+    declared_arguments = [
         DeclareLaunchArgument(
-            "gui",
-            default_value="true",
-            description="Start RViz2 automatically with this launch file.",
-        )
-    )
+            'port',
+            default_value='/dev/ttyACM0',
+            description='Serial port of the bus servo adapter. Ignored under mock hardware.',
+        ),
+        DeclareLaunchArgument(
+            'baudrate',
+            default_value='1000000',
+            description='Bus baud rate. Ignored under mock hardware.',
+        ),
+        DeclareLaunchArgument(
+            'use_mock_hardware',
+            default_value='false',
+            description='Swap the driver for mock_components/GenericSystem, which opens no '
+                        'serial port. Accepts true, false, 1 or 0 in any case; any other value '
+                        'aborts the xacro render, and with it the launch.',
+        ),
+        DeclareLaunchArgument(
+            'gui',
+            default_value='true',
+            description='Start RViz2 automatically with this launch file.',
+        ),
+    ]
 
-    # Initialize Arguments
-    gui = LaunchConfiguration("gui")
+    port = LaunchConfiguration('port')
+    baudrate = LaunchConfiguration('baudrate')
+    use_mock_hardware = LaunchConfiguration('use_mock_hardware')
+    gui = LaunchConfiguration('gui')
 
-    # Get URDF via xacro
+    # Command joins this list with no separator, so each space is its own element. xacro ignores
+    # an undeclared arg silently, so example.urdf.xacro must declare all three.
     robot_description_content = Command(
         [
-            PathJoinSubstitution([FindExecutable(name="xacro")]),
-            " ",
+            PathJoinSubstitution([FindExecutable(name='xacro')]),
+            ' ',
             PathJoinSubstitution(
                 [
-                    FindPackageShare("waveshare_servos"),
-                    "urdf",
-                    "example.urdf.xacro",
+                    FindPackageShare('waveshare_servos'),
+                    'description',
+                    'urdf',
+                    'example.urdf.xacro',
                 ]
             ),
+            ' ', 'port:=', port,
+            ' ', 'baudrate:=', baudrate,
+            ' ', 'use_mock_hardware:=', use_mock_hardware,
         ]
     )
-    robot_description = {"robot_description": robot_description_content}
+    # value_type=str: the URDF is XML, and launch would otherwise YAML-parse it (a colon in an
+    # XML comment aborts the launch).
+    robot_description = {
+        'robot_description': ParameterValue(robot_description_content, value_type=str)
+    }
 
     robot_controllers = PathJoinSubstitution(
         [
-            FindPackageShare("waveshare_servos"),
-            "config",
-            "example_controllers.yaml",
+            FindPackageShare('waveshare_servos'),
+            'config',
+            'example_controllers.yaml',
         ]
     )
     rviz_config_file = PathJoinSubstitution(
-        [FindPackageShare("waveshare_servos"), "description/rviz", "example_ws.rviz"]
+        [FindPackageShare('waveshare_servos'), 'description/rviz', 'example_ws.rviz']
     )
 
+    # Takes the URDF from robot_state_publisher's transient-local /robot_description; no remap.
+    # output='both' also shows the vendored serial layer's raw stdout.
     control_node = Node(
-        package="controller_manager",
-        executable="ros2_control_node",
+        package='controller_manager',
+        executable='ros2_control_node',
         parameters=[robot_controllers],
-        output="log",
-        remappings=[
-            ("~/robot_description", "/robot_description"),
-        ],
+        output='both',
     )
     robot_state_pub_node = Node(
-        package="robot_state_publisher",
-        executable="robot_state_publisher",
-        output="both",
+        package='robot_state_publisher',
+        executable='robot_state_publisher',
+        output='both',
         parameters=[robot_description],
     )
+    # example_ws.rviz reads /robot_description as Transient Local; with Volatile, RViz would show
+    # no model and no error.
     rviz_node = Node(
-        package="rviz2",
-        executable="rviz2",
-        name="rviz2",
-        output="log",
-        arguments=["-d", rviz_config_file],
-        condition=IfCondition(gui),
-    )
-    
-    joint_state_publisher_node = Node(
-        package="joint_state_publisher_gui",
-        executable="joint_state_publisher_gui",
+        package='rviz2',
+        executable='rviz2',
+        name='rviz2',
+        output='both',
+        arguments=['-d', rviz_config_file],
         condition=IfCondition(gui),
     )
 
-    joint_state_broadcaster_spawner = Node(
-        package="controller_manager",
-        executable="spawner",
-        arguments=["joint_state_broadcaster", "--controller-manager", "/controller_manager"],
+    # One switch per controller, in this order (no --activate-as-group), so one failure does not
+    # stop the others. The spawner waits for the controller manager with no timeout.
+    controller_spawner = Node(
+        package='controller_manager',
+        executable='spawner',
+        output='both',
+        arguments=[
+            'joint_state_broadcaster',
+            'joint_trajectory_position_controller',
+            'joint_velocity_controller',
+            '--controller-manager',
+            '/controller_manager',
+            '--param-file',
+            robot_controllers,
+        ],
     )
 
-    pos_controller_spawner = Node(
-        package="controller_manager",
-        executable="spawner",
-        arguments=["joint_trajectory_position_controller", "--controller-manager", "/controller_manager"],
-    )
-    
-    vel_controller_spawner = Node(
-        package="controller_manager",
-        executable="spawner",
-        arguments=["joint_trajectory_velocity_controller", "--controller-manager", "/controller_manager"],
-    )
-
-    # Delay rviz start after `joint_state_broadcaster`
-    delay_rviz_after_joint_state_broadcaster_spawner = RegisterEventHandler(
-        event_handler=OnProcessExit(
-            target_action=joint_state_broadcaster_spawner,
-            on_exit=[rviz_node],
-        )
-    )
-
-    # delay_joint_state_publisher_gui_after_joint_state_broad_spawn = RegisterEventHandler(
-    #     event_handler=OnProcessExit(
-    #         target_action=joint_state_broadcaster_spawner,
-    #         on_exit=[joint_state_publisher_node],
-    #     )
-    # )
-
-    # Delay start of joint_state_broadcaster after `robot_controller`
-    # TODO(anyone): This is a workaround for flaky tests. Remove when fixed.
-    delay_joint_state_broadcaster_after_robot_controller_spawner = RegisterEventHandler(
-        event_handler=OnProcessExit(
-            target_action=vel_controller_spawner,
-            on_exit=[TimerAction(period=5.0, actions=[joint_state_broadcaster_spawner])],
-        )
+    # Inactive, so it claims nothing and the two spawners may run in either order; it shares
+    # joint3/joint4 with joint_velocity_controller. See docs/setup.md, "Drive a differential base".
+    diff_drive_spawner = Node(
+        package='controller_manager',
+        executable='spawner',
+        output='both',
+        arguments=[
+            'diff_drive_controller',
+            '--inactive',
+            '--controller-manager',
+            '/controller_manager',
+            '--param-file',
+            robot_controllers,
+        ],
     )
 
     nodes = [
         control_node,
         robot_state_pub_node,
-        pos_controller_spawner,
-        vel_controller_spawner,
-        delay_rviz_after_joint_state_broadcaster_spawner,
-        # delay_joint_state_publisher_gui_after_joint_state_broad_spawn,
-        delay_joint_state_broadcaster_after_robot_controller_spawner,
+        rviz_node,
+        controller_spawner,
+        diff_drive_spawner,
     ]
-
-    print(f"Nodes: {nodes}")
-    print(f"robot_description: {robot_description}")
-    print(f"robot_controllers: {robot_controllers}")
 
     return LaunchDescription(declared_arguments + nodes)

@@ -2,14 +2,23 @@ controller_manager:
   ros__parameters:
     update_rate: 100
 
+    # Off (the default). On, a position servo that starts outside its limits would abort
+    # ros2_control_node. See docs/configuration.md, "Command interfaces and limits".
+    enforce_command_limits: false
+
     joint_state_broadcaster:
       type: joint_state_broadcaster/JointStateBroadcaster
 
     joint_trajectory_position_controller:
       type: joint_trajectory_controller/JointTrajectoryController
 
-    joint_trajectory_velocity_controller:
-      type: joint_trajectory_controller/JointTrajectoryController
+    joint_velocity_controller:
+      type: velocity_controllers/JointGroupVelocityController
+
+    # Loaded by example.launch.py but left inactive - see the block at the bottom of this file.
+    # Ships in its own apt package: sudo apt install ros-jazzy-diff-drive-controller.
+    diff_drive_controller:
+      type: diff_drive_controller/DiffDriveController
 
 joint_trajectory_position_controller:
   ros__parameters:
@@ -20,39 +29,62 @@ joint_trajectory_position_controller:
     command_interfaces:
       - position
       - velocity
-    
+
     state_interfaces:
       - position
       - velocity
-    
-    state_publish_rate: 200.0
+
     action_monitor_rate: 100.0
 
     allow_partial_joints_goal: true
-    open_loop_control: false
+    interpolate_from_desired_state: false
     allow_integration_in_goal_trajectories: true
     constraints:
       stopped_velocity_tolerance: 0.01 # Defaults to 0.01
       goal_time: 0.0 # Defaults to 0.0 (start immediately)
 
-joint_trajectory_velocity_controller:
+# Velocity passthrough, held until the next command. Not a JointTrajectoryController: it crashes
+# ros2_control_node on velocity-only trajectories. See docs/operation.md, "Known issues".
+joint_velocity_controller:
   ros__parameters:
     joints:
       - joint3
-    
-    command_interfaces:
-      - velocity
-    
-    state_interfaces:
-      - position
-      - velocity
+      - joint4
 
-    state_publish_rate: 200.0 # Defaults to 50
-    action_monitor_rate: 20.0 # Defaults to 20
+# Optional demo: joint3/joint4 as a differential base; wheel_radius and wheel_separation are
+# example values. See docs/setup.md, "Drive a differential base".
+diff_drive_controller:
+  ros__parameters:
+    left_wheel_names: ["joint3"]
+    right_wheel_names: ["joint4"]
 
-    allow_partial_joints_goal: false # Defaults to false
-    open_loop_control: true
-    allow_integration_in_goal_trajectories: true
-    constraints:
-      stopped_velocity_tolerance: 0.01 # Defaults to 0.01
-      goal_time: 0.0 # Defaults to 0.0 (start immediately)
+    wheel_separation: 0.20
+    wheel_radius: 0.05
+
+    publish_rate: 50.0
+    odom_frame_id: odom
+    base_frame_id: base_link
+    pose_covariance_diagonal: [0.001, 0.001, 0.001, 0.001, 0.001, 0.01]
+    twist_covariance_diagonal: [0.001, 0.001, 0.001, 0.001, 0.001, 0.01]
+
+    # position_feedback reads the unwrapped multi-turn wheel position; a wrapping position would
+    # add a jump of one wheel circumference per revolution.
+    open_loop: false
+    position_feedback: true
+    enable_odom_tf: true
+
+    cmd_vel_timeout: 0.5
+    publish_limited_velocity: false
+    velocity_rolling_window_size: 10
+
+    # Body-frame limits; omit one to disable it. Do not add the deprecated has_*_limits. Both
+    # maxima at once ask 12 rad/s of a wheel; the driver clamps that at max_speed (9.2 by default).
+    linear.x.max_velocity: 0.4
+    linear.x.min_velocity: -0.4
+    linear.x.max_acceleration: 1.0
+    linear.x.max_deceleration: -1.0
+
+    angular.z.max_velocity: 2.0
+    angular.z.min_velocity: -2.0
+    angular.z.max_acceleration: 4.0
+    angular.z.max_deceleration: -4.0

@@ -1,17 +1,35 @@
 <?xml version="1.0"?>
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro">
 
-    <xacro:macro name="example_ws_ros2_control" params="name prefix">
+    <xacro:macro name="example_ws_ros2_control"
+                 params="name port:=/dev/ttyACM0 baudrate:=1000000 use_mock_hardware:=false">
 
+        <!-- true/false/1/0 in any case. Any other value aborts the render (exit 2), so a typo
+             such as 'yes' cannot silently open the real port. -->
+        <xacro:property name="mock"
+            value="${['false', '0', 'true', '1'].index(str(use_mock_hardware).strip().lower()) >= 2}"/>
+
+        <!-- Optional attributes of this tag, such as rw_rate="50" is_async="true"; the parser
+             drops a misspelt one silently. See docs/bus-timing.md, "rw_rate and is_async". -->
         <ros2_control name="${name}" type="system">
             <hardware>
-                <plugin>waveshare_servos/WaveshareServos</plugin>
-                <param name="example_param_hw_start_duration_sec">0</param>
-                <param name="example_param_hw_stop_duration_sec">3.0</param>
-                <param name="example_param_hw_slowdown">100</param>
+                <!-- Mock hardware opens no port, and wheel positions stay at zero; do not
+                     add calculate_dynamics. See docs/setup.md, "Try it without hardware". -->
+                <xacro:if value="${mock}">
+                    <plugin>mock_components/GenericSystem</plugin>
+                </xacro:if>
+                <xacro:unless value="${mock}">
+                    <plugin>waveshare_servos/WaveshareServos</plugin>
+                    <param name="port">${port}</param>
+                    <param name="baudrate">${baudrate}</param>
+                    <!-- The other hardware params keep their defaults on purpose.
+                         See docs/configuration.md, "Hardware parameters". -->
+                </xacro:unless>
             </hardware>
-        
-            <joint name="${prefix}joint1">
+
+            <!-- Any subset of the state interfaces, in any order. Keep min/max equal to the URDF
+                 <limit>. See docs/configuration.md, "Command interfaces and limits". -->
+            <joint name="joint1">
                 <param name="id">1</param>
                 <param name="type">pos</param>
                 <param name="offset">1.570796</param>
@@ -25,11 +43,11 @@
                 </command_interface>
                 <state_interface name="position"/>
                 <state_interface name="velocity"/>
-                <state_interface name="torque"/>
+                <state_interface name="effort"/>
                 <state_interface name="temperature"/>
             </joint>
 
-            <joint name="${prefix}joint2">
+            <joint name="joint2">
                 <param name="id">2</param>
                 <param name="type">pos</param>
                 <param name="offset">1.570796</param>
@@ -43,11 +61,11 @@
                 </command_interface>
                 <state_interface name="position"/>
                 <state_interface name="velocity"/>
-                <state_interface name="torque"/>
+                <state_interface name="effort"/>
                 <state_interface name="temperature"/>
             </joint>
 
-            <joint name="${prefix}joint3">
+            <joint name="joint3">
                 <param name="id">3</param>
                 <param name="type">vel</param>
                 <command_interface name="velocity">
@@ -56,11 +74,26 @@
                 </command_interface>
                 <state_interface name="position"/>
                 <state_interface name="velocity"/>
-                <state_interface name="torque"/>
+                <state_interface name="effort"/>
                 <state_interface name="temperature"/>
             </joint>
 
-        </ros2_control> 
+            <!-- Second wheel, id 4. No inverted param: this URDF is a serial chain, not a
+                 mirrored wheel pair. See docs/configuration.md, "Adapt the example". -->
+            <joint name="joint4">
+                <param name="id">4</param>
+                <param name="type">vel</param>
+                <command_interface name="velocity">
+                    <param name="min">-9.2</param>
+                    <param name="max">9.2</param>
+                </command_interface>
+                <state_interface name="position"/>
+                <state_interface name="velocity"/>
+                <state_interface name="effort"/>
+                <state_interface name="temperature"/>
+            </joint>
+
+        </ros2_control>
 
     </xacro:macro>
 

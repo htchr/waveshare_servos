@@ -12,14 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-/* This header must be included by all rclcpp headers which declare symbols
- * which are defined in the rclcpp library. When not building the rclcpp
- * library, i.e. when using the headers in other package's code, the contents
- * of this header change the visibility of certain symbols which the rclcpp
- * library cannot have, but the consuming code must have inorder to link.
- */
+// Symbol visibility macros for the plugin library. The include guard is package-scoped, so a
+// consumer's own visibility_controls.h cannot hide these macros.
 
-#ifndef WAVESHARE_SERVOS__VISIBILITY_CONTROL_H_
+#ifndef WAVESHARE_SERVOS__VISIBILITY_CONTROL_H_  // NOLINT(build/header_guard)
 #define WAVESHARE_SERVOS__VISIBILITY_CONTROL_H_
 
 // This logic was borrowed (then namespaced) from the examples on the gcc wiki:
@@ -53,4 +49,4 @@
 #define WAVESHARE_SERVOS_PUBLIC_TYPE
 #endif
 
-#endif  // WAVESHARE_SERVOS__VISIBILITY_CONTROL_H_
+#endif  // WAVESHARE_SERVOS__VISIBILITY_CONTROL_H_  // NOLINT(build/header_guard)
