@@ -1,4 +1,4 @@
-// set_id -- gives one servo a new id, verified by reading back (PHASE6_SPEC C.2).
+// set_id -- gives one servo a new id, verified by reading back.
 // All of it is in tool_main (parameters, port) and servo_tools (the bus logic).
 
 #include "tool_main.hpp"

@@ -1,7 +1,5 @@
-// Shared helpers for the waveshare_servos tests: URDF building, log capture and plugin loading.
-//
-// Everything here is inline rather than in an anonymous namespace: an anonymous-namespace function
-// a translation unit does not call produces -Wunused-function under the package-wide -Wall -Wextra.
+// Shared test helpers: URDF building, log capture and plugin loading. All inline, not in an
+// anonymous namespace, so an unused helper does not cause -Wunused-function.
 
 #ifndef TEST_HELPERS_HPP_
 #define TEST_HELPERS_HPP_
@@ -38,13 +36,9 @@ inline constexpr char kRmLogger[] = "test_rm";
 // ---------------------------------------------------------------------------------------------
 // URDF building
 
-// The seven <joint><param> names the driver knows, as strings so a test can declare a malformed
-// value. "" means "emit no <param> at all"; kEmptyParam means "emit the element with no text", the
-// declared-but-empty case every parameter has to reject on its own.
-//
-// The five members after state_interfaces were appended, never inserted: all four builders below
-// use positional aggregate initialization, so a member added in the middle would silently bind a
-// std::vector<std::string> to a std::string.
+// The seven <joint><param> values as strings, so a test can declare a malformed value.
+// "" emits no <param>; kEmptyParam emits an empty element. Add members at the end only: the
+// builders here and in test_lifecycle_over_pty.cpp use positional aggregate initialization.
 struct Joint
 {
   std::string name;
@@ -81,10 +75,8 @@ inline std::string command(
   return xml + "</command_interface>";
 }
 
-// <state_interface>, with an initial_value param when given and a data_type when given.
-//
-// data_type is an XML ATTRIBUTE, never a <param> (component_parser.cpp:237-250,433), and it
-// defaults to "double" when it is left out.
+// <state_interface>, with an initial_value param and a data_type when given. data_type is an
+// XML attribute, not a <param>, and defaults to "double".
 inline std::string state(
   const std::string & name, const std::string & initial_value = "",
   const std::string & data_type = "")
@@ -106,8 +98,8 @@ inline std::vector<std::string> servo_states()
   return {state("position"), state("velocity"), state("effort"), state("temperature")};
 }
 
-// the four it declared before `effort` (N m) replaced the deprecated `torque` alias (kg cm, D2);
-// the bench description of the HIL harness still carries these, so the alias stays exercised
+// the example xacro's older four, with the deprecated `torque` alias (kg cm) in place of
+// `effort` (N m); keeps the alias tested
 inline std::vector<std::string> legacy_servo_states()
 {
   return {state("position"), state("velocity"), state("torque"), state("temperature")};
@@ -322,6 +314,7 @@ inline void capture_log(
   }
 }
 
+// One at a time: a nested LogCapture would pass each record to itself until the stack runs out.
 class LogCapture
 {
 public:

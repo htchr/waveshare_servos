@@ -1,8 +1,7 @@
 <?xml version="1.0"?>
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="waveshare_servos">
-    <!-- Arguments the launch file forwards. port and baudrate are only used when
-         use_mock_hardware is false; with it true the driver is replaced by
-         mock_components/GenericSystem and no serial port is opened at all. -->
+    <!-- Arguments from the launch file. port and baudrate are ignored when use_mock_hardware
+         is true (no serial port is opened). -->
     <xacro:arg name="port" default="/dev/ttyACM0" />
     <xacro:arg name="baudrate" default="1000000" />
     <xacro:arg name="use_mock_hardware" default="false" />
@@ -21,17 +20,8 @@
         </visual>
     </link>
 
-    <!-- effort and velocity below are declared caps, not measured figures: 9.2 rad/s is just under
-         the driver's default max_speed, 6000 steps/s (9.2038847 rad/s), and 1.0 N m is the same
-         cap the hardware-verified bench description under test/hil declares. Keep them
-         numerically equal to the <command_interface> min/max in the ros2_control block beside
-         this file: ros2_control merges the two and enforces whichever is tighter. lower/upper are
-         read only for revolute and prismatic joints and are silently discarded for continuous
-         ones, which is why joint3 and joint4 declare none - a wheel joint's position is unbounded
-         once the driver unwraps it.
-         The <limit> element itself is kept on the wheels on purpose: a joint_trajectory_controller
-         older than 4.42.0 dereferences a null limits pointer at load time when a continuous joint
-         has none. -->
+    <!-- Caps, not measured values: keep equal to the ros2_control min/max. Wheels keep <limit>,
+         without lower/upper. See docs/configuration.md, "Command interfaces and limits". -->
     <joint name="joint1" type="revolute">
         <axis xyz="0 0 1"/>
         <limit effort="1.0" lower="-1.570796" upper="1.570796" velocity="9.2"/>

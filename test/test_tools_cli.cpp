@@ -1,24 +1,5 @@
-// Tests for the executables scan, set_id and calibrate_midpoint (PHASE6_SPEC D.5), and
-// factory_reset (factory_reset_evidence/FACTORY_RESET_SPEC.md).
-//
-// test_servo_tools drives the tools' logic in-process. What it cannot reach belongs to the PROCESS:
-// how the parameters arrive through rclcpp, the exit code a shell sees, which stream gets what,
-// the signal handlers, and that the port is let go on every exit. So every case here spawns the
-// BUILT binary ($WAVESHARE_TOOL_*, from the ENV of this test's ctest entry) against the fake bus
-// of test/fake_servo_bus.hpp on an openpty() pair, and the fake's frame log and raw byte count --
-// never anything a tool says about itself -- are the witness of what reached the wire.
-//
-// Two things keep a child off the bench, and neither is optional (R17):
-//   - DefaultPortGuard holds defaults::kPort for the whole suite: opened, flocked and made
-//     exclusive, and never a byte sent. A child that ignores `port` and falls back to the default
-//     is refused with EBUSY. A port another process holds is waited for (30 s), never trusted:
-//     that holder may let go mid-suite. SetUpTestSuite fails the suite outright when it cannot
-//     prove the refusal, and then no tool is spawned at all;
-//   - the fake's servos sit at ids 11-14, never the bench's 1-4, so even a child that reached a
-//     real bus would address ids nobody answers at.
-//
-// Every exit is asserted as WIFEXITED && WEXITSTATUS == code: a shell reports 130 for a death by
-// SIGINT too, and only the wait status tells a clean exit from a lost handler (A.3).
+// Spawns the built tools on the fake bus (ids 11-14); DefaultPortGuard holds the default port so
+// no child reaches the bench. See docs/development.md, "Keep tests off the bench".
 
 #include <gmock/gmock.h>
 
@@ -101,7 +82,7 @@ constexpr ToolBinary kCalibrate{"calibrate_midpoint", "WAVESHARE_TOOL_CALIBRATE_
 constexpr ToolBinary kFactoryReset{"factory_reset", "WAVESHARE_TOOL_FACTORY_RESET"};
 constexpr ToolBinary kAllTools[] = {kScan, kSetId, kCalibrate, kFactoryReset};
 
-// scan's stdout contract (C.1), the header the HIL parser matches exactly.
+// scan's stdout header, which the HIL parser matches exactly.
 constexpr const char * kHeader =
   " id  type  mode  model  baud_reg     baud  position  voltage_V  temp_C  status  offset";
 
@@ -149,14 +130,8 @@ std::string binary_of(const ToolBinary & tool)
   return path;
 }
 
-// Holds the default port for the whole suite (D.5): opened, flocked and made exclusive, never a
-// byte sent. Every outcome it can end in is named, and only the ones that leave a child refused
-// for the WHOLE suite count as safe: absent, held, and refused (EACCES) -- a permission this user
-// lacks stays lacking. A port another process holds is NOT safe: this guard would hold nothing,
-// and the other holder may let go mid-suite (review fixes F4, F16, F19). So an open refused with
-// EBUSY, or a flock another holder has, is retried every 100 ms for up to `busy_wait`, and a port
-// still held after that is fatal. `port` and `busy_wait` are parameters only so the guard's own
-// cases can drive it on a pty; the suite uses the default port and 30 s.
+// Holds the default port for the suite (open, flock, TIOCEXCL; no byte sent). Safe only when
+// absent, held or refused (EACCES); another holder is retried every 100 ms, then fatal.
 class DefaultPortGuard
 {
 public:
@@ -272,9 +247,8 @@ struct ToolRun
   Clock::time_point ended{};
 };
 
-// "exit 64", "signal 6 (Aborted)", "not spawned": one string, so that a case asserts
-// WIFEXITED(status) && WEXITSTATUS(status) == code in one comparison whose failure prints what
-// happened instead -- a death by SIGINT is never mistaken for the 130 a shell would show for it.
+// "exit 64", "signal 6 (Aborted)", "not spawned": one comparison checks WIFEXITED and the
+// code, and a failure says what happened (a SIGINT death is not the shell's 130).
 std::string how(const ToolRun & run)
 {
   if (!run.spawned) {
@@ -337,8 +311,8 @@ private:
 class ToolsCli : public ::testing::Test
 {
 protected:
-  // No tool is spawned without the guard: a fatal failure here makes gtest skip every case of the
-  // suite and fail the binary (0.2.9).
+  // No tool is spawned without the guard: a fatal failure here skips every case of the suite and
+  // fails the binary.
   static void SetUpTestSuite()
   {
     guard_ = std::make_unique<DefaultPortGuard>();
@@ -373,10 +347,8 @@ protected:
     }
   }
 
-  // A servo as the bench delivers it (E.0) -- firmware 3.6, model word 9 3 (777), baud register 0,
-  // response level 1, limits 0 and 4095, torque on, the EEPROM lock closed -- at an id of the
-  // fake's 11-14, positions 11-12 and wheels 13-14, each with its own offset (bit 11), position,
-  // voltage and temperature, so a column read from the wrong servo cannot pass for the right one.
+  // Bench-like, at the fake's ids 11-14 (11-12 position, 13-14 wheels), each with its own offset,
+  // position, voltage and temperature. Firmware/model bytes are 3.6/777, not the ST3025's.
   void seed(uint8_t id)
   {
     const int k = id - 10;
@@ -409,11 +381,8 @@ protected:
     }
   }
 
-  // Spawns `args` (args[0] the binary) with stdout, and stderr unless `stderr_fd` is given, into
-  // files -- never pipes, which a chatty child could fill and block on. The child gets an empty
-  // signal mask and default dispositions, so it cannot inherit an immunity to the very signal a
-  // case sends it. waitpid(WNOHANG) every 10 ms, `while_running` in between; after 30 s, SIGKILL
-  // and a failure.
+  // Spawns args[0] with output to files (a pipe could fill and block), an empty signal mask and
+  // default dispositions; polls every 10 ms, then SIGKILL and a failure after 30 s.
   ToolRun spawn(
     const std::vector<std::string> & args,
     const std::function<void(pid_t)> & while_running = nullptr, int stderr_fd = -1)
@@ -499,9 +468,8 @@ protected:
   // `port:=<the fake's pty>`, which every case passes unless it is about a stale name.
   std::string port_param() const {return "port:=" + fake_.port();}
 
-  // The ids a tool is given when a case must not depend on them: 200 and 201, which answer on no
-  // bus this test builds, so a regression that got past the refusal under test still writes to
-  // nobody (R16).
+  // Ids no bus here answers at (200, 201): a regression past the refusal under test still writes
+  // to nobody.
   static std::vector<std::string> absent_ids(const ToolBinary & tool)
   {
     if (std::string(tool.name) == kSetId.name) {
@@ -537,9 +505,8 @@ protected:
     }
   };
 
-  // An in-process bus takes the pty and lets it go again: whatever the child did to the tty's
-  // exclusive flag and its advisory lock was undone when it exited. Around it, this process holds
-  // exactly one descriptor on the pty -- the fake's own slave.
+  // The child's TIOCEXCL and flock went with it: a new bus takes the pty, and this process holds
+  // only the fake's own slave descriptor before and after.
   void expect_port_retakeable(const std::string & after)
   {
     SCOPED_TRACE("after " + after);
@@ -584,7 +551,6 @@ protected:
 
 TEST_F(ToolsCli, default_port_guard_blocks_a_second_open)
 {
-  // H step 8.2 runs this case alone before the red run, whose old binaries ignore `port`.
   RecordProperty("default_port_guard", guard().state());
   RecordProperty("default_port_guard_waited_ms", std::to_string(guard().waited_ms()));
   std::cout << "DefaultPortGuard on " << kDefaultPort << ": " << guard().state() << " (waited " <<
@@ -605,7 +571,7 @@ TEST_F(ToolsCli, default_port_guard_blocks_a_second_open)
   }
 }
 
-// ---- the three tools, end to end ----
+// ---- the four tools, end to end ----
 
 TEST_F(ToolsCli, scan_prints_the_fake_bus_and_exits_0)
 {
@@ -631,12 +597,12 @@ TEST_F(ToolsCli, scan_prints_the_fake_bus_and_exits_0)
     lines[5], MatchesRegex(
       "found 4 servo\\(s\\) on " + fake_.port() + " at 1000000 baud: ids 11 12 13 14 \\(pinged "
       "ids 0\\.\\.253, 3 attempts each, [0-9]+\\.[0-9] s\\)"));
-  // The vendored line goes to stderr, never to the table's stream (R19).
+  // The vendored line goes to stderr, never to the table's stream.
   EXPECT_THAT(lines_of(run.err), Contains("serial speed 1000000"));
   EXPECT_THAT(run.err, HasSubstr("scan: use the id column as <param name=\"id\">"));
   EXPECT_THAT(unprefixed(run.err, kScan), IsEmpty()) << run.err;
   fake_.wait_quiet();
-  // The coverage gate, from the fake's log: every id 0..253 [Q5], a found one no more than once.
+  // The coverage gate, from the fake's log: every id 0..253, a found one no more than once.
   EXPECT_EQ(fake_.ping_counts(), scan_pings_with_found({11, 12, 13, 14}));
   EXPECT_TRUE(fake_.writes().empty());
 }
@@ -715,7 +681,7 @@ TEST_F(ToolsCli, calibrate_centres_12_exit_0)
   const ToolRun run = run_tool(kCalibrate, {port_param(), "id:=12"});
   EXPECT_EQ(how(run), exited(0)) << run.err;
   fake_.wait_quiet();
-  // torque off, verified unlock, 128, verified lock [Q1, Q2, Q3]
+  // torque off, verified unlock, 128, verified lock
   EXPECT_EQ(
     fake_.writes(), (std::vector<WriteRecord>{WriteRecord{12, 40, {0}}, WriteRecord{12, 55, {0}},
       WriteRecord{12, 40, {128}}, WriteRecord{12, 55, {1}}}));
@@ -781,8 +747,8 @@ TEST_F(ToolsCli, factory_reset_resets_the_wheel_13_exit_0)
 
 TEST_F(ToolsCli, factory_reset_at_500000_follows_the_servo_to_1000000_exit_0)
 {
-  // M3 through the process: the child sends the RESET at the rate it was given and finds the servo
-  // at the factory rate afterwards, without letting go of the port in between.
+  // Through the process: the child sends the RESET at the given rate and finds the servo at the
+  // factory rate, without releasing the port.
   fake_.set_factory_from_eeprom(14, {{kRegMode, 0}, {31, 0}, {32, 0}});
   fake_.set_byte(14, 6, 1);
   fake_.set_baud_model(true);
@@ -885,9 +851,8 @@ TEST_F(ToolsCli, each_tool_exits_64_for_an_override_addressed_to_another_node)
 
 TEST_F(ToolsCli, set_id_and_calibrate_without_ids_exit_64_and_send_nothing)
 {
-  // [Q4] The bare invocation, the only place it is run (R16): it names no port either, so the
-  // guard is what a regression would meet; the second run names the fake so the wire can witness
-  // that nothing was sent. factory_reset takes calibrate's `id`, required the same way.
+  // A bare call (run only here) names no port, so a regression meets the guard; the second run
+  // names the fake so the wire shows nothing was sent. factory_reset requires `id` too.
   for (const ToolBinary & tool : {kSetId, kCalibrate, kFactoryReset}) {
     SCOPED_TRACE(tool.name);
     const ToolRun bare = spawn({binary_of(tool)});
@@ -967,10 +932,8 @@ TEST_F(ToolsCli, a_positional_argument_is_64)
 
 TEST_F(ToolsCli, each_tool_is_refused_by_a_bus_this_process_holds_exit_1)
 {
-  // This process holds the pty the way the driver does (lock and TIOCEXCL). The child leaves its
-  // own pid out of the holder list, so the pid it names is this one. Close-on-exec is NOT what
-  // this shows -- an inherited descriptor would carry the child's pid, which the list drops;
-  // FakeBusTools.descriptors_are_close_on_exec is that proof.
+  // This process holds the pty like the driver (flock + TIOCEXCL), so the refusal names this
+  // pid. Close-on-exec is FakeBusTools.descriptors_are_close_on_exec's proof, not this case's.
   ServoBus holder;
   const OpenResult opened = holder.open(fake_.port(), kBaudrate, kIoTimeoutMs);
   ASSERT_TRUE(static_cast<bool>(opened)) << to_string(opened.status);
@@ -992,9 +955,8 @@ TEST_F(ToolsCli, each_tool_is_refused_by_a_bus_this_process_holds_exit_1)
 
 TEST_F(ToolsCli, each_tool_is_refused_by_a_flock_only_holder_before_begin)
 {
-  // The advisory lock alone, no TIOCEXCL: the open succeeds, so only a tool that takes the lock
-  // is refused -- and it must be refused BEFORE begin(), which is what prints "serial speed". A
-  // tool that called SMS_STS::begin itself would open the port and print the line (G.3, item 4).
+  // flock alone, no TIOCEXCL: the open succeeds, so a tool must take the lock and be refused
+  // before begin(), which prints "serial speed".
   const int fd = ::open(fake_.port().c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
   ASSERT_NE(fd, -1) << std::strerror(errno);
   ASSERT_EQ(::flock(fd, LOCK_EX | LOCK_NB), 0) << std::strerror(errno);
@@ -1078,9 +1040,8 @@ TEST_F(ToolsCli, a_signal_during_the_eeprom_sequence_is_deferred)
 
 TEST_F(ToolsCli, a_signal_during_calibrates_settle_exits_130_before_the_unlock)
 {
-  // Review fix F7, end to end: SIGHUP once the torque-off write is out, while the tool waits for
-  // the servo to settle. Nothing has been written to EEPROM, so the signal is acted on at the last
-  // check before the unlock -- whichever thread took it, the flag or the pending set shows it.
+  // SIGHUP after the torque-off write, during the settle: no EEPROM write yet, so the last check
+  // before the unlock acts on it (the flag or the pending set shows it).
   fake_.set_offset_model(12, true);
   fake_.set_position(12, 1026);
   fake_.clear_frames();
@@ -1102,9 +1063,8 @@ TEST_F(ToolsCli, a_signal_during_calibrates_settle_exits_130_before_the_unlock)
 
 TEST_F(ToolsCli, a_closed_stderr_pipe_does_not_stop_set_id)
 {
-  // `set_id ... 2>&1 | head` after head has exited: every write to stderr is EPIPE. A tool that
-  // did not ignore SIGPIPE would die on the pre-write notice, just before the first EEPROM write,
-  // or anywhere after it.
+  // Like `set_id ... 2>&1 | head` after head exits: every stderr write is EPIPE. A tool that did
+  // not ignore SIGPIPE would die at or after the pre-write notice.
   int pipe_fds[2] = {-1, -1};
   ASSERT_EQ(::pipe2(pipe_fds, O_CLOEXEC), 0) << std::strerror(errno);
   ::close(pipe_fds[0]);
@@ -1149,16 +1109,14 @@ TEST_F(ToolsCli, the_port_is_retakeable_after_every_exit)
   expect_port_retakeable("exit 130");
 }
 
-// ---- DefaultPortGuard's own mechanics, on a pty (review fixes F4, F16, F19) ----
-// A port somebody else holds is waited for and then held; one that stays held is fatal. It is
-// never "safe" while this suite holds nothing, because the other holder may let go mid-suite.
+// ---- DefaultPortGuard's own mechanics, on a pty ----
+// A held port is waited for, then held; one that stays held is fatal, never "safe".
 
 namespace
 {
 
-// Another holder of `port`, the way the controller manager holds it (TIOCEXCL) or the way a
-// flock-only process does; release() lets it go. In this process, on its own open file
-// description, so it conflicts with the guard's exactly as another process's would.
+// Another holder, by TIOCEXCL or by flock only, on its own open file description in this
+// process, so it conflicts with the guard as another process would.
 class OtherHolder
 {
 public:

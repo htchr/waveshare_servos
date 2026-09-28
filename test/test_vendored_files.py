@@ -1,33 +1,7 @@
 """
 The vendored SCServo files are byte-for-byte the ones THIRD_PARTY.md records.
 
-THIRD_PARTY.md says the 14 vendored files are not edited, and the package leans on that in two
-ways nothing else checks. The ServoBus wrapper relies on details of them that are not a stable API,
-and code and tests across the package cite them by line number. The behavioural tests in
-test/test_servo_bus.cpp catch a change only on the paths they drive: a comment edit, a whitespace
-cleanup, or any edit to SMSBL/SMSCL/SCSCL (compiled, never linked) passes every other test in the
-suite. This one does not.
-
-The recorded table is the fenced block between the vendored-sha256 markers in THIRD_PARTY.md, in
-`sha256sum` format, so a person can check it with `sha256sum -c` as well.
-
-Four cross-checks keep the gate from passing vacuously:
-  - the table must hold exactly EXPECTED_FILE_COUNT rows, so an empty or truncated table fails;
-  - every file whose name starts with an upper-case letter under include/ or src/ must be in the
-    table (every driver-owned source name is lower-case), so a newly vendored file cannot slip in
-    unrecorded;
-  - the CMake lint exclusion list and the scservo target must name exactly the tabled files;
-  - two self-tests run the digest comparison over a synthetic tree whose hashes are written out
-    below, and require it to report a flipped byte and a deleted file.
-
-One more case reads THIRD_PARTY.md's prose: its "Licensing" section must reproduce both MIT
-notices of the upstream sources, the two copyright lines and the whole permission text, because
-the MIT license asks that copies carry them.
-
-No fixture reads a file: each case first asserts that THIRD_PARTY.md exists and then parses it, so
-a missing or malformed table is a failed case, never an error at setup. No motors, no port, no ROS
-graph, no git. The test reads the SOURCE tree (ament_add_pytest_test runs this file from the
-source directory, so __file__ is there), because the claim is about the sources.
+Also checks the table size, the upper-case file names, the CMake lists and the MIT notices.
 """
 
 import hashlib
@@ -40,9 +14,8 @@ PKG_ROOT = Path(__file__).resolve().parents[1]
 THIRD_PARTY = PKG_ROOT / 'THIRD_PARTY.md'
 CMAKELISTS = PKG_ROOT / 'CMakeLists.txt'
 
-# Pinned independently of every list this test compares, so shrinking all of them together still
-# fails. Change it only together with THIRD_PARTY.md, add_library(scservo ...) and
-# AMENT_LINT_AUTO_FILE_EXCLUDE, in the same reviewed change.
+# Pinned apart from the lists it checks, so shrinking all of them fails. Change it only with
+# THIRD_PARTY.md, add_library(scservo ...) and AMENT_LINT_AUTO_FILE_EXCLUDE.
 EXPECTED_FILE_COUNT = 14
 
 BLOCK = re.compile(
@@ -50,9 +23,8 @@ BLOCK = re.compile(
     re.S)
 ROW = re.compile(r'^(?P<sha>[0-9a-f]{64})  (?P<path>(?:include|src)/[A-Za-z0-9_]+\.(?:h|cpp))$')
 
-# The self-tests' synthetic tree: two small files with fixed content, and their sha256 written
-# out by hand (`printf 'synthetic vendored header\n' | sha256sum`), so the comparison is checked
-# against known digests rather than against digests it computed itself.
+# Synthetic tree for the self-tests. The digests are computed by hand (printf ... | sha256sum),
+# so the check uses known values, not values it computed itself.
 SYNTHETIC_FILES = {
     'include/ONE.h': b'synthetic vendored header\n',
     'src/TWO.cpp': b'synthetic vendored source\n',
@@ -192,8 +164,7 @@ def test_the_scservo_target_compiles_exactly_the_tabled_sources():
 
 
 def test_the_comparison_reports_a_one_byte_change(tmp_path):
-    # The gate that cannot fail is the failure mode this package keeps finding. Prove this one can:
-    # a synthetic tree that matches its table, then one byte flipped in one file.
+    # Prove the comparison can fail: a matching synthetic tree, then one flipped byte.
     write_synthetic_tree(tmp_path)
     assert mismatches(tmp_path, SYNTHETIC_TABLE) == []
     victim = tmp_path / 'src' / 'TWO.cpp'

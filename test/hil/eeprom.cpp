@@ -1,15 +1,5 @@
-// hil_eeprom: the bench's EEPROM oracle and repair tool (PHASE6_SPEC E.1). A test fixture for the
-// HIL check, never installed.
-//
-// Everything that touches a bus is in eeprom_core.cpp, where test_hil_eeprom drives it on the
-// fake. This file owns only what a process owns: the signal handlers. SIGINT, SIGTERM, SIGHUP and
-// SIGQUIT set a flag and nothing else. The core checks it before its first write (exit 130,
-// nothing written) and blocks the four signals from the first write to the end of the sequence,
-// so a Ctrl-C, a `timeout -s TERM` or an ssh drop cannot stop a restore between unlock and lock.
-// SIGPIPE is ignored so a closed output pipe cannot either. SIGKILL cannot be caught; the journal
-// (E.2) is the answer to that.
-//
-// Usage and exit codes: see eeprom_core.hpp and `hil_eeprom` with no arguments.
+// hil_eeprom: the bench's EEPROM oracle and repair tool (a test fixture); this file owns only
+// the signal handlers. See docs/bench-check.md, "hil_eeprom".
 
 #include <signal.h>
 

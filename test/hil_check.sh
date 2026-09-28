@@ -1,27 +1,9 @@
 #!/usr/bin/env bash
-# The waveshare_servos bench check (PHASE2_SPEC 12.3-12.6). Driven by ctest as `hil_check`, it
-# skips unless WAVESHARE_HIL=1 and a real adapter is present, so a motorless machine records a
-# skip rather than a failure. It drives the motors: nothing else may hold the port while it runs.
-#
-#   WAVESHARE_HIL=1 colcon test --packages-select waveshare_servos --ctest-args -R hil_check
-#
-# Environment: WAVESHARE_HIL_PORT (default /dev/ttyACM0), WAVESHARE_HIL_OUT (default
-# ./hil_check.d), WAVESHARE_HIL_WS (default: the workspace this package was built from),
-# WAVESHARE_HIL_HELPERS and WAVESHARE_HIL_STOP_WHEELS / _PORT_PROBE / _EEPROM (set by CMake), and
-# WAVESHARE_HIL_SOAK_S (H11's soak length in seconds, default 600, clamped to at least 40).
-# Phase 6 (PHASE6_SPEC E.2) adds WAVESHARE_HIL_JOURNAL (the EEPROM journal of H13-H16, default
-# $HOME/.local/state/waveshare_servos/hil_eeprom_journal.snap), WAVESHARE_HIL_EEPROM_BASELINE (E.0's
-# golden snapshot, which H17.matches_baseline compares with; it SKIPs without one) and
-# WAVESHARE_HIL_TOOLS (the directory scan, set_id and calibrate_midpoint are run from; the install
-# tree by default -- the override exists only for the H14 red run of the pre-Phase-6 binaries,
-# which ignore `port`, and is refused on any port but /dev/ttyACM0).
-# Exit codes: 0 every check PASS/SKIP or an allowed INCONCLUSIVE; 1 a FAIL; 2 an abort; 77 skip.
-#
-# The safety machinery of PHASE2_SPEC 12.4 -- the clean-environment re-exec, HIL_TAG, killing
-# only tagged processes, the port-holder check around every scenario, timeout on everything and
-# stopping the wheels at the end of each scenario -- is carried from phase1_evidence/hil/
-# common.sh:19-66, 130-149, 163-195 and run.sh:12-24, 83-94, where it was exercised for a whole
-# phase. Never pkill -f ros2, never fuser -k, never a bare kill on a pgrep result.
+# Bench check (ctest `hil_check`): drives the real servos; skips (exit 77) unless WAVESHARE_HIL=1.
+# See docs/bench-check.md, "Run the bench check".
+
+# Signal only processes tagged with this run's HIL_TAG: never pkill -f ros2, never fuser -k,
+# never a bare kill on a pgrep result.
 
 PORT=${WAVESHARE_HIL_PORT:-/dev/ttyACM0}
 
@@ -30,27 +12,23 @@ STOP_WHEELS=${WAVESHARE_HIL_STOP_WHEELS:-}
 PORT_PROBE=${WAVESHARE_HIL_PORT_PROBE:-}
 OUT=${WAVESHARE_HIL_OUT:-$PWD/hil_check.d}
 WS=${WAVESHARE_HIL_WS:-$(cd "$HELPERS/../../../.." && pwd)}
-# Phase 6 (E.2). Every one of these is forwarded through the env -i below, or it is dropped there
-# without a word. TOOLS stays empty unless given; the pre-flight fills in the install tree.
+# Forward each of these through the env -i re-exec below, or it is lost there.
+# TOOLS stays empty unless given; the pre-flight fills in the install tree.
 EEPROM=${WAVESHARE_HIL_EEPROM:-}
 JOURNAL=${WAVESHARE_HIL_JOURNAL:-$HOME/.local/state/waveshare_servos/hil_eeprom_journal.snap}
-# The port the journal was taken on (review fix F3): written with it, removed with it, and the
-# pre-flight applies a journal only to that port -- restore cannot tell one bench's servos from
-# another's of the same model. Beside the journal rather than in its name, so a replug that
-# renumbers the adapter shows the journal and stops the run instead of hiding it.
+# The port the journal was taken on; the pre-flight applies a journal only on that port.
+# See docs/bench-check.md, "EEPROM journal".
 JOURNAL_PORT=$JOURNAL.port
 BASELINE=${WAVESHARE_HIL_EEPROM_BASELINE:-}
 TOOLS=${WAVESHARE_HIL_TOOLS:-}
 JOURNAL_OURS=0          # 1 from the moment guard_begin writes the journal, 0 once it is removed
 
-# INCONCLUSIVE is legal for exactly these two keys, because for those two the bench itself cannot
-# supply the stimulus (PHASE2_SPEC 12.4/12.5). Adding a third is a spec change, reviewed as one,
-# never a run-time decision. Every other row that would be INCONCLUSIVE is reported as FAIL.
+# Only these rows may be INCONCLUSIVE (the bench cannot always supply their stimulus).
+# Any other INCONCLUSIVE row is reported as FAIL.
 HIL_INCONCLUSIVE_ALLOWED="H7.load_sign H8.accel_effect"
 
-# The skip contract and the single clean-environment re-exec (12.3, run.sh:12-24). Both belong to
-# the outer invocation: the re-exec's env -i PATH has no ros2 on it until setup.bash is sourced
-# below, so running the contract again inside would skip every real run.
+# Skip checks and the clean-env re-exec run only in the outer call: inside, ros2 is not on PATH
+# until setup.bash is sourced, so the checks would skip every real run.
 if [ -z "${HIL_CLEAN:-}" ]; then
   # Each line says why, and exits 77, CMake's skip code.
   [ "${WAVESHARE_HIL:-}" = 1 ] || { echo "SKIP: WAVESHARE_HIL is not 1"; exit 77; }
@@ -96,7 +74,7 @@ hil_log() {
   echo "[$(date +%H:%M:%S.%3N)] ${SCEN}: $*" | tee -a "$OUT/run.log"
 }
 
-# pids with an open fd on the port (common.sh:19-21; fuser/lsof are not installed here)
+# pids with an open fd on the port (fuser/lsof are not installed on the bench)
 port_holders() {
   find /proc/[0-9]*/fd -lname "$PORT" 2> /dev/null | cut -d/ -f3 | sort -u | tr '\n' ' ' |
     sed 's/ $//'
@@ -111,7 +89,7 @@ wait_port_free() {
   [ -z "$(port_holders)" ]
 }
 
-# only processes carrying this run's HIL_TAG are ever signalled (common.sh:33-51)
+# only processes carrying this run's HIL_TAG are ever signalled
 tagged_pids() {
   local pid
   for pid in $(pgrep -f "$1"); do
@@ -131,9 +109,8 @@ kill_tagged() {
   return 0
 }
 
-# The last two are Phase 6's own processes (E.2), so port_rescue may escalate on this run's hung
-# tools and on a hung hil_eeprom too; like everything here they are signalled only when they carry
-# this run's HIL_TAG. Old binaries run from WAVESHARE_HIL_TOOLS do not match the first pattern.
+# The tools and hil_eeprom are here so port_rescue can stop them if they hang (tagged only).
+# Binaries from a WAVESHARE_HIL_TOOLS override do not match the tools pattern.
 STACK_PATTERNS=("^$CM_BIN" "^$RSP_BIN" "ros2 launch waveshare_servos" "controller_manager/spawner"
   "hil_record.py" "lib/waveshare_servos/(scan|set_id|calibrate_midpoint)" "hil_eeprom")
 
@@ -150,7 +127,7 @@ teardown_stack() {
   wait_port_free 10
 }
 
-# ros2 CLI under a timeout, without the "waiting for service" chatter (common.sh:88-97)
+# ros2 CLI under a timeout, without the "waiting for service" chatter
 r2() {
   local t=$1 rc ef
   shift
@@ -245,7 +222,7 @@ abort_scenario() {
   hil_log "ABORTED $1: $2"
 }
 
-# A holder that is not ours is not ours to kill (PHASE2_SPEC 12.4): stop, and say what to do.
+# Never signal a port holder without this run's HIL_TAG: log it and stop.
 port_rescue() {
   local pid tagged=1
   for pid in $(port_holders); do
@@ -287,14 +264,13 @@ scenario_begin() {
       abort_scenario "$SCEN" "port could not be freed"
       return 2; }
   fi
-  # A rescue is not a clean start: 12.4 item 3 makes port_free_before a gated row, so a scenario
-  # that needed one records false even though its own holders were ours to kill.
+  # A rescue is not a clean start: port_free_before is a gated row, so it records false.
   if [ "$rescued" = 1 ]; then
     fact port_free_before false
   else
     fact port_free_before true
   fi
-  # 12.4 item 9: record before you move, once per scenario, while the port is free.
+  # Read the registers once per scenario, before any move, while the port is free.
   readback pre_readback --read-only --registers --ids 1,2,3,4 > /dev/null
   return 0
 }
@@ -315,27 +291,9 @@ scenario_end() {
 }
 
 # ------------------------------------------------------------------ the stack under test
-# $1 = xacro arguments, $2 = the wheels joint list for the controller, $3 = the stack watchdog in
-# seconds (default 420). The watchdog is what SIGINTs a stack that outlives its scenario, so it
-# has to be longer than the scenario: H11 soaks for ten minutes and passes its own (PHASE3 5.13).
-# Every other scenario is far inside 420, and H9 owns the longest single stack. Phase 5 raised its
-# recorder from 40 s to 70 s and added two post-cycle arm moves (see the `70 s, raised from 40`
-# comment in h_H9), so the 56 s that stack lived in the archived post-Phase-4 run
-# (phase5_evidence/post_phase4_baseline_2026-09-21_1659/run.log: `starting ros2_control_node` at
-# 17:14:36.011, `end` at 17:15:32.403) becomes roughly 86 s -- the recorder, not the body, now
-# sets that length (the budget block above h_H11 does the arithmetic). Still under a quarter of
-# the 420 s default.
-# H12 runs THREE stacks on this same default, none of them a minute long: the watchdog is per
-# stack, a fresh `timeout` per call, never per scenario, so several short stacks in one scenario
-# never walk up on it the way one long stack does.
-#
-# $4 = the controller YAML under hil/controllers (default bench.yaml), and it exists for H12
-# alone. `enforce_command_limits` can only be set in that file -- the controller manager builds
-# the JointSaturationLimiters at hardware-component init, so a `ros2 param set` on a running
-# stack is accepted and does nothing (jazzy.md section 6 step 8, the Phase 4 amendment) -- and
-# turning it on in bench.yaml would turn it on for every other scenario, whose gates were measured
-# without it. A parameter here, rather than a variable a scenario sets: a global left set by one
-# scenario would silently re-render the next one's stack.
+
+# start_stack XACRO_ARGS WHEELS [WATCHDOG_S=420] [YAML=bench.yaml]. The watchdog SIGINTs a stack
+# that outlives its scenario. YAML is an argument, not a global, for H12's limiters only.
 start_stack() {
   local watchdog=${3:-420} yaml=${4:-bench.yaml}
   # port:= first, so a scenario argument can still override it deliberately
@@ -346,9 +304,8 @@ start_stack() {
   CM_LOG=$SDIR/cm$STACK_N.stdout
   timeout -s INT "$watchdog" "$CM_BIN" --ros-args --params-file "$SDIR/cm.yaml" > "$CM_LOG" 2>&1 &
   CM_WRAP=$!
-  # robot_state_publisher takes the description through a parameter FILE, not through
-  # -p robot_description:=<urdf>: rcl parses a parameter override as YAML, and a multi-line
-  # XML document is not a YAML scalar, so the override form aborts the node before it starts.
+  # The URDF goes in a params FILE: rcl parses a -p value as YAML, and a multi-line XML
+  # document aborts the node.
   python3 -c 'import sys, yaml; yaml.safe_dump({"robot_state_publisher": {"ros__parameters":
     {"robot_description": open(sys.argv[1]).read()}}}, open(sys.argv[2], "w"))' \
     "$SDIR/robot.urdf" "$SDIR/rsp.yaml" || return 1
@@ -378,10 +335,8 @@ stop_stack() {
   wait "$CM_WRAP" 2> /dev/null
   rc=$?
   fact cm_exit_code $rc
-  # Also exposed as a global, for the reason start_stack exposes SPAWNER_RC and
-  # CONTROLLERS_ACTIVE: a scenario that runs more than one stack has to copy each stack's number
-  # under its own fact key before the next stop_stack overwrites the shared cm_exit_code
-  # (h_H12 does exactly that, as park_cm_exit_code and limited_cm_exit_code).
+  # Also a global: a scenario with several stacks (H12) copies it under its own fact key
+  # before the next stop_stack overwrites cm_exit_code.
   CM_EXIT_CODE=$rc
   local rsp
   rsp=$(pgrep -P "${RSP_WRAP:-0}" 2> /dev/null)
@@ -390,23 +345,16 @@ stop_stack() {
   wait_port_free 10 && fact port_released true || fact port_released false
 }
 
-# $6 is the controller whose /<controller>/joint_trajectory the point goes to, and it exists for
-# H1B alone: the shipped example calls its arm controller `joint_trajectory_position_controller`
-# (bringup/config/example_controllers.yaml:31-32), while every bench scenario calls it `arm`
-# (hil/controllers/bench.yaml). A positional with a default rather than a variable a scenario
-# sets, for the reason start_stack's $4 gives: a global left set by one scenario would silently
-# retarget the next one's moves, and the failure would look like a dead controller.
+# $6 = controller (default arm; H1B: joint_trajectory_position_controller). An argument, not a
+# global, so one scenario cannot retarget the next one's moves.
 move() {  # label joints positions duration [post] [controller]
   $RECORD move --controller "${6:-arm}" --joints "$2" --positions="$3" --duration "$4" --pre 0.5 \
     --post "${5:-1.5}" --label "$1" --out "$SDIR/$1.json" > "$SDIR/$1.stdout" 2>&1 ||
     hil_log "move $1 rc=$?"
 }
 
-# An empty stop-values publishes no stop at all, which is what the scenarios that SIGKILL the
-# stack mid-command need: the controller holds the last command it was given (12.5, H7 and H8).
-# $7 is the command topic, and like move's $6 it exists for H1B: the example's wheel controller is
-# `joint_velocity_controller`, so its JointGroupVelocityController listens on
-# /joint_velocity_controller/commands, not on the bench's /wheels/commands.
+# Empty stop-values publish no stop (H7 and H12 SIGKILL the stack while the command stands).
+# $7 = topic (default /wheels/commands; H1B: /joint_velocity_controller/commands).
 spin() {  # label values hold [stop-values [stop-hold]] [--djs] [topic]
   local stop=()
   [ -n "${4:-}" ] && stop=(--stop-values "$4" --stop-hold "${5:-2.0}")
@@ -426,15 +374,15 @@ wait_t_cmd() {  # stdout-file [seconds]
   return 1
 }
 
-diagnostics() {  # capture /diagnostics through the CLI (12.3: the recorder does not subscribe)
+diagnostics() {  # capture /diagnostics through the CLI (hil_record.py does not subscribe)
   r2 "${1:-12}" topic echo /diagnostics > "$SDIR/diagnostics.txt" 2>&1
   return 0
 }
 
-# ------------------------------------------------------------------ Phase 6: tools and EEPROM (E.2)
-# $1 = label, $2 = tool, rest = its argv verbatim (so a positional argument can be tested).
-# *.out.txt / *.err.txt, not *.stdout, so scenario_end's log.txt stays the driver's.
-# Every fact is written on every path, so a row can never read a missing fact as a pass.
+# ------------------------------------------------------------------ tools and EEPROM
+
+# tool LABEL NAME ARGV...: output goes to *.out.txt/*.err.txt, not *.stdout (log.txt collects
+# those). Every fact is written on every path, so a missing fact never reads as a pass.
 tool() {
   local label=$1 name=$2 t0 rc
   shift 2
@@ -463,7 +411,7 @@ eeprom() {
   local label=$1 rc
   shift
   local lim=(-s KILL 60)
-  [ "$1" = restore ] && lim=(-k 30 -s TERM 90)   # TERM is deferred to the end of a sequence (E.1)
+  [ "$1" = restore ] && lim=(-k 30 -s TERM 90)   # restore defers TERM to the end of a sequence
   if [ -n "$(port_holders)" ]; then
     echo '{"ok": false, "error": "port_busy_skipped"}' > "$SDIR/$label.json"
     fact "${label}_rc" busy
@@ -499,10 +447,8 @@ sys.exit(0 if ok else 1)
 EOF
 }
 
-# The journal (R13) is the scenario's own pre snapshot, copied to $JOURNAL before the first tool
-# call. guard_begin writes it only from a complete snapshot of the bench and never over a journal
-# it does not know; guard_end removes it only once the bench is back as that snapshot says, and
-# otherwise restores from it. Returns: 0 go on, 1 abort this scenario only, 2 abort the run.
+# guard_begin journals the pre snapshot. Returns 0 go on, 1 abort this scenario, 2 abort the run.
+# See docs/bench-check.md, "EEPROM journal".
 guard_begin() {
   local why= rc
   if [ -e "$JOURNAL" ]; then
@@ -522,10 +468,8 @@ readable EEPROM bytes each)"
   elif [ ! -s "$SDIR/pre_eeprom.snap" ] || grep -Eq '(^| )x( |$)' "$SDIR/pre_eeprom.snap"; then
     why="pre_eeprom.snap is empty or holds an unreadable byte"
   else
-    # The journal is this run's from its first byte on, so an INT/TERM that lands while it is
-    # written still has cleanup_all restore (a no-op: no tool has run) and remove it, instead of
-    # leaving it for the next pre-flight as a crashed run's (review fix F25). Its port record goes
-    # first, so a journal never exists without one (F3).
+    # Mark the journal ours before writing it, so an interrupt here still restores it.
+    # The port record goes first: a journal never exists without one.
     JOURNAL_OURS=1
     if ! { mkdir -p "$(dirname "$JOURNAL")" && printf '%s\n' "$PORT" > "$JOURNAL_PORT" &&
       cp "$SDIR/pre_eeprom.snap" "$JOURNAL.tmp" && mv "$JOURNAL.tmp" "$JOURNAL"; }; then
@@ -581,32 +525,10 @@ holder_alive() {  # $1 = a pid announced by a HOLDING line; true while that proc
   [ -n "$1" ] && [ -d "/proc/$1" ] && echo true || echo false
 }
 
-# ------------------------------------------------------------------ the ten scenarios (12.5)
+# ------------------------------------------------------------------ scenarios
 h_H1() {
-  # H1 is the shipped entry point: the one scenario that runs bringup/launch/example.launch.py and
-  # its four-joint description, where every other scenario drives a bare ros2_control_node against
-  # hil/descriptions/bench.urdf.xacro. It passes port:=$PORT (declared at example.launch.py:28-31,
-  # forwarded into the xacro render at :73) so the suite follows WAVESHARE_HIL_PORT here like it
-  # does everywhere else -- start_stack:319, the xacro line, passes the same "port:=$PORT" to its
-  # own render.
-  #
-  # Until Phase 5 this scenario passed no port and called abort_scenario on any port but
-  # /dev/ttyACM0, which cost more than the one scenario it looked like: run() turns an ABORTED row
-  # into exit code 2 -- the line is 'if counts[...ABORTED...] or not port_free: return 2', at
-  # hil_gates.py:2557-2558 -- so a bench on a second adapter reported the whole suite FAIL rather
-  # than skipping the scenario it could not run.
-  #
-  # What that skip bought, and what passing the port gives up: the packaged default is no longer
-  # exercised by being left alone. On the usual bench it is the same value either way -- both
-  # description/urdf/example.urdf.xacro:6 and example.launch.py:30 default to /dev/ttyACM0 -- so a
-  # regressed default would render identically here and pass. Nothing is lost by that, because
-  # the default is a render-time fact about the shipped files and is already pinned where it can
-  # be checked with no motors at all: test/test_urdf_xacro.py:86 asserts the three <xacro:arg>
-  # declarations and their defaults verbatim, and :103 asserts that an argument-free render is
-  # the real driver on /dev/ttyACM0 at 1 Mbaud.
-  #
-  # gui:=false stays: gui defaults to true (example.launch.py:45-49) and rviz2 has no display on
-  # this bench, so the default would leave a failed node in the launch log of every run.
+  # H1: the shipped example.launch.py, idle; gui:=false because the bench has no display.
+  # See docs/bench-check.md, "Example stack (H1 and H1B)".
   scenario_begin H1 || return $?
   timeout -s INT 420 ros2 launch waveshare_servos example.launch.py "port:=$PORT" gui:=false \
     > "$SDIR/launch.stdout" 2>&1 &
@@ -622,37 +544,8 @@ h_H1() {
   scenario_end
 }
 
-# H1B: the shipped example, COMMANDED. jazzy.md section 6 steps 1, 3, 4 and 7 are all written
-# against bringup/launch/example.launch.py, but until Phase 5 H1 only watched that stack idle --
-# it waited for the controllers, recorded 9 s of /joint_states and 12 s of /diagnostics, and
-# SIGINTed. Every position, velocity and shutdown proof in this suite was therefore against
-# hil/descriptions/bench.urdf.xacro and hil/controllers/bench.yaml, i.e. against a description
-# and a controller set that ship with the TESTS and not with the package. The thing a user
-# actually runs was never commanded.
-#
-# Why a separate scenario instead of more stimulus inside h_H1. H1's read_ms, write_ms, rate and
-# per-joint gate rows are `[no-regression]` rows whose bounds were measured over an IDLE example
-# stack: H1's 12 s /diagnostics capture is where READ_MS_AVG_MAX and friends are compared, and
-# turning two servos inside that window changes the cost being measured. Re-basing a pre-existing
-# no-regression term is not this pass's business (the argument h9's `cost` comment already makes
-# about rate_hz), and a quiet stack is worth keeping as its own measurement. So H1 keeps its
-# meaning and H1B pays a second launch startup, ~20 s, to get a clean one.
-#
-# SAFETY, and jazzy.md section 7: the example's joint_trajectory_position_controller claims BOTH
-# position and velocity command interfaces (bringup/config/example_controllers.yaml:44-50), the
-# configuration the joint_velocity_controller comment in that same file suspects of crashing
-# joint_trajectory_controller on jazzy. The arm move below is the first thing in this repo that
-# will ever command it on real hardware. Nothing here tries to resolve that. What it does do is
-# fail loudly and safely if it happens:
-#   - the arm is commanded FIRST, while the wheels are still stopped, so a crash during the arm
-#     move cannot leave a wheel spinning;
-#   - the wheel command is skipped outright if the component is no longer active afterwards, and
-#     H1B.arm_survived turns that into a FAIL rather than a silent skip;
-#   - hil_record.py never blocks forever -- it waits at most 15 s for a subscriber, then writes
-#     its file and exits -- so a dead stack costs seconds, not a hung suite;
-#   - if a crash does land mid-spin the servos keep their last goal speed in firmware, which is
-#     why after_exit is read back and gated, and why scenario_end's final_stop_wheels and the
-#     EXIT trap's cleanup_all both COMMAND zero afterwards.
+# H1B: the shipped example, commanded. Arm first; wheels only if the component is still active.
+# See docs/bench-check.md, "Example stack (H1 and H1B)".
 h_H1B() {
   scenario_begin H1B || return $?
   timeout -s INT 420 ros2 launch waveshare_servos example.launch.py "port:=$PORT" gui:=false \
@@ -661,17 +554,12 @@ h_H1B() {
   wait_controllers_active 90 joint_state_broadcaster joint_trajectory_position_controller \
     joint_velocity_controller && fact controllers_active true || fact controllers_active false
   fact hw_state "$(hw_state example_ws_ros2_control)"
-  # Phase 4 spawns diff_drive_controller --inactive deliberately (example.launch.py:162-168): it
-  # claims the same joint3/joint4 velocity command interfaces as joint_velocity_controller, and
-  # ros2_control hands each command interface to exactly one controller, so an active one would
-  # take the wheels away from the controller this scenario commands. Nothing in the bench noticed
-  # today if that regressed -- to active, or to absent because the separate apt package
-  # (ros-jazzy-diff-drive-controller, package.xml:60) is not installed. An empty fact is the
-  # "absent" case and H1B.diff_drive fails on it just as it fails on "active".
+  # diff_drive_controller must be loaded but inactive (it claims the wheel command interfaces);
+  # an empty state means absent, and H1B.diff_drive fails on both.
   fact diff_drive_state "$(controllers_snapshot | awk '$1=="diff_drive_controller" {print $NF}')"
   $RECORD wait_js --timeout 20 > /dev/null
-  # Step 3: the arm, gated the way H2 gates it. Same two targets and same 2 s, so H1B.target and
-  # H2.target are the same measurement on the two different stacks and can be read side by side.
+  # The arm, as H2 moves it: same targets and 2 s, so H1B.target and H2.target compare
+  # directly.
   move ex_move_to_0 joint1 0.0 2.0 1.5 joint_trajectory_position_controller
   move ex_move_to_06 joint1 0.6 2.0 1.5 joint_trajectory_position_controller
   fact arm_state_after \
@@ -679,19 +567,16 @@ h_H1B() {
   local state
   state=$(hw_state example_ws_ros2_control)
   fact hw_state_after_arm "$state"
-  # Step 4: the wheels, gated the way H3 gates it -- 2.0 rad/s for 6 s, then an explicit stop.
-  # Guarded, because commanding wheels through a stack that has just died is how a bench ends up
-  # with servos spinning on a latched goal speed and no process to stop them.
+  # The wheels, as H3: 2.0 rad/s for 6 s, then a stop. Skipped if the component died, so no
+  # wheel is left on a latched goal speed with no process to stop it.
   if [ "$state" = active ]; then
     fact vel_attempted true
     spin ex_vel_2 "2.0,2.0" 6.0 "0.0,0.0" 2.5 "" /joint_velocity_controller/commands
   else
     fact vel_attempted false
-    hil_log "component is '$state' after the arm move; skipping the wheel command (section 7)"
+    hil_log "component is '$state' after the arm move; skipping the wheel command"
   fi
-  # Step 7: the launch's own SIGINT teardown. H10 gates this shape for a bare ros2_control_node
-  # under SIGINT and SIGTERM; this is the same proof for the wrapper a user actually runs, and
-  # on a stack that has just driven both an arm joint and a wheel rather than an idle one.
+  # The launch's own SIGINT teardown, after an arm and a wheel moved (H10 covers a bare node).
   kill_tagged INT "ros2 launch waveshare_servos"
   wait "$LAUNCH_WRAP" 2> /dev/null
   fact launch_exit_code $?
@@ -758,7 +643,7 @@ h_H5C() {
 
 h_H6() {
   scenario_begin H6 || return $?
-  start_stack "" "[joint3, joint4]"          # the wheels stay at 0 throughout H6 (12.4 item 6)
+  start_stack "" "[joint3, joint4]"          # the wheels stay at 0 throughout H6
   fact driver_warns_before "$(grep -c '\[WARN\]\|\[ERROR\]' "$CM_LOG")"
   $RECORD record --duration 4 --label probe_window --out "$SDIR/probe_window.json" &
   local recorder=$!
@@ -771,10 +656,8 @@ h_H6() {
   local kind flag holder probe_pid sampler next_log
   for kind in flock_holder excl_holder; do
     flag=$([ "$kind" = flock_holder ] && echo --no-exclusive)
-    # The baseline for "the refused configure changed nothing" is taken per holder, immediately
-    # before it and while the port is free -- not once at the top of the scenario, where H6's own
-    # active stack legitimately wrote the goal registers, and not once for both holders, which
-    # would stretch the comparison across two failed start_stacks of an unpowered arm.
+    # Baseline per holder, just before it and with the port free (H6's active stack above
+    # legitimately wrote the goal registers).
     wait_port_free 15
     readback "${kind}_pre" --read-only --registers --ids 1,2,3,4 > /dev/null
     timeout -s KILL 60 "$PORT_PROBE" --port "$PORT" --hold 30 $flag > "$SDIR/$kind.txt" 2>&1 &
@@ -783,12 +666,8 @@ h_H6() {
     # as it owns the port, and carries the pid, so the hold window is observed and not assumed.
     probe_pid=$(wait_holding "$SDIR/$kind.txt" 20)
     fact "${kind}_probe_pid" "$probe_pid"
-    # 12.5 wants the holders sampled once the driver's own configure has been refused -- a
-    # leaked fd from the failed component is what makes it two -- and that is inside the hold,
-    # not after start_stack returns, which can outlast a 30 s hold waiting on a spawner that
-    # will never come up. The sampler waits for the refusal, then for the driver to let go.
-    # It also records whether the holder was still alive when the refusal appeared: a holder that
-    # expired first lets the driver succeed, and that is the sampler's fault, not the driver's.
+    # Sample the holders inside the hold, 1 s after the refusal (a leaked driver fd makes two),
+    # and record if the holder was alive then: an expired hold lets configure succeed.
     : > "$SDIR/$kind.holders"
     echo false > "$SDIR/$kind.within"
     next_log=$SDIR/cm$((${STACK_N:-0} + 1)).stdout
@@ -813,8 +692,8 @@ h_H6() {
     fact "${kind}_refusal_within_hold" "$(cat "$SDIR/$kind.within")"
     fact "${kind}_spawner_rc" "$SPAWNER_RC"
     fact "${kind}_controllers_active" "$CONTROLLERS_ACTIVE"
-    # Both refusals -- EBUSY from the exclusive holder and LOCK_FAILED from the flock-only one --
-    # end in "refusing to share the bus" (src/waveshare_servos.cpp:1584-1587 and :1616-1620).
+    # Both refusals (EBUSY from an exclusive holder, LOCK_FAILED from a flock-only one) log
+    # "refusing to share the bus".
     fact "${kind}_driver_refusals" "$(grep -c 'refusing to share the bus' "$CM_LOG")"
     fact "${kind}_serial_speed_lines" "$(grep -c 'serial speed' "$CM_LOG")"
     stop_stack TERM
@@ -835,9 +714,8 @@ h_H7() {
   stop_stack KILL
   readback pos_readback --read-only --registers --ids 1,2 > /dev/null
   start_stack "inverted2:=true inverted4:=true" "[joint3, joint4]"
-  # No stop is published: the SIGKILL must land while +2.0 rad/s still stands, or the goal-speed
-  # register reads 0 and the wheels have already ramped down (12.5, H7.vel_register/vel_physical).
-  # The wheels are stopped immediately afterwards by vel_stop, by scenario_end and by the trap.
+  # No stop: the SIGKILL must land while +2.0 rad/s stands, or the goal-speed register reads 0.
+  # vel_stop, scenario_end and the EXIT trap stop the wheels afterwards.
   spin vel_spin "2.0,2.0" 6.0
   stop_stack KILL          # killed while the wheels still turn: the raw slope is the evidence
   readback vel_readback --read-only --registers --ids 3,4 --samples 21 --interval-ms 50 > /dev/null
@@ -850,7 +728,7 @@ h_H7() {
 
 h_H8() {
   scenario_begin H8 || return $?
-  # max_accel is rad/s^2 and the ACC register is 100 steps/s^2 per count (include/units.hpp:66),
+  # max_accel is rad/s^2 and the ACC register is 100 steps/s^2 per count (include/units.hpp),
   # so the two values that land on 10 and 150 counts are 10*100*2pi/4096 and 150*100*2pi/4096.
   local slow="speed1:=1.0 speed3:=2.0 speed4:=9.2038847 accel4:=1.5339808"
   local fast="speed1:=4.0 speed3:=9.2038847 speed4:=9.2038847 accel4:=23.0097118"
@@ -861,22 +739,18 @@ h_H8() {
       wheel=8.0        # 4x joint3's 2.0 rad/s clamp
     else
       start_stack "$fast" "[joint3, joint4]"
-      # joint3's own clamp, which is also the wheel command interface's declared max and the
-      # 6000-count register ceiling: lround(9.2038847 * 651.8986) == 6000 either way, so the
-      # register row of 12.5 does not need a command outside the interface to reach it
+      # joint3's clamp = the interface max = the 6000-count register ceiling
+      # (lround(9.2038847 * 651.8986) == 6000), so no command outside the interface is needed.
       wheel=9.2038847
     fi
     move "prep_$stack" joint1 0.0 2.0
-    # 1.0 rad in 0.2 s (5 rad/s), so the servo's goal-speed clamp limits the move in both stacks.
-    # The recording runs 2.5 s past the trajectory: H8.speed_arm allows t_slow up to 1.60 s, and
-    # settle() reports NaN if the last sample is still outside the band.
+    # 1.0 rad in 0.2 s, so the servo's speed clamp limits the move. 2.5 s post-roll: H8.speed_arm
+    # allows t_slow up to 1.60 s, and settle() is NaN if the last sample is outside the band.
     move "settle_$stack" joint1 1.0 0.2 2.5
     [ "$stack" = slow ] && spin slow_wheel "8.0,0.0" 4.0 "0.0,0.0" 3.0
     spin "t90_$stack" "0.0,3.0" 5.0 "0.0,0.0" 3.0
-    # 12.5 reads the registers after a SIGKILL *mid-motion*: the driver writes the goal speed it
-    # is pacing right now, so joint1 has to be inside a trajectory that demands more than its
-    # max_speed (2.4 rad in 0.3 s = 8 rad/s) and joint3 still commanded at its own clamp. The
-    # wheel command persists in the controller, so one --once publication is enough.
+    # SIGKILL mid-motion: joint1 in a 2.4 rad / 0.3 s (8 rad/s) move, over its max_speed, and
+    # joint3 at its clamp. The controller keeps the wheel command, so one --once publish is enough.
     r2 15 topic pub --once /wheels/commands std_msgs/msg/Float64MultiArray \
       "{data: [$wheel, 0.0]}" > /dev/null 2>&1
     move "kill_$stack" joint1 -1.4 0.3 3.0 &
@@ -897,16 +771,8 @@ h_H9() {
   scenario_begin H9 || return $?
   start_stack "phantom:=true allow_missing:=true nine:=true" "[joint3, joint4, joint5]"
   r2 20 control list_hardware_interfaces > "$SDIR/hardware_interfaces.txt" 2>&1
-  # 70 s, raised from 40 (Phase 5). The recording has to OUTLAST the inactive/active cycle, not
-  # merely reach it, because the only gate that has ever caught the multi-turn reset of
-  # jazzy.md section 6 step 6 is g1c.joint3/g1c.joint4 over this file, and g1c can only see a
-  # reset in samples taken AFTER the component came back. The body ahead of the cycle already
-  # measures ~38 s on this bench -- 15 s of wheel steps, two arm moves at ~6 s each and a 6 s
-  # /diagnostics capture -- so at 40 s the cycle was landing within a couple of seconds of the
-  # recorder's own deadline, and on the two archived runs it fitted only by luck. A recorder
-  # that stops first does not make g1c fail; it makes g1c PASS over a window that cannot contain
-  # the defect, which is the same vacuous-gate failure EXAMPLE_IDS had. H9.cycle_recorded gates
-  # that it really did outlast the cycle, so this number cannot quietly become too small again.
+  # 70 s: the recording must outlast the component cycle, or g1c sees no post-cycle samples.
+  # See docs/bench-check.md, "Component cycle (H9)".
   $RECORD record --duration 70 --djs --label interfaces --out "$SDIR/interfaces.json" &
   local recorder=$!
   sleep 5
@@ -926,19 +792,8 @@ h_H9() {
   move arm_back joint1,joint2 0.0,0.0 1.0
   diagnostics 6
   fact t_cycled "$(now)"
-  # The recovery half of jazzy.md section 6 step 6. The cycle itself is not new -- H9 has run it
-  # since Phase 2 -- but until Phase 5 both transition results were thrown away and nothing after
-  # the cycle was recorded, so the only consequence anything gated was the wheel-position
-  # continuity g1c reads out of the recording above. The three facts below are what let
-  # hil_gates.py h9() gate the other half: that the component came BACK.
-  # stdout is chatter and goes to /dev/null; stderr is kept, per transition, in the scenario
-  # directory. It used to go to /dev/null too, and that threw away the only sentence that says
-  # WHICH half of a failed cycle failed: ros2controlcli prints the service name and the returned
-  # `ok: false` / message on stderr, and cycle_inactive_rc / cycle_active_rc are bare exit codes
-  # that cannot distinguish "the service was never there" from "the component refused the
-  # transition". Without these two files a red H9.cycle_state has no explanation anywhere in the
-  # run tree. The redirection is on the r2 wrapper, so `$?` on the next line is still r2's own
-  # status (r2 returns the timeout/ros2 status at r2:157) and the recorded facts do not change.
+  # Cycle the component. Keep each transition's stderr: ros2controlcli prints the failing service
+  # and its message there, which the bare exit codes cannot tell apart.
   r2 30 control set_hardware_component_state bench inactive \
     > /dev/null 2> "$SDIR/cycle_inactive.stderr"
   fact cycle_inactive_rc $?
@@ -950,12 +805,8 @@ h_H9() {
   # samples that follow it: those, and only those, are the ones g1c can see a reset in.
   fact t_cycle_done "$(now)"
   fact hw_state_after_cycle "$(hw_state)"
-  # An `active` label is the controller manager's opinion of its own state machine; it is not
-  # evidence that the bus came back. These two moves are that evidence, and they are the reason
-  # the recorder above was lengthened: a component that reports active but whose write path is
-  # dead answers this row and nothing else. 0.4 rad is inside the arm's <command_interface>
-  # min/max on every bench render, and the park that follows leaves the arm where the next
-  # scenario expects to find it (the discipline H12's park_final and H11's soak_park keep).
+  # 'active' does not prove the bus is back; these moves do. 0.4 rad is inside every render's
+  # command limits, and the park leaves the arm at 0 for the next scenario.
   move arm_after_cycle joint1,joint2 0.4,0.4 1.0
   move arm_after_park joint1,joint2 0.0,0.0 1.0
   wait $recorder
@@ -985,9 +836,8 @@ h_H10() {
   wait_port_free 10 && fact port_free_within_10s true || fact port_free_within_10s false
   fact port_holders_after_exit "$(port_holders)"
   probe probe_after_exit
-  # The second stimulus of 12.5: SIGTERM, not SIGINT, to a bare ros2_control_node, again with a
-  # wheel turning. The launch's own SIGINT teardown is the one H1 exercises, against the packaged
-  # default port which that scenario deliberately does not override, so it is not repeated here.
+  # Second stimulus: SIGTERM (not SIGINT) to a bare ros2_control_node with a wheel turning.
+  # H1B covers the launch's own SIGINT teardown.
   start_stack "" "[joint3, joint4]"
   r2 10 topic pub --once /wheels/commands std_msgs/msg/Float64MultiArray "{data: [1.0, 1.0]}" \
     > /dev/null 2>&1
@@ -1003,96 +853,26 @@ h_H10() {
   scenario_end
 }
 
-# H11: the soak of PHASE3 5.13. Ten minutes of the real Phase 3 cycle -- one sync read of four
-# servos, one position sync write for the arm, one speed sync write for the wheels -- so the
-# failed-transaction rate of jazzy.md item 3 is produced by this harness and not by a hand-run
-# probe. The load matches probe 3 Q1 (100 Hz, 4 read, 2+2 written) except that the wheels turn:
-# a stationary bus is not the bus a robot runs on, and probe 3 Q2 showed the timeout floor is
-# measured under load. That the wheels really did turn is not assumed: h11's wheels_turning row
-# reads it back out of the recording, because a publish that never matched a subscriber would
-# otherwise buy a clean failed-transaction rate on a load 5.13 forbids. Only the last 20 s are
-# recorded: the counters, not the samples, are the measurement, and a ten-minute /joint_states
-# capture is tens of MB for nothing.
-#
-# THE RUNTIME BUDGET, against ctest's TIMEOUT 2400 (CMakeLists.txt:416). The baseline is not the
-# 998 s of PHASE3 5.17 any more -- that arithmetic (998 + 600 + 40 = 1638) predates Phase 4. The
-# measurement to reason from is the archived post-Phase-4 full run, which took 26m58s = 1618 s
-# with SOAK_S at its 600 s default
-# (phase5_evidence/post_phase4_baseline_2026-09-21_1659/hil_check.txt, summary line).
-#
-# Phase 5 spends some of the remaining margin in three places. All three are ESTIMATES, not
-# measurements -- none has run on the bench -- so the first real run should replace them with
-# observed begin/end deltas out of run.log. Each is built from segments that WERE measured in
-# that archived run, and the segment is named so the estimate can be checked:
-#   H1B, new: a second example.launch.py startup, two arm moves, a 6 s spin with its stop, the
-#     SIGINT teardown and a readback/probe pair. ~75-95 s, kept as first written. The one measured
-#     anchor is H1, the same launch idling: 36.4 s begin-to-end (16:59:35.910 -> 17:00:12.336),
-#     which includes a 9 s recording and a 12 s /diagnostics capture H1B does not take and
-#     excludes H1B's 8 s of moves, 9 s of spin-and-stop and its readback/probe pair (the probe
-#     defaults to --hold 0, port_probe.cpp:47, so it costs nothing to speak of). That puts H1B
-#     nearer 40 s than 95, so this bullet is the conservative end of the budget, not the likely
-#     one; it stays until a run measures it.
-#   H9, changed: the interfaces recording goes 40 s -> 70 s and the body gains two post-cycle arm
-#     moves, and the body ends on `wait $recorder`. Which of the two sets the length flips here.
-#     In the archived run the stack lived 56 s (17:14:36.011 -> 17:15:32.403): the recorder
-#     started ~12 s in, ended at ~52 s, and the body was still running, so the wait cost almost
-#     nothing. At 70 s the recorder ends at ~82 s while the body -- 44 s of steps, moves and
-#     /diagnostics after the recorder starts, the two new moves included -- ends at ~56 s, so the
-#     recorder now sets the length and the scenario runs ~86 s. ~+30 s.
-#   H12, new: THREE bring-ups, four arm moves, a 6 s spin and four readbacks of its own (plus
-#     scenario_begin's and scenario_end's, which every scenario pays). H7 is the scenario of the
-#     same shape, and its three segments were measured at 12.3 s (stack + one 2 s move +
-#     KILL stop + one readback), 22.1 s (stack + 6.5 s spin + KILL stop + two readbacks) and
-#     19.8 s (stack + spin + TERM stop + scenario_end). H12's stack 1 and stack 3 are that first
-#     shape, ~12 s each; stack 2 is the second shape plus two arm moves, ~31 s; scenario_begin
-#     and scenario_end add ~5 s. ~60-80 s, the spread being the 9-12 s that one start_stack
-#     itself varied by across H7's three calls.
-# So the suite is about 1618 + 75 + 30 + 60 = 1783 s at the low end and 1618 + 95 + 30 + 80 =
-# 1823 s at the high end: call it ~1780-1825 s, i.e. 575-620 s of margin under TIMEOUT 2400. (The
-# figure this comment carried before Phase 5's review -- ~1720 s and ~680 s of margin -- had H12
-# missing from it entirely and took H1B at its low end.) Still ample; not ample enough to keep
-# adding scenarios without re-measuring.
-#
-# Phase 5's own full run then MEASURED those fifteen scenarios at 29m09s = 1749 s
-# (phase5_evidence/phase5_run1/hil_check.txt, summary line), and that is the number Phase 6
-# (PHASE6_SPEC E.2) builds on. Its five scenarios are ESTIMATES again, to be replaced by the
-# begin/end deltas of their first real runs:
-#   H13 ~25 s: the guard's snapshots with census at ~3 s each (two, three when guard_end has to
-#     restore) and two 4-5 s scans, explicit and default port; the stale-name and positional
-#     scans exit 64 before the port opens.
-#   H14 ~80 s: one stack with a 12 s recorder, a 25 s flock hold, eleven tool runs and the guard's
-#     two snapshots. It holds only because H14 waits on its recorder's pid and never with a bare
-#     `wait`, which would sit out the stack's 420 s watchdog (0.2.6, E.4).
-#   H15 ~35 s: two set_id runs, one scan, four snapshots and a restore that writes nothing.
-#   H16 ~25 s: two calibrate runs, one read, four snapshots and a restore.
-#   H17 ~8 s: one snapshot with census.
-# So ~+175 s, ~1925 s in all, ~475 s of margin under TIMEOUT 2400 (G.2 R9).
-#
-# The SOAK_S rule follows from that margin: WAVESHARE_HIL_SOAK_S is 600 above, and raising it adds
-# its own difference second for second. At 750 the run is ~2075 s, ~325 s inside the timeout --
-# about what 900 left before Phase 6 -- so 750 is the last value that fits; above it, raise
-# ctest's TIMEOUT 2400 with it.
+# H11: a soak of the real 100 Hz cycle with the wheels turning; only the last 20 s are recorded.
+# See docs/bench-check.md, "Soak (H11)".
+
+# Runtime: a full run takes ~1880 s at SOAK_S=600, under ctest's TIMEOUT 2400. Each soak second
+# adds one; above SOAK_S=750, raise the TIMEOUT too.
 h_H11() {
   scenario_begin H11 || return $?
-  # The tail of this function -- the park move, the 20 s recording, the 12 s diagnostics capture
-  # and the 2 s stop settle -- is about 38 s of the soak, so only the remainder is idled. Clamp
-  # at 0: `sleep -10` is an error, not a short sleep, and a SOAK_S under 40 would otherwise run
-  # the whole scenario with no soak in it and no sign that anything went wrong. 40 is also the
-  # floor the variable itself is clamped to, below the scenario is not a soak at all.
+  # The tail (park, 20 s recording, 12 s /diagnostics, 2 s settle) takes ~38 s, so idle the rest.
+  # SOAK_S is at least 40, and idle at least 0 (`sleep -N` is an error, not a short sleep).
   local soak=${WAVESHARE_HIL_SOAK_S:-600}
   [ "$soak" -ge 40 ] 2> /dev/null || soak=40
   local idle=$((soak - 38))
   [ "$idle" -lt 0 ] && idle=0
-  # The stack's own watchdog must outlast the soak, or the controller manager takes a SIGINT
-  # mid-idle and there is no driver left to record, to capture /diagnostics from, or to print the
-  # totals line. 180 s of slack covers the stack start, the spawner and the teardown.
+  # Watchdog = soak + 180 s (start, spawner, teardown), or the CM gets SIGINT mid-soak and
+  # prints no totals line.
   start_stack "allow_missing:=false nine:=true" "[joint3, joint4]" $((soak + 180))
   fact soak_s "$soak"
   move soak_park joint1,joint2 0.0,0.0 2.0
-  # Logged, unlike every other wheel publish in this file: this one IS the soak's load. If it
-  # times out waiting for a matching subscription the ten minutes still run, on a stopped bus,
-  # which is not the load PHASE3 5.13 specifies. h11's wheels_turning row is what FAILs the run;
-  # this line is what tells the reader why, in run.log, without reading the recording.
+  # Logged: this publish IS the soak's load. If it fails, the soak runs on a stopped bus and
+  # h11's wheels_turning row FAILs; this line says why.
   r2 10 topic pub --once /wheels/commands std_msgs/msg/Float64MultiArray \
     "{data: [1.0, 1.0]}" > /dev/null 2>&1 || hil_log "soak wheel command rc=$?"
   sleep "$idle"
@@ -1101,126 +881,40 @@ h_H11() {
   r2 10 topic pub --once /wheels/commands std_msgs/msg/Float64MultiArray \
     "{data: [0.0, 0.0]}" > /dev/null 2>&1 || hil_log "soak wheel stop rc=$?"
   sleep 2
-  stop_stack TERM          # TERM, never KILL: on_deactivate prints the totals line (5.14)
+  stop_stack TERM          # TERM, never KILL: on_deactivate prints the totals line
   scenario_end             # ... and scenario_end stops the wheels again and proves the port free
 }
 
-# H12: jazzy.md section 6 step 8, the only step of the hardware recipe no other scenario touches.
-# It runs the bench stack once with enforce_command_limits: true (test/hil/controllers/
-# bench_limits.yaml) and proves that the controller manager's JointSaturationLimiter -- not the
-# driver -- clamps a command that lies beyond the joint's <limit>.
-#
-# ATTRIBUTION, which is the whole design of this scenario and the reason it renders anything
-# special. The driver clamps too, and it would clamp these same commands: a position command is
-# held inside the command interface's own min/max (src/waveshare_servos.cpp:587-617) and a wheel's
-# goal speed inside max_speed_counts, 6000 counts = 9.2038847 rad/s when no max_speed param is
-# given (include/waveshare_servos.hpp:214, src/waveshare_servos.cpp:1936-1941). A command clamped
-# at a number both mechanisms agree on is evidence for neither of them -- that is exactly what H8
-# already measures on the driver's side. So the render tightens the two <limit> ceilings and
-# leaves the driver's own where they are:
-#
-#   joint           <limit>          the driver's own ceiling      commanded here
-#   joint3/joint4   velocity 2.0     9.2038847 rad/s               8.0 rad/s
-#   joint1/joint2   +-0.8            +-1.570796 rad                1.2 rad
-#
-# Both commands are INSIDE what the driver would pass and OUTSIDE what the description allows, so
-# a clamp landing on 2.0 rad/s or 0.8 rad can only have come from the limiter: nothing else in the
-# stack knows those two numbers. The driver never reads a URDF <limit> at all -- it parses the
-# <param>s and the command interface min/max, and nothing in src/waveshare_servos.cpp touches
-# info_.limits -- so the two ceilings cannot be confused even in principle. The rendered proof is
-# kept as well, and under its OWN name: this scenario runs three stacks and start_stack re-renders
-# $SDIR/robot.urdf and $SDIR/cm.yaml on every call, so the tightened render is copied aside to
-# $SDIR/robot_limited.urdf and $SDIR/cm_limited.yaml the moment the limited stack is up. Those two
-# files carry the tightened <limit> next to the untouched <command_interface> min/max and the one
-# controller YAML with enforce_command_limits on, for whoever reads a red row later; robot.urdf
-# itself is whatever the LAST stack rendered, which is the final park's ordinary description.
-#
-# TRAP (c) of the Phase 4 amendment, and the reason for the first stack. With the flag on, an arm
-# servo whose MEASURED position is more than 0.0087 rad outside its <limit>
-# (joint_limits_helpers.hpp:32, OUT_OF_BOUNDS_EXCEPTION_TOLERANCE = 0.0087, "0.5 degrees") makes
-# compute_position_limits throw, and the controller manager deactivates the arm controller instead
-# of clamping anything -- a failure with nothing to do with what this scenario tests. So the arm
-# is parked first by an ORDINARY stack with the limiters off, and where it actually came to rest
-# is read off the servos while the port is free.
-#
-# That precondition has two halves and they are answered in two different places, because only
-# one of them is something the shell can act on:
-#   - did the park stack come up and drive the arm at all. The shell records park_spawner_rc,
-#     park_controllers_active and park_cm_exit_code and, if that stack did not come up, ABORTS
-#     before the limited stack ever starts (see the guard below for why an abort and not a FAIL).
-#     Without it the park's evidence was not even retrievable: move() swallows a failed move into
-#     a run.log line, and the second start_stack overwrites the shared spawner_rc /
-#     controllers_active facts, so a silently failed park left the scenario looking healthy.
-#   - where the arm actually rests, which no amount of guarding can force. That is the arm_pre
-#     readback below, taken with the port free, and H12.arm_inside_limits is that reading: the one
-#     precondition this scenario cannot control reports itself in its own row.
+# H12: the controller manager's JointSaturationLimiter, not the driver, clamps a command past a
+# URDF <limit>. See docs/bench-check.md, "Command limits (H12)".
+
+# Only the <limit>s are tightened (the driver never reads them), so a clamp there is the limiter's.
+# The arm is parked first with the limiters off: 0.0087 rad outside a <limit>, the limiter throws.
 h_H12() {
   scenario_begin H12 || return $?
-  # The stimulus, recorded rather than implied: hil_gates.py holds the same four numbers as
-  # constants (hil_gates.py:760-763 -- H12_ARM_LIMIT, H12_ARM_COMMAND, H12_WHEEL_LIMIT,
-  # H12_WHEEL_COMMAND, cited by name because that file is edited more often than this one) and
-  # H12.stimulus compares every one of them against the fact recorded here, so the script and the
-  # gate cannot drift apart silently the way a hard-coded expectation can (H8's register rows).
-  # The two limit names, arm_pos_limit and wheel_vel_limit, are also the xacro arguments the
-  # limited render is given below (declared at hil/descriptions/bench.urdf.xacro:27-28, whose
-  # defaults are the UNtightened 1.570796 and 9.2038847), so a changed ceiling cannot reach the
-  # description without reaching the fact the gate reads.
+  # The stimulus as facts: H12.stimulus compares them with hil_gates.py's H12_* constants, and
+  # the limits are also the xacro arguments below, so script, render and gate cannot drift apart.
   fact arm_pos_limit 0.8
   fact arm_command 1.2
   fact wheel_vel_limit 2.0
   fact wheel_command 8.0
-  # 1. park the arm inside the tightened limit with the limiters OFF, then read where it rests.
-  #    The stack goes away first: nothing may hold the port during a readback (12.4 item 9).
-  #    Both globals are cleared before the call because start_stack can return without setting
-  #    either of them -- the xacro render and the rsp params file each `return 1` ahead of the
-  #    spawner -- and H12 is the fourteenth scenario of the run, so the values H10's last stack
-  #    left behind (spawner_rc=0, controllers_active=true) would read as a park that worked.
+  # 1. Park the arm with the limiters OFF, then read where it rests. Clear both globals first:
+  #    start_stack can return early and leave the previous scenario's values.
   SPAWNER_RC=
   CONTROLLERS_ACTIVE=
   start_stack "" "[joint3, joint4]"
   move park joint1,joint2 0.0,0.0 2.0
   stop_stack TERM
-  # The park stack's own evidence, under keys of its own. start_stack and stop_stack write the
-  # shared spawner_rc / controllers_active / cm_exit_code facts, and the two stacks below
-  # overwrite them, so without this copy the park left no trace at all: move() ends in
-  # `|| hil_log "move $1 rc=$?"` and swallows a failed park into one run.log line.
+  # The park stack's facts under own keys: the next two stacks overwrite the shared ones, and
+  # move() only logs a failure.
   fact park_spawner_rc "$SPAWNER_RC"
   fact park_controllers_active "$CONTROLLERS_ACTIVE"
   fact park_cm_exit_code "$CM_EXIT_CODE"
   # arm_pre keeps its label and its place: read with the port free, after the park stack is gone,
   # and BEFORE the guard below, so even an aborted H12 records where the arm was actually left.
   readback arm_pre --read-only --registers --ids 1,2 > /dev/null
-  # The other half of the trap-(c) precondition, guarded the way h_H1B guards its own
-  # (`if [ "$state" = active ]` before the wheel command): if the park stack never came up, the
-  # arm was never driven and the limited stack would start with the arm wherever the previous
-  # scenario left it. Outside the tightened +-0.8 <limit> that is not a clamp test at all --
-  # compute_position_limits throws and the controller manager deactivates the arm controller, so
-  # every clamp row of this scenario would go red for a reason that has nothing to do with the
-  # limiter.
-  #
-  # ABORTED and not FAIL, because the two verdicts mean different things and only one of them is
-  # true here: a FAIL says the code under test did the wrong thing, and this says the bench never
-  # managed to ask it the question. An ABORTED row is louder than a FAIL in exactly the right way
-  # -- run() returns 2 for any ABORTED row, not 1 ('if counts[...ABORTED...] or not port_free:
-  # return 2', hil_gates.py:2557-2558) -- and it cannot be mistaken for a limiter regression.
-  #
-  # Returning 0 rather than 2 is deliberate. The run loop treats any rc=2 from a scenario as
-  # "aborted_all" and aborts every scenario AFTER it with the message "an earlier scenario left
-  # the port held by a process this suite may not kill" -- which is about a port this suite must
-  # not touch, not about a park that did not run. H12 runs before H11, so returning 2 would cost
-  # the ten-minute soak its run and label it with a false reason. Nothing here holds the port:
-  # scenario_end below tears any stack down, stops the wheels and proves the port free, exactly
-  # as it does on the success path, and the ABORTED row already carries the exit code.
-  #
-  # What the abort leaves behind, and why it is safe. The wheels are stopped (this scenario has
-  # not commanded them yet, and scenario_end commands zero anyway) and the port is free, but the
-  # arm is wherever the failed park left it -- which is the very thing being aborted for and
-  # cannot be fixed by the stack that just failed to come up. It endangers nothing downstream:
-  # the tightened +-0.8 <limit> is never rendered, because the abort happens before the limited
-  # stack, and every other scenario renders the xacro's default +-1.570796 against bench.yaml,
-  # which sets enforce_command_limits false (bench.yaml:7) -- so there is no limiter to throw,
-  # the driver's own command-interface clamp still holds, and H11's soak_park parks the arm again
-  # on its way past.
+  # No park stack: the arm was never parked, so the limiter could throw. Record ABORTED (the bench
+  # could not ask), not FAIL; return 0, not 2, so the later scenarios (the soak) still run.
   if [ "$SPAWNER_RC" != 0 ] || [ "$CONTROLLERS_ACTIVE" != true ]; then
     abort_scenario H12 "the park stack did not come up (spawner_rc=[$SPAWNER_RC] \
 controllers_active=[$CONTROLLERS_ACTIVE] cm_exit_code=[$CM_EXIT_CODE]); the arm was never parked, \
@@ -1231,65 +925,33 @@ so the limited stack was not started -- see arm_pre.txt for where the arm actual
   # 2. the same bench stack, rendered with both ceilings tightened and driven by the one
   #    controller YAML that turns the limiters on.
   start_stack "arm_pos_limit:=0.8 wheel_vel_limit:=2.0" "[joint3, joint4]" "" bench_limits.yaml
-  # The tightened render and the limiters-on YAML, copied before stack 3 re-renders both names
-  # over them, plus the name of this stack's own controller-manager log: STACK_N counts stacks
-  # across the whole run, so the limited stack's log is neither the first nor the last cm*.stdout
-  # in this directory and the gate should not have to guess which of the three it is. The limiter
-  # lines themselves ("Creating JointSaturationLimiter for joint ...") can only appear in this
-  # one: bench_limits.yaml:20 sets enforce_command_limits true and bench.yaml:7, which the other
-  # two stacks use, sets it false.
+  # Keep the tightened render, the limiters-on YAML and this stack's CM log name before stack 3
+  # re-renders; only this log can hold the 'Creating JointSaturationLimiter' lines.
   cp "$SDIR/robot.urdf" "$SDIR/robot_limited.urdf"
   cp "$SDIR/cm.yaml" "$SDIR/cm_limited.yaml"
   fact limited_cm_log "$(basename "$CM_LOG")"
   # 2.5 s of post-roll, as H8's settle moves use: the clamp is read off the last sample, so the
   # recording has to outlast the trajectory rather than end inside its final approach.
   move pos_clamp joint1 1.2 2.0 2.5
-  # Back inside the limit immediately, while there is still a controller to do it with: with a
-  # working limiter the command above clamps at exactly 0.8 rad, and the trap-(c) throw fires
-  # 0.0087 rad outside the <limit> -- 5.7 encoder ticks at 2*pi/4096 rad each -- so an arm left
-  # sitting ON its limit is a hand-nudge away from breaking every scenario that follows.
-  #
-  # This move is best-effort and cannot be the whole mitigation: it publishes through the arm
-  # controller of the LIMITED stack, and the case it most needs to cover is precisely the case
-  # where that controller is already gone (the limiter threw and the controller manager
-  # deactivated it), where move() publishes into nothing and logs `move park_back rc=...`. The
-  # park that actually guarantees the bench state is park_final below, on an ordinary stack with
-  # the limiters off, run unconditionally after this stack is torn down. Both are kept: this one
-  # gets the arm off the edge seconds earlier on the healthy path, and it is the move
-  # arm_state_after is read after.
+  # Best effort: back inside the limit while a controller exists (0.8 rad is 5.7 ticks from the
+  # throw). If the limiter threw, this publishes into nothing; park_final below is the guarantee.
   move park_back joint1,joint2 0.0,0.0 2.0
   # After both arm commands, because a limiter throw takes the arm controller down at the moment
   # it enforces, not at activation: start_stack's controllers_active was true either way.
   fact arm_state_after "$(controllers_snapshot | awk '$1=="arm" {print $NF}')"
-  # No stop is published (the H7 pattern): the SIGKILL has to land while 8.0 rad/s still stands,
-  # or the goal-speed register reads 0 and the clamped value is gone. The wheels are stopped
-  # immediately afterwards by vel_stop, again by scenario_end and again by the exit trap.
+  # No stop (as H7): the SIGKILL must land while 8.0 rad/s stands, so the goal-speed register
+  # keeps the clamped value. vel_stop, scenario_end and the EXIT trap stop the wheels.
   spin vel_clamp "8.0,8.0" 6.0
   stop_stack KILL          # the goal-speed registers stay exactly as the driver last wrote them
-  # The limited stack's own numbers, under keys of its own, for the same reason the park's are:
-  # the final park below runs a third start_stack/stop_stack pair and overwrites the shared
-  # spawner_rc, controllers_active, hw_state, port_holders_running, joint_states_seen,
-  # cm_exit_code and port_released facts. cm_exit_code here is a SIGKILL death by construction
-  # (the line above), so it is recorded as the record of what this scenario did, not as a gate.
+  # The limited stack's facts under own keys (the final park overwrites the shared ones).
+  # Its cm_exit_code is a SIGKILL by design: recorded, not gated.
   fact limited_spawner_rc "$SPAWNER_RC"
   fact limited_controllers_active "$CONTROLLERS_ACTIVE"
   fact limited_cm_exit_code "$CM_EXIT_CODE"
   readback vel_readback --read-only --registers --ids 3,4 > /dev/null
   readback vel_stop --ids 3,4 > /dev/null
-  # 3. the park that is not conditional on anything. Whatever happened above -- the limiter
-  #    clamped and park_back worked, or the limiter threw, took the arm controller down and
-  #    park_back published into a dead topic -- the arm may still be resting on 0.8 rad, which is
-  #    5.7 ticks from the trap-(c) throw and would break the NEXT scenario that renders a limit.
-  #    An ordinary stack has the limiters off and the driver's own +-1.570796 rad ceiling, so it
-  #    can always drive the arm back to 0.0 from the edge; the limited stack could not be trusted
-  #    to. This is the suite's park discipline paid where it cannot be skipped (H11's soak_park,
-  #    H9's arm_after_park), and it is cheap: one bring-up, one 2 s move, one teardown and one
-  #    readback is the shape H7's first segment measured at 12.3 s in the archived run
-  #    (phase5_evidence/post_phase4_baseline_2026-09-21_1659/run.log, 17:12:05.861 -> :18.127).
-  #
-  #    Its stack facts land under park_final_*, and the shared keys named above are left holding
-  #    THIS stack's values because it is the last one to run: read spawner_rc / controllers_active
-  #    for H12 and you are reading the final park, not the limited stack.
+  # 3. Unconditional park on an ordinary stack (limiters off): the arm may still rest on 0.8 rad.
+  #    The shared stack facts of H12 hold THIS stack's values.
   SPAWNER_RC=
   CONTROLLERS_ACTIVE=
   start_stack "" "[joint3, joint4]"
@@ -1304,15 +966,13 @@ so the limited stack was not started -- see arm_pre.txt for where the arm actual
   scenario_end
 }
 
-# ------------------------------------------------------------------ Phase 6: H13-H17 (E.3-E.7)
-# Every tool scenario runs between guard_begin and guard_end (E.2): the journal is written before
-# the first tool call from a complete snapshot of the bench, and guard_end -- on every return path
-# once guard_begin succeeded -- compares, restores from the journal if it must, and returns 2 when
-# it could not, which aborts every later scenario so no row runs on a changed bench. The tools are
-# run directly from $TOOLS (tool()), never through `ros2 run`, so their exit codes are their own.
+# ------------------------------------------------------------------ tool scenarios H13-H17
 
-# H13: scan, read-only (E.3). Four scans: the explicit port, no parameter at all (only when the
-# port under test IS the default one), the stale name beside the new one, and a positional port.
+# Each runs between guard_begin and guard_end. See docs/bench-check.md, "EEPROM journal".
+# The tools run directly from $TOOLS, not through `ros2 run`, so their exit codes are their own.
+
+# H13: scan, read-only: explicit port, no parameter (only on /dev/ttyACM0), the stale
+# device_port name beside the new one, and a positional port.
 h_H13() {
   scenario_begin H13 || return $?
   guard_begin
@@ -1333,12 +993,8 @@ h_H13() {
   return $g
 }
 
-# H14: every tool refuses a held port, and the refusals write nothing (E.4). SAFETY: every set_id
-# and calibrate call addresses only ids no servo answers -- 200, 201, and 300, which narrows to 44
-# -- and guard_begin has just proved the census is exactly 1 2 3 4, so even a tool whose refusals
-# are all broken writes nothing to a servo; the pre-Phase-6 binaries meet this too (the H step 12
-# red run). Every command names -p port:="$PORT" (R16). Not run here, by R16: bare set_id or
-# calibrate, any id 0, 254, 255 or 510, and any bench id as a start id -- the CLI tests cover them.
+# H14: every tool refuses a held port and writes nothing. Only silent ids (200, 201, 300 -> 44),
+# after a census of exactly 1-4. See docs/bench-check.md, "Tool scenarios (H13 to H17)".
 h_H14() {
   scenario_begin H14 || return $?
   guard_begin
@@ -1354,8 +1010,7 @@ h_H14() {
   tool cm_scan scan --ros-args -p port:="$PORT"
   tool cm_set_id set_id --ros-args -p port:="$PORT" -p start_id:=200 -p new_id:=201
   tool cm_calibrate calibrate_midpoint --ros-args -p port:="$PORT" -p id:=200
-  # On the recorder's pid, never a bare `wait`: that would also wait for the stack's backgrounded
-  # wrappers, i.e. for the 420 s watchdog (0.2.6).
+  # Wait on the recorder's pid, never a bare `wait` (that also waits for the 420 s watchdog).
   wait "$rec"
   fact driver_warns_after "$(grep -c '\[WARN\]\|\[ERROR\]' "$CM_LOG")"
   stop_stack TERM
@@ -1396,8 +1051,8 @@ h_H14() {
   return $g
 }
 
-# H15: set_id round trip 4 -> 253 -> 4 (E.5), an EEPROM writer, journaled. 253 is the top of scan's
-# range, so moved_scan is the hardware proof that scan reaches it (R15).
+# H15: set_id round trip 4 -> 253 -> 4, journaled. 253 is the top of scan's range, so moved_scan
+# proves that scan reaches it.
 h_H15() {
   scenario_begin H15 || return $?
   guard_begin
@@ -1441,7 +1096,7 @@ sys.exit(0 if d.get('ok') is True and two.get('eeprom', {}).get('33') == 0 and
 EOF
 }
 
-# H16: calibrate_midpoint on id 2, and the refusal on the wheel id 3 (E.6) [Q1-Q3], journaled.
+# H16: calibrate_midpoint on id 2, and the refusal on the wheel id 3, journaled.
 h_H16() {
   scenario_begin H16 || return $?
   guard_begin
@@ -1460,9 +1115,9 @@ written"
   # Immediately: the independent position read, before anything can let the servo creep.
   eeprom cal_pos read --id 2 --addr 56 --word
   eeprom cal_eeprom snapshot --ids 1,2,3,4 --census --out "$SDIR/cal_eeprom.snap"
-  tool wheel calibrate_midpoint --ros-args -p port:="$PORT" -p id:=3                     # 4 [Q1]
+  tool wheel calibrate_midpoint --ros-args -p port:="$PORT" -p id:=3                     # 4
   eeprom wheel_eeprom snapshot --ids 1,2,3,4 --out "$SDIR/wheel_eeprom.snap"
-  # The offset first, then the goal, then the torque (E.1 restore steps 4-5).
+  # restore writes the offset, then the goal at the new present position, then the torque.
   eeprom restore restore --from "$SDIR/pre_eeprom.snap"
   guard_end full
   g=$?
@@ -1470,7 +1125,7 @@ written"
   return $g
 }
 
-# H17: the bench as found (E.7). Last in the list: every other scenario has run by now.
+# H17: the bench as found. Last in the list: every other scenario has run by now.
 h_H17() {
   scenario_begin H17 || return $?
   eeprom final_eeprom snapshot --ids 1,2,3,4 --census --out "$SDIR/final_eeprom.snap"
@@ -1506,10 +1161,8 @@ cleanup_all() {
   SCEN=exit
   SDIR=$OUT
   teardown_stack
-  # A journal THIS run wrote and no guard_end removed (an interrupt between guard_begin and
-  # guard_end) is restored here, and removed only once the restore succeeded. One this run did not
-  # write is left alone for the next pre-flight. A SIGKILL or a ctest timeout skips this trap
-  # (0.2.12); the next run's pre-flight covers that case.
+  # Restore a journal THIS run wrote that no guard_end removed; remove it only on success.
+  # A SIGKILL or a ctest timeout skips this trap; the next run's pre-flight handles that.
   if [ "$JOURNAL_OURS" = 1 ] && [ -e "$JOURNAL" ] && [ -z "$(port_holders)" ]; then
     if eeprom exit_restore restore --from "$JOURNAL"; then
       rm -f "$JOURNAL" "$JOURNAL_PORT"
@@ -1530,18 +1183,17 @@ for the next pre-flight"
 trap cleanup_all EXIT
 trap 'hil_log "interrupted"; exit 130' INT TERM
 
-# The Phase 6 pre-flight (E.2), after the traps and before anything reads the bench.
+# Tools and EEPROM pre-flight: after the traps, before anything reads the bench.
 [ -x "$EEPROM" ] || { hil_log "missing helper binary '$EEPROM'"; exit 2; }
-# The pre-Phase-6 binaries ignore `port` and always open /dev/ttyACM0, so the override that runs
-# them (H step 12's red run) is refused on any other port: they would reach a bench not under test.
+# A WAVESHARE_HIL_TOOLS override can run older binaries that ignore `port` and always open
+# /dev/ttyACM0, so it is refused on any other port.
 if [ -n "$TOOLS" ] && [ "$PORT" != /dev/ttyACM0 ]; then
-  hil_log "the tools override is for the pre-Phase-6 binaries, which ignore 'port' and always \
+  hil_log "the tools override is for the older tool binaries, which ignore 'port' and always \
 open /dev/ttyACM0; refusing to run them against $PORT"
   exit 2
 fi
-# A journal left by a run that died between guard_begin and guard_end (a SIGKILL, a ctest timeout)
-# is applied, but only to the registers Phase 6's scenarios change -- never over a deliberate
-# change elsewhere -- only on the port it was taken on (F3), and the run stops when it cannot be.
+# A journal left by a killed run: restore it only on its own port and only registers 5, 31, 32,
+# 33, 40, 55; else keep it and stop. See docs/bench-check.md, "Recover an interrupted run".
 if [ -e "$JOURNAL" ]; then
   hil_log "journal from $(date -r "$JOURNAL" '+%F %T') found; bench EEPROM was left changed by an \
 earlier run"
@@ -1552,7 +1204,7 @@ and this run's port is '$PORT'; a journal is applied only to the bench it came f
 applied and is kept -- run on that port, or check the journal and remove it by hand"
     exit 2
   fi
-  # A held port is named as what it is, never as a journal that cannot be applied (F10).
+  # A held port is reported as a held port, not as a journal that cannot be applied.
   if [ -n "$(port_holders)" ]; then
     hil_log "port $PORT is held by [$(port_holders)]; the journal $JOURNAL was NOT applied and is \
 kept -- stop that process and run again"
@@ -1570,15 +1222,14 @@ NOT applied and is kept -- stop that process and run again"
     while IFS= read -r line; do
       hil_log "  $line"
     done < <(grep -v '^RESULT ' "$SDIR/preflight_restore.txt" 2> /dev/null)
-    hil_log "bench EEPROM differs from the journal outside the registers Phase 6 writes (or the \
+    hil_log "bench EEPROM differs from the journal outside the registers the tools write (or the \
 journal is unreadable); not restoring automatically -- see $JOURNAL"
     exit 2
   fi
 fi
 [ -n "$TOOLS" ] || TOOLS=$prefix/lib/waveshare_servos
 hil_log "tools from $TOOLS"
-# H17.eeprom_as_found compares the end of the run with THIS file: one left by an earlier run in the
-# same $OUT must not stand in for a snapshot that failed now (review fix F14).
+# H17.eeprom_as_found compares with THIS file: remove one an earlier run left in $OUT.
 rm -f "$OUT/initial_eeprom.snap" "$OUT/initial_eeprom.txt" "$OUT/initial_eeprom.json"
 if ! eeprom initial_eeprom snapshot --ids 1,2,3,4 --census --out "$OUT/initial_eeprom.snap"; then
   rm -f "$OUT/initial_eeprom.snap"
@@ -1589,29 +1240,8 @@ fi
 timeout 20 ros2 daemon stop > /dev/null 2>&1
 readback initial_readback --read-only --registers --ids 1,2,3,4 > /dev/null
 
-# H11 goes last but one so its ten minutes are spent only after every fast row has reported, and
-# so an abort in it costs nothing but H17 (PHASE3 5.13). That is why H12 runs before it and not
-# after it, even though the list then stops being in numeric order: the number is a name, the
-# position is a cost decision, and H12's three short stacks are an estimated 60-80 s (the budget
-# block above h_H11 shows the arithmetic), which is worth spending before the soak rather than
-# after it. Phase 6's H13-H16 run before it for the same reason, and H15 and H16 above all: they
-# write EEPROM under a journal, and running them before the soak closes that journal long before
-# the ctest budget edge -- a ctest timeout ends this script without its EXIT trap (0.2.12), so the
-# only scenarios it can land in are H11 and H17, and neither holds a journal (R14). H17 is last
-# because it compares the EEPROM every other scenario left behind with the run's start.
-#
-# The report is NOT printed in this order, and nothing keeps the two orders in step. hil_gates.py's
-# run() walks its own CHECKERS tuple and prints the rows in THAT order (`for name, checker in
-# CHECKERS` at hil_gates.py:2520, the tuple at :2464-2467, which today is numeric); a
-# scenario's position in the line below is a cost decision and says nothing about where its rows
-# land in hil_check.txt. What the two lists do have to agree on is their MEMBERSHIP, and that is
-# checked rather than assumed, twice: a scenario that ran on the bench and that no checker in
-# CHECKERS claims produces a FAIL row naming its directory (unchecked_rows(),
-# hil_gates.py:2477-2503) -- the row that exists because H12 was added here, given a controller
-# YAML and its constants, and gated by nothing at all -- and the default list below is parsed by
-# the gate self-test and must name exactly CHECKERS' set (_self_test_scenario_membership, which
-# also holds H13-H16 before H11 and H17 last). The list is also handed to the gates as --expected,
-# so a scenario in it that left no directory and no abort is FAIL <name>.did_not_run.
+# Order is a cost decision: fast rows first, journaled tool scenarios before the soak H11, H17
+# last. It must name exactly hil_gates.py's CHECKERS. See docs/bench-check.md, "Scenarios".
 SCENARIOS=${WAVESHARE_HIL_SCENARIOS:-"H1 H1B H2 H3 H4 H5A H5B H5C H6 H7 H8 H9 H10 H12 H13 H14 H15 H16 H11 H17"}
 aborted_all=0
 abort_all_reason=
@@ -1629,8 +1259,7 @@ for s in $SCENARIOS; do
   SCEN=run
   SDIR=$OUT
   hil_log "$s finished rc=$rc"
-  # 127 is bash's "command not found": a SCENARIOS name with no h_ function. Before Phase 6 that
-  # was a log line only, and the scenario a SKIP in the report; it is an abort now (E.2).
+  # 127 = bash's "command not found": a SCENARIOS name with no h_ function. Abort it.
   if [ "$rc" = 127 ]; then
     if declare -F "h_$s" > /dev/null; then
       abort_scenario "$s" "h_$s returned 127"

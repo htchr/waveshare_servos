@@ -1,10 +1,6 @@
 <?xml version="1.0"?>
-<!-- The bench check's description (PHASE2_SPEC 12.5). One file with arguments, because the ten
-     scenarios differ only in allow_missing_servos, the absent servo, inverted, the two
-     per-joint limits, the two <limit> ceilings H12 tightens and whether every state interface
-     is declared.
-     joint1/joint2 are the arm servos (ids 1 and 2, pos, offset 1.570796); joint3/joint4 are the
-     wheels (ids 3 and 4, vel, unwrap explicitly true); joint5 is the deliberately absent id 9. -->
+<!-- Bench check description; the scenarios vary it through xacro arguments. joint1/2: arm,
+     ids 1, 2 (pos, offset 1.570796); joint3/4: wheels, ids 3, 4 (vel); joint5: absent id 9. -->
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="waveshare_bench">
   <xacro:arg name="port" default="/dev/ttyACM0"/>
   <xacro:arg name="allow_missing" default="false"/>
@@ -16,14 +12,8 @@
   <xacro:arg name="speed3" default=""/>
   <xacro:arg name="speed4" default=""/>
   <xacro:arg name="accel4" default=""/>
-  <!-- The two <limit> values the controller manager's JointSaturationLimiter reads when
-       enforce_command_limits is on (H12 only; every other scenario leaves the limiters off and
-       never notices these). They default to the values the limits were written with, so only H12
-       renders anything different. They are arguments, and NOT the same numbers as the command
-       interface min/max below, because that separation is the whole of H12's attribution: the
-       driver clamps to the command interface min/max and to max_speed_counts and never reads a
-       URDF <limit> at all, so a command clamped at a value only the description knows can only
-       have been clamped by the limiter. See h_H12 in test/hil_check.sh. -->
+  <!-- The <limit> values the JointSaturationLimiter reads. H12 tightens them below the driver's
+       own clamps (position min/max, max_speed), so a clamp at them can only be the limiter's. -->
   <xacro:arg name="arm_pos_limit" default="1.570796"/>
   <xacro:arg name="wheel_vel_limit" default="9.2038847"/>
 
@@ -55,8 +45,8 @@
     <xacro:wheel_link name="joint5"/>
   </xacro:if>
 
-  <!-- With nine:=true every interface of PHASE2_SPEC 7.2 is declared, in that order, the
-       deprecated torque alias included (H9). Otherwise the six H7 needs are declared. -->
+  <!-- nine:=true declares all nine state interfaces, the deprecated torque included (H9);
+       otherwise the six that H7 needs. -->
   <xacro:macro name="states">
     <state_interface name="position"/>
     <state_interface name="velocity"/>

@@ -37,9 +37,8 @@ using Overrides = std::map<std::string, rclcpp::ParameterValue>;
 
 constexpr int kUsage = static_cast<int>(Exit::kUsage);
 
-// A.1 step 1. The handlers are process-wide, so a signal delivered to any thread -- a DDS thread
-// during start-up included -- only sets this flag; the run functions read it through
-// Session::stop and decide where it is safe to stop (never between an EEPROM unlock and its lock).
+// Set by the stop handlers, whichever thread gets the signal. The run functions read it through
+// Session::stop and stop only where it is safe (never between an EEPROM unlock and its lock).
 volatile std::sig_atomic_t g_stop = 0;
 
 void on_stop_signal(int signal_number)
@@ -54,7 +53,7 @@ void install_stop_handlers()
   action.sa_handler = on_stop_signal;
   sigemptyset(&action.sa_mask);
   // Restarted, so a write to a slow terminal is not cut short by the signal; the bus reads are
-  // select()s, which a signal interrupts anyway and readSCS retries (0.2.2).
+  // select()s, which a signal interrupts anyway and readSCS retries on EINTR.
   action.sa_flags = SA_RESTART;
   for (const int signal_number : {SIGINT, SIGTERM, SIGHUP, SIGQUIT}) {
     ::sigaction(signal_number, &action, nullptr);
@@ -64,9 +63,8 @@ void install_stop_handlers()
   ::signal(SIGPIPE, SIG_IGN);
 }
 
-// The stream servo_tools writes its diagnostics to (D-22): every line reaches `target` with
-// "<tool>: " in front, whole, in one write. The library writes bare lines and stays tool-agnostic;
-// the executable is what knows its own name.
+// The diagnostics stream: every line reaches `target` whole, in one write, with "<tool>: " in
+// front. The library writes bare lines; only the executable knows its name.
 class PrefixedLines : public std::streambuf
 {
 public:
@@ -136,10 +134,8 @@ struct ParamsDeleter
   void operator()(rcl_params_t * params) const {rcl_yaml_node_struct_fini(params);}
 };
 
-// A.1 step 4. The overrides rclcpp resolved for this tool's node, minus the parameters rclcpp
-// declares itself (use_sim_time and the like, so no allow-list of rclcpp's own names is kept
-// here); and in `refusals`, one message per other node name that rcl holds overrides for, which
-// rclcpp would drop without a word.
+// The overrides rclcpp resolved for this node, minus the ones it declares itself; and in
+// `refusals`, one message per other node name rcl holds overrides for (rclcpp drops those).
 Overrides node_overrides(Tool tool, std::vector<std::string> * refusals)
 {
   auto node = std::make_shared<rclcpp::Node>(
@@ -176,7 +172,7 @@ Overrides node_overrides(Tool tool, std::vector<std::string> * refusals)
   return overrides;
 }
 
-// Each error as one "<tool>: <message>" line, then the usage line as A.2 shows it.
+// Each error as one "<tool>: <message>" line, then the usage line.
 int usage_exit(Tool tool, const std::vector<std::string> & errors, std::ostream & err)
 {
   for (const std::string & error : errors) {
@@ -187,8 +183,8 @@ int usage_exit(Tool tool, const std::vector<std::string> & errors, std::ostream 
   return kUsage;
 }
 
-// A.1 steps 2-7: everything before the port. 0 with `config` filled when the tool may run,
-// otherwise the exit code, with its reason already printed. Nothing here touches the port.
+// Start-up steps 2-7 (step 1 is in run_tool), all before the port: 0 with `config` filled when
+// the tool may run, otherwise the exit code, with its reason already printed.
 int start_up(Tool tool, int argc, char ** argv, std::ostream & err, ToolConfig * config)
 {
   // Step 2. Logging is not initialised (no ROS log files; the tools print their own messages),
@@ -240,7 +236,7 @@ int start_up(Tool tool, int argc, char ** argv, std::ostream & err, ToolConfig *
   return 0;
 }
 
-// B.3 steps 1-6: the port, the tool, the detail line and the final code.
+// The port, the tool, the detail line and the final exit code.
 Exit run_on_bus(Tool tool, const ToolConfig & config, std::ostream & err)
 {
   ServoBus bus;                       // its destructor closes the port on every path, a throw too
@@ -287,8 +283,8 @@ Exit run_on_bus(Tool tool, const ToolConfig & config, std::ostream & err)
       }
   }
 
-  // Step 5: a port that vanished during the run (a USB drop) says "nothing sent" only if nothing
-  // was written; otherwise the run's own outcome still describes the servo.
+  // A port that vanished during the run (a USB drop) says "nothing sent" only if nothing was
+  // written; otherwise the run's own outcome still describes the servo.
   std::error_code ignored;
   const bool port_exists = std::filesystem::exists(config.port, ignored);
   if (!port_exists) {
@@ -307,7 +303,7 @@ Exit run_on_bus(Tool tool, const ToolConfig & config, std::ostream & err)
 
 int run_tool(Tool tool, int argc, char ** argv)
 {
-  install_stop_handlers();            // A.1 step 1: before anything else
+  install_stop_handlers();            // step 1: before anything else
   PrefixedLines prefixed(std::cerr.rdbuf(), std::string(name_of(tool)) + ": ");
   std::ostream err(&prefixed);
   int code = static_cast<int>(Exit::kInternal);

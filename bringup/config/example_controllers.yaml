@@ -2,25 +2,8 @@ controller_manager:
   ros__parameters:
     update_rate: 100
 
-    # Explicitly off, which is also the default. Writing it here is what decides it, and only here:
-    # the controller manager declares its parameters from this file's overrides before
-    # generate_parameter_library gets a chance to, so with this line present the parameter is a
-    # plain read/write one (ros2 param describe reports read_only False) and with it absent the
-    # generated declaration wins (read_only True, and a set is refused). Either way a set on a
-    # RUNNING stack does nothing at all: the joint limiters are built when the hardware component is
-    # initialised, so after `ros2 param set /controller_manager enforce_command_limits true`
-    # succeeds there are still zero "Creating JointSaturationLimiter" lines and an out-of-range
-    # command produces no error. Both halves measured on 4.48.0.
-    #
-    # Reasons to leave it off in an example: the driver already clamps position commands to the
-    # <command_interface> min/max and bounds goal speed at each joint's max_speed (6000 steps/s,
-    # 9.2 rad/s, by default), so nothing is left unprotected; and with it on, a position joint
-    # whose MEASURED position is more than 0.0087 rad outside its limits makes the
-    # JointSaturationLimiter throw, which nothing in the controller manager's loop catches
-    # (ros2_control 4.48, read from its source), so a servo somebody moved by hand would abort
-    # ros2_control_node instead of being clamped, pre-empting the driver's gentler "hold where you
-    # started" behaviour. test/hil/controllers/bench.yaml keeps it off too. Turn it on once you know
-    # your servos start inside their declared range.
+    # Off (the default). On, a position servo that starts outside its limits would abort
+    # ros2_control_node. See docs/configuration.md, "Command interfaces and limits".
     enforce_command_limits: false
 
     joint_state_broadcaster:
@@ -60,53 +43,16 @@ joint_trajectory_position_controller:
       stopped_velocity_tolerance: 0.01 # Defaults to 0.01
       goal_time: 0.0 # Defaults to 0.0 (start immediately)
 
-# A plain passthrough of the commanded velocity, held until the next command. Not a
-# JointTrajectoryController: a JTC on velocity-only trajectories still segfaults the whole
-# ros2_control_node on jazzy 4.42.1 (re-checked on mock hardware), because a velocity-only point
-# carries no `positions` and two places dereference that empty vector: wraparound_joint
-# (trajectory.cpp:88) on any continuous joint, whatever the timing, and deduce_from_derivatives
-# (trajectory.cpp:446) whenever the first point is already due (time_from_start 0). 4.41's #2359
-# fixed only the single-point case. The crash happens before the controller writes any command, so
-# the wheels are left at their previous goal speed, not at the requested one. A JTC's only job here
-# would be this same passthrough anyway: on a velocity-only command interface it is not a
-# passthrough at all, it runs a closed-loop PID position tracker that needs position and velocity
-# state interfaces plus per-joint gains.
+# Velocity passthrough, held until the next command. Not a JointTrajectoryController: it crashes
+# ros2_control_node on velocity-only trajectories. See docs/operation.md, "Known issues".
 joint_velocity_controller:
   ros__parameters:
     joints:
       - joint3
       - joint4
 
-# Optional demonstration controller: drives joint3/joint4 as a differential base and publishes
-# odometry integrated from their UNWRAPPED multi-turn positions.
-#
-# It ships in a separate apt package (sudo apt install ros-jazzy-diff-drive-controller, declared as
-# an <exec_depend> so rosdep install picks it up too). Without it the launch still brings up the
-# other three controllers, but this controller's spawner exits non-zero and says so.
-#
-# It commands the same two joints as joint_velocity_controller, and ros2_control hands each command
-# interface to exactly one controller, so only one of the two can be active at a time.
-# example.launch.py spawns this one --inactive; swap them atomically with
-#   ros2 control switch_controllers --strict \
-#     --deactivate joint_velocity_controller --activate diff_drive_controller
-# and the reverse to go back. Activating first, without the deactivate, is refused with
-# "command interface 'joint3/velocity' is currently claimed by another controller".
-#
-# It subscribes to geometry_msgs/msg/TwistStamped ONLY (the plain Twist option was removed upstream
-# in 4.0) on /diff_drive_controller/cmd_vel, and publishes /diff_drive_controller/odom. With
-# cmd_vel_timeout below, a single --once publish is honoured for half a second and then braked, so
-# publish continuously (ros2 topic pub -r 20). The once-a-second "Velocity command timed out.
-# Braking." while idle is expected, not a fault.
-#
-# wheel_radius and wheel_separation are EXAMPLE values - this bench has no chassis, and the URDF
-# beside this file is a serial chain rather than a mirrored wheel pair. They are chosen so the
-# arithmetic checks by hand: wheel_separation = 4 * wheel_radius, so both wheels at 1.0 rad/s give
-# twist.linear.x = 0.05 m/s, and left -1.0 / right +1.0 give twist.angular.z = 0.5 rad/s. Measure
-# them on a real robot.
-#
-# Under use_mock_hardware:=true this controller activates and commands the wheels, but the odometry
-# stays at zero: mock_components/GenericSystem never advances a velocity-commanded joint's position
-# state, and position_feedback below reads exactly that state.
+# Optional demo: joint3/joint4 as a differential base; wheel_radius and wheel_separation are
+# example values. See docs/setup.md, "Drive a differential base".
 diff_drive_controller:
   ros__parameters:
     left_wheel_names: ["joint3"]
@@ -121,10 +67,8 @@ diff_drive_controller:
     pose_covariance_diagonal: [0.001, 0.001, 0.001, 0.001, 0.001, 0.01]
     twist_covariance_diagonal: [0.001, 0.001, 0.001, 0.001, 0.001, 0.01]
 
-    # position_feedback: true is what makes this a test of the driver's unwrapper: the odometry
-    # differences each wheel's position state interface, which for a vel joint is the unbounded
-    # multi-turn value. With a wrapping position, every revolution would inject a jump of one wheel
-    # circumference and a permanent heading error.
+    # position_feedback reads the unwrapped multi-turn wheel position; a wrapping position would
+    # add a jump of one wheel circumference per revolution.
     open_loop: false
     position_feedback: true
     enable_odom_tf: true
@@ -133,16 +77,8 @@ diff_drive_controller:
     publish_limited_velocity: false
     velocity_rolling_window_size: 10
 
-    # Body-frame limits. Leave a limit out entirely to disable it (the default is NaN). Do NOT add
-    # has_velocity_limits / has_acceleration_limits / has_jerk_limits: they are deprecated in 4.42.1
-    # ("deprecated, set the respective limits to .NAN for deactivation") and setting one even to
-    # false logs a deprecation warning.
-    # Each limit on its own stays inside the 9.2 rad/s the wheel command interfaces declare:
-    # linear.x 0.4 m/s is 8.0 rad/s per wheel, angular.z 2.0 rad/s is +-4.0 rad/s per wheel. The two
-    # COMBINED are not bounded by either: linear.x 0.4 with angular.z 2.0 asks for 12.0 rad/s on the
-    # outer wheel, which the driver clamps at the joint's max_speed (9.2038847 rad/s by default)
-    # and which enforce_command_limits: true would clamp at 9.2. Pick a pair whose sum fits if you
-    # need these limits to be the only clamp.
+    # Body-frame limits; omit one to disable it. Do not add the deprecated has_*_limits. Both
+    # maxima at once ask 12 rad/s of a wheel; the driver clamps that at max_speed (9.2 by default).
     linear.x.max_velocity: 0.4
     linear.x.min_velocity: -0.4
     linear.x.max_acceleration: 1.0

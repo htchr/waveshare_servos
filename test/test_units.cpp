@@ -1,14 +1,5 @@
-// Unit tests for include/units.hpp + src/units.cpp.
-//
-// The unit under test is pure: no ros2_control, no rclcpp, no bus, no motors. Everything here is
-// arithmetic over one FeedbackSample, so the whole suite runs with the adapter unplugged.
-//
-// Two invariants are worth naming, because they are the reason several of these cases exist:
-// - decode() keeps the Phase 1 operator association, so a non-inverted joint is bit-identical to
-//   the pre-Phase-2 driver (position_conversion_matches_the_legacy_expression asserts exact
-//   equality, never a tolerance);
-// - `inverted` flips exactly three quantities -- position, velocity and load -- and never the
-//   current family, which is an unsigned magnitude on this firmware.
+// Unit tests for include/units.hpp and src/units.cpp: pure arithmetic, no ROS, bus or motors.
+// See docs/design.md, "Feedback block".
 
 #include <gmock/gmock.h>
 
@@ -157,15 +148,12 @@ TEST_F(Units, position_conversion_matches_the_legacy_expression)
   for (int t = -4096; t <= 4096; t++) {
     FeedbackSample sample = reference_sample();
     sample.position_ticks = t;
-    // cpp:734 verbatim, with the Phase 1 operator association: never a precomputed rad per tick.
+    // The original driver's expression and operator order: never a precomputed rad per tick.
     EXPECT_EQ(decode(sample, t, k).position, t * 2 * M_PI / 4096) << "tick " << t;
   }
 
-  // The loop above cannot fail for the association on its own: 4096 is a power of two, so
-  // 2*M_PI/4096 is exact and the hoisted form `t * (2*M_PI/4096)` is bit-identical for every tick.
-  // encoder_steps is any even value in [2, 32768] (PHASE2_SPEC 4.1), and at 1000 the hoisted form
-  // differs by 1 ulp for 704 of these 2001 ticks -- so this is the loop that actually locks the
-  // association down.
+  // At 4096 steps the hoisted form is exact; at 1000 it differs by 1 ulp for 704 of these 2001
+  // ticks, so this loop is the one that detects a changed operator order.
   FeedbackScales odd_steps;
   odd_steps.encoder_steps = 1000;
   ASSERT_DOUBLE_EQ(odd_steps.sign, 1.0);
@@ -179,8 +167,7 @@ TEST_F(Units, position_conversion_matches_the_legacy_expression)
 
 TEST_F(Units, velocity_conversion_matches_the_legacy_expression)
 {
-  // The other half of the association rule (PHASE2_SPEC 3.1), on the velocity line. Again at an
-  // encoder_steps that is not a power of two, where `t * (2*M_PI/steps)` is observably different.
+  // The same operator-order rule for velocity, at 1000 steps where the hoisted form differs.
   FeedbackScales k;
   k.encoder_steps = 1000;
   for (int t = -3000; t <= 3000; t++) {
@@ -256,8 +243,8 @@ TEST_F(Units, default_torque_constant_is_nine_kgf_cm_per_amp)
 
 TEST_F(Units, torque_alias_reproduces_the_legacy_value)
 {
-  // cpp:737 was `ReadCurrent(-1) * 6.0 / 1000.0 * KT_` with KT_ == 9.0, in kg cm. The Phase 2
-  // regrouping is not bit-identical (2 ulp), so the comparison is relative, never `==`.
+  // The original driver computed ReadCurrent(-1) * 6.0 / 1000.0 * 9.0 (kg cm). The regrouped form
+  // can differ by up to 2 ulp, so the comparison is relative.
   const FeedbackScales k;
   for (const int counts : {0, 1, 7, 50, 123, 1000, -50}) {
     FeedbackSample sample = reference_sample();
@@ -325,9 +312,8 @@ TEST_F(Units, status_text_of_zero_is_none)
 
 TEST_F(Units, status_text_names_every_cited_bit)
 {
-  // All five names come from FEETECH's own Python SDK (ERRBIT_VOLTAGE = 1, ERRBIT_ANGLE = 2,
-  // ERRBIT_OVERHEAT = 4, ERRBIT_OVERELE = 8, ERRBIT_OVERLOAD = 32), retrieved by URL; see the
-  // citation comment in src/units.cpp.
+  // The names come from FEETECH's Python SDK (ERRBIT_*), cited in src/units.cpp.
+  // See docs/configuration.md, "Status bits".
   EXPECT_EQ(status_text(0x01), "voltage");
   EXPECT_EQ(status_text(0x02), "angle");
   EXPECT_EQ(status_text(0x04), "overheat");
@@ -441,15 +427,15 @@ TEST_F(Units, offset_applies_to_position_only)
   EXPECT_DOUBLE_EQ(b.torque, a.torque);
 }
 
-TEST_F(Units, speed_counts_match_the_phase1_default)
+TEST_F(Units, speed_counts_match_the_goal_speed_default)
 {
-  // The Phase 1 goal-speed default is the register value 6000, not a rad/s number.
+  // The goal-speed default is the register value 6000 steps/s, not a rad/s number.
   EXPECT_NEAR(steps_from_rad(9.2038847, 4096), 6000.0, 0.5);
   EXPECT_NEAR(rad_from_steps(6000, 4096), 9.2038847, 1e-6);
   EXPECT_NEAR(rad_from_steps(32767, 4096), 50.264, 1e-3);
 }
 
-TEST_F(Units, accel_counts_match_the_phase1_default)
+TEST_F(Units, accel_counts_match_the_acc_default)
 {
   // Likewise the ACC default: 150 counts at the (unverified) 100 steps/s^2 per count scale.
   EXPECT_NEAR(accel_counts_from_rad_s2(23.0097118, 4096), 150.0, 0.5);
@@ -472,11 +458,8 @@ TEST_F(Units, rad_and_step_conversions_round_trip)
 
 TEST_F(Units, plain_structs_default_every_member_to_zero)
 {
-  // apply_feedback() fills a FeedbackSample field by field from a FeedbackBlock. A field left unset
-  // on some path must read 0, not whatever was on the stack -- a stale `load_raw` would go straight
-  // onto a state interface and no compiler warning catches it. Default-initialising over a poisoned
-  // buffer makes the difference deterministic: with a default member initialiser on every member
-  // these read 0, without one they read the poison.
+  // apply_feedback() fills fields one by one, so every member needs a default initialiser.
+  // Placement new over a 0xAB-filled buffer shows a missing one as poison, not as 0.
   alignas(FeedbackSample) unsigned char sample_storage[sizeof(FeedbackSample)];
   std::memset(sample_storage, 0xAB, sizeof(sample_storage));
   FeedbackSample * sample = new (sample_storage) FeedbackSample;

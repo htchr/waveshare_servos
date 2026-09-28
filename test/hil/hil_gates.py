@@ -1,16 +1,7 @@
 """
 Invariant gates, scenario predicates and the report writer for the bench check.
 
-PHASE2_SPEC 12.2 (the gates), 12.4 (the output contract) and 12.5 (the ten scenarios).
-
-  hil_gates.py --self-test          the gates over synthetic series with injected defects
-  hil_gates.py --run-dir DIR ...    check one run directory and write its report
-
---self-test needs no hardware, no ROS and no run directory; it is the part `colcon test` can
-prove. Command times (t_cmd, t_stop) and message header stamps are one clock here: the recorder
-takes time.time() and the controller manager stamps with a real, unsimulated clock. There is no
-path from FAIL to anything else anywhere in this file (decision D5); INCONCLUSIVE is legal only
-for the keys hil_check.sh freezes and passes in with --allow-inconclusive.
+Modes: --self-test (synthetic series with injected defects, no hardware) or --run-dir DIR.
 """
 
 import argparse
@@ -22,35 +13,36 @@ import os
 import re
 import sys
 
-# Driver constants, copied from the driver's own defaults and never rounded (PHASE2_SPEC 12.3);
-# they are updated with the sections they come from, never independently.
-ENCODER_STEPS = 4096                             # param_parsing.hpp kEncoderSteps
+# Driver defaults, copied exactly (never rounded) from src/driver_defaults.hpp and
+# include/units.hpp; change them only together with the driver.
+ENCODER_STEPS = 4096                             # driver_defaults.hpp kEncoderSteps
 STEPS_PER_RAD = ENCODER_STEPS / (2.0 * math.pi)  # 651.8986
 TICK = 2.0 * math.pi / ENCODER_STEPS             # 0.00153398 rad, the encoder quantum
 MAX_SPEED_COUNTS = 6000
 MAX_ACCEL_COUNTS = 150
 V_CAP = MAX_SPEED_COUNTS * TICK                  # 9.20388 rad/s, the servo speed ceiling
 VQ = 50 * TICK                                   # 0.07670 rad/s, reported-velocity quantum
-CURRENT_PER_COUNT_A = 0.006                      # param_parsing.hpp kCurrentPerCountA
-TORQUE_CONSTANT_NM_PER_A = 0.8825985             # param_parsing.hpp kTorqueConstantNmPerA
+CURRENT_PER_COUNT_A = 0.006                      # driver_defaults.hpp kCurrentPerCountA
+TORQUE_CONSTANT_NM_PER_A = 0.8825985             # driver_defaults.hpp kTorqueConstantNmPerA
 NM_PER_KGFCM = 0.0980665                         # units.hpp kNmPerKgfCm
-IO_TIMEOUT_MS = 5                                # param_parsing.hpp kIoTimeoutMs (PHASE3 5.19)
+IO_TIMEOUT_MS = 5                                # driver_defaults.hpp kIoTimeoutMs
 PING_ATTEMPTS = 3
 MAX_READ_FAILS = 50
 ALLOW_MISSING_SERVOS = False
 
-# Decision D4 (PHASE2_SPEC 3.2): inverted flips exactly these three quantities.
+# `inverted` flips exactly these three quantities.
+# See docs/configuration.md, "Joint frame".
 INVERTED_FLIPS = ('position', 'velocity', 'load')
 
-# The guard D4/A9 asks for: effort, current and torque are unsigned magnitudes and never flip.
+# Import-time guard: effort, current and torque are unsigned magnitudes and never flip.
 for _name in ('effort', 'current', 'torque'):
     if _name in INVERTED_FLIPS:
         raise SystemExit(
-            "hil_gates: INVERTED_FLIPS contains '%s'; PHASE2_SPEC 3.2 and decision D4 say "
+            "hil_gates: INVERTED_FLIPS contains '%s'; in the driver, "
             'inverted flips position, velocity and load only' % _name)
 
-# Gate tolerances, every one derived and justified in PHASE2_SPEC 12.2.
-G1B_SLACK = 12 * TICK      # 0.018408 rad; the worst Phase 1 excess is 5.5 ticks
+# Gate tolerances. See docs/bench-check.md, "Gate thresholds".
+G1B_SLACK = 12 * TICK      # 0.018408 rad; the worst measured excess is 5.5 ticks
 G1C_EPS = 1e-9             # G1c is exact; this is float noise, not a tolerance
 G2_WINDOW = 0.50           # s, centred on the sample, taken by time and not by count
 G2_MIN_SAMPLES = 25
@@ -63,226 +55,43 @@ G3_ABS = 0.05              # rad
 STALE_MIN = 3              # bit-identical samples that make a stale run
 STALE_MOVING = 0.05        # rad/s; a parked joint repeating itself is not stale
 
-# Resting drift of `present_position` between two readbacks of the same servo, used by
-# registers_unchanged() for H5A.registers and for H6's two holder rows.  The registers themselves
-# (torque_enable, acc, goal_position_raw, goal_speed_raw, mode) are compared for *equality* and
-# that is what actually proves the driver did not re-program anything; these two numbers only say
-# how far the shaft may be found to have settled in between.
-#
-# A `pos` joint is servoing a goal position the whole time, so it has no relaxation path and keeps
-# the original bound.  A `vel` (wheel-mode) joint is commanded a *speed* of zero and nothing holds
-# its shaft: when the drive stops, gearbox backlash and elastic wind-up in the wheel unwind, and
-# the encoder reports that as a slow position change.  The magnitude is set by mechanics, not by
-# elapsed time, so the allowance is a constant and not a rate.
-#
-# The number comes from the three bench runs, not from what makes one row pass.  The pairing rule
-# is spelled out here because the count depends entirely on it, and an unstated rule got the
-# sample misquoted once already (decision W2(i)):
-#   1. Corpus.  Every *.json under one run directory that parses and carries a top-level "ids"
-#      map.  Which files that is is the one ambiguity that matters, so all three readings are
-#      given below: (A) only basenames ending _readback.json; (B) every file whose id blocks
-#      carry a "registers" dict, i.e. every full register readback, which adds the H8 *_stop and
-#      H10 after_exit/term_after_exit reads; (C) every file whose id blocks carry pos_last_raw,
-#      which additionally admits the position-only stop_wheels reads.
-#   2. Time key.  The file's mtime - the instrument writes the file when the read completes, and
-#      the readback JSON carries no wall clock of its own.  Sort ascending within a run
-#      directory; never pair across run directories.
-#   3. Pairing.  Per servo id, pair each readback with the next readback in that order that also
-#      answers for that id (n >= 1).
-#   4. Eligibility.  Keep the pair only if both endpoints report mode == 1 (wheel) and
-#      moving == false.
-#   5. Drift.  pos_last_raw(later) - pos_last_raw(earlier), absolute, no modulo unwrap - exactly
-#      the quantity registers_unchanged() compares, so the sample and the gate measure the same
-#      thing.
-#   6. Exclusion.  Drop a pair whose |drift| > 50 ticks: the wheel was driven in between (or the
-#      raw value wrapped), which is not resting drift.  This is a clean separation and not a
-#      convenient one - the 24 pairs it drops are 311, 316, 436, 437, 439, 456, 610, 616, 860,
-#      1402, 1497, 1500, 1501 and 2697 ticks, so there is a 260-tick empty gap between the
-#      largest kept value and the smallest dropped one.
-# Over hil_out, hil_out2 and hil_out3 that rule gives:
-#   (A) 48 intervals, 3085 s (51 min) of wheel rest, 10 of them >= 100 s: 46 drifted 0 ticks, one
-#       1 tick (over 18.8 s) and one 3 ticks (over 193 s - id4 in H5A of run 3, the 1.5 min after
-#       H4 had driven it three revolutions).
-#   (B) 64 intervals, 3085 s, 14 of them >= 100 s: 62 zeros, the same 1 tick, the same 3 ticks.
-#       This is the corpus behind the earlier "64 intervals / 3 ticks once" quotation, which was
-#       right for corpus B and wrong only in not saying which corpus it was.
-#   (C) 132 intervals, 3114 s, 14 of them >= 100 s: 129 zeros, the same 1 tick, and 3 ticks
-#       twice - the second 1.1 s after H10 had stopped id4 in run 1.
-# The 3-tick ceiling also shows up inside single 0.4 s readback windows: of 188 windows on a
-# non-moving wheel, 181 read 0 ticks and the largest was 3, with the speed register reading zero.
-# So 3 ticks (0.26 deg) is the worst resting drift under every one of the three corpora, and it
-# only ever appears shortly after the wheel was driven.
-#
-# 8 ticks = 0.70 deg is 2.7x that worst observation, and still ~39x below the smallest change a
-# real wheel command produced across the three runs (311 raw ticks; most are 436 or more), so the
-# row loses no power to catch a driver that really touched a wheel.  The readback is modulo 4096,
-# so this row was never what would catch a whole number of revolutions - the register comparison
-# and the scenario's motion gates are.  The tail is carried by one or two nonzero samples
-# depending on the sampling above, so the choice is deliberately conservative; what would refine
-# it is a dozen more >= 190 s rests recorded immediately after a spin, the only condition under
-# which a nonzero was ever seen.
-#
-# For the record, the run-3 H5A red that motivated this was not the driver: ids 1, 2 and 3 moved 0
-# ticks, every writable register on all four ids was byte-identical pre vs post, and the driver's
-# entire contact with the bus in that scenario was 66 ms of 195 s (port open at 1789665509.710,
-# FATAL at 1789665509.777) with nothing else holding the port for the remaining ~194 s.  Run 1
-# recorded "identical" for the same row, so the 3 ticks are nondeterministic mechanical
-# relaxation.  A driver defect would move a register or move the wheel by hundreds of ticks.
-REST_TICKS = 2             # `pos` joints: unchanged, PHASE2_SPEC 12.5's H5A row
-WHEEL_REST_TICKS = 8       # `vel` joints: 0.70 deg; see the derivation above
+# Resting drift allowed between two readbacks (registers_unchanged): worst measured wheel rest 3
+# ticks, smallest real command 311. See docs/bench-check.md, "Gate thresholds".
+REST_TICKS = 2             # `pos` joints: a servoed goal does not relax
+WHEEL_REST_TICKS = 8       # `vel` joints: 0.70 deg, 2.7x the worst measured rest
 WHEEL_MODE = 1             # the servo's mode register: 0 = position, 1 = wheel
 
-# H8.accel_effect, the acc=150 arm of the t90 gate.  Spec 12.4 set 0.35 s from the ramp term
-# alone: acc=150 -> 150 counts x 100 steps/s^2 x TICK = 23.01 rad/s^2 -> 2.7/23.01 = 0.117 s,
-# times ~3 for slack.  t90 is measured from t_cmd, so it is a sum of three terms, only the
-# middle of which ACC governs:
-#   latency   t_cmd -> first non-zero reported |v|           0.050 - 0.080 s (measured)
-#   ramp      0 -> 2.0 rad/s (66 % of the commanded 3.0)     0.200 s at the achievable
-#             ceiling; the wheel is torque-limited to ~10-15 rad/s^2, not 23.01
-#   settling  66 % -> 90 %, the velocity loop's asymptote    0.16 - 0.24 s (measured on five
-#             independent recordings: 0.16 / 0.18 / 0.22 / 0.24 / 0.24 s)
-# Latency and settling are ACC-independent, so the floor of t90 on this servo is
-# 0.050 + 0.160 = 0.21 s even with an instantaneous ramp, and 0.050 + 0.117 + 0.160 = 0.327 s
-# with a perfectly obeyed ACC=150 ramp - i.e. flawless firmware lands at the old bound.  The
-# bench measured eight independent acc=150 recordings (hil_out, hil_out2, hil_out3 and the five
-# H4+H8 repeats) and none came in under 0.4570 s: 0.4570 0.4692 0.4694 0.4796 0.4896 0.4995
-# 0.4996 0.4996, mean 0.4829, sd 0.0166.  0.70 s sits 1.40x above the worst of those and ~1.8x
-# above the floor, while still being 2.8x under the acc=10 measurement (mean 1.9655 s), so the
-# gate keeps its discriminating power: the ratio clause below, not this absolute bound, is what
-# proves ACC is honoured.
-#
-# Does this absolute clause have the same quantisation problem as the ratio (see T90_RATIO_MIN)?
-# Yes - it is the same t90 on the same 50-count lattice - but its margin is safe, and that was
-# checked rather than assumed.  Two ways of counting:
-#   scatter at the level the row actually fires on (1800 raw): (0.70 - 0.4829) / 0.0166 = 13.1
-#     sd, and 1.40x the worst of eight.  Nothing there is close.
-#   whole-quantum slips, i.e. a run whose feedback skips the 1800 level and first reports higher.
-#     Re-evaluating t90 on the same eight recordings, one level at a time:
-#       1850 raw  max 0.5496 s   0.70 / 0.5496 = 1.27x   OK
-#       1900 raw  max 0.6396 s   0.70 / 0.6396 = 1.09x   OK
-#       1950 raw  max 0.8088 s   0.70 / 0.8088 = 0.87x   breach
-#     So the absolute clause survives a two-quantum slip and only a three-quantum one breaks it,
-#     while the observed failure mode is a single level.  It needs no change.
-T90_FAST_MAX = 0.70        # s, t90 at acc=150; see the derivation above
+# t90 at acc=150 = latency + ramp + settling; eight runs gave 0.457-0.500 s, and 0.70 s still
+# holds if the feedback skips two velocity levels.
+T90_FAST_MAX = 0.70        # s, t90 at acc=150
 
-# H8.accel_effect, the ratio clause.  This floor is deliberately loose and the looseness is the
-# metric's, not the driver's.  Read this before tightening it.
-#
-# What the bench measured, t90(acc=10)/t90(acc=150) over eight independent observations
-# (hil_out, hil_out2, hil_out3, repeat/r1..r5):
-#   3.9220  3.9223  3.9825  4.0279  4.0633  4.0851  4.2552  4.3314
-#   mean 4.0737, sd 0.1493 (3.7 % of the mean); min 3.9220, max 4.3314, spread 10 % of the mean.
-# The old floor of 4.0 sat at -0.49 sd, essentially on the distribution's median: three of the
-# eight observations fall below it and three of the five dedicated repeats FAILED on it.
-#
-# The driver is not at fault, and that is established rather than assumed:
-#   * the acc register reads back exactly 10 in the slow stack and exactly 150 in the fast stack
-#     in all eight runs (slow_readback / fast_readback, id4) - see accel_register.*.id4, which is
-#     an exact equality row.  THAT is the authoritative evidence that the ACC write arrived;
-#   * an independent least-squares fit of the acc=10 ramp (|v| vs t over the 0.3-2.4 rad/s band
-#     of the rising ramp) is reproducible to ~1 %: 1.4807-1.5236 rad/s^2, mean 1.4955, sd 0.0148,
-#     against the 1.5340 nominal (10 counts x 100 steps/s^2 x TICK).  The same fit on the fast
-#     stack gives 7.31-7.94 rad/s^2, a factor of 5.06 - so the physical ACC effect is ~5x and the
-#     t90 ratio under-reads it, because latency and settling are ACC-independent.
-#
-# The flakiness is in the measurement.  present_speed is quantised to exactly 50 raw counts
-# (0.076699039 rad/s; every one of the 45 distinct |v| levels seen on joint4 across the sixteen
-# recordings is an integer multiple of it, so one raw count is 0.0015339808 rad/s).  The gate's
-# 2.7 rad/s threshold is 1760.13 raw, which is NOT a reportable level, so t90 cannot fire at
-# 2.7 rad/s: it fires on the next lattice value up, 1800 raw = 2.761165 rad/s (measured, not
-# inferred) = 92.04 % of the 3.0 rad/s command - inside the
-# velocity loop's ringing rather than on the clean part of the ramp.  Whether a given run's
-# feedback happens to land on the 1800 level, or dwells at 1750 first, or skips straight past,
-# is what decides that run's ratio.  Level skips demonstrably happen in the recordings.
-# Decision W1 was to keep this t90 metric (a direct least-squares ramp-slope measurement was
-# considered and rejected) and to set the floor from the measured distribution instead.
-#
-# The floor: 2.5.  Both constraints, with the arithmetic:
-#   (a) real headroom below the observed minimum.  3.9220 / 2.5 = 1.57x, i.e. 1.4220 absolute =
-#       9.5 sd of the observed ratio below the worst observation and 10.5 sd below the mean.  It
-#       also clears the worst credible quantisation slip, which 3.0 would not.  Re-evaluating the
-#       ratio one lattice level at a time in BOTH arms gives minima 3.6356 (1850), 3.1735 (1900)
-#       and 2.8434 (1950); the worst mixed case - the fast arm slipping while the slow arm does
-#       not - is its 1900-raw worst against the slow arm's 1800-raw best, 1.8898/0.6396 = 2.9549
-#       (one level only: 1.8898/0.5496 = 3.4384).  2.5 sits below all of those, by 1.14x on the
-#       tightest.  3.0 would clear the 2.9549 case by 1.02x, which is exactly the hair's breadth
-#       this decision exists to avoid.
-#   (b) it still cannot pass if ACC is ignored.  If the register had no effect both arms would be
-#       draws from one distribution - the acc=150 one - and the ratio would tend to 1.0.  The
-#       widest ratio inside that single measured distribution is 0.4996/0.4570 = 1.093, and the
-#       sd of a ratio of two independent draws from it is sqrt(2) x cv = sqrt(2) x 0.0344 =
-#       0.0487, so 1.0 + 5 sd = 1.24 and 1.0 + 10 sd = 1.49.  2.5 is 2.29x the widest observed
-#       ignored-case ratio, 2.01x the 5 sd ceiling, and 30.8 sd above 1.0.  An ACC-ignored
-#       firmware lands in the INCONCLUSIVE branch below (|ratio - 1| <= 0.15), never in PASS.
-# So the floor sits at 1.57x below "obeyed" and 2.29x above "ignored" - loose on purpose, and
-# still on the right side of both by a wide margin.  What would justify tightening it is a
-# threshold that lands ON the lattice instead of between levels - 1750 raw = 2.6845 rad/s is
-# 89.5 % of command, nearer the intended 90 % than the 92 % this gate actually measures, and at
-# that level the same eight recordings give ratios 4.1323 .. 4.5749, mean 4.3538, sd 0.1327, all
-# eight of them above even the old 4.0 - or the least-squares slope metric above.  Not a tighter
-# number on this threshold.
-T90_RATIO_MIN = 2.5        # t90(acc=10)/t90(acc=150); see the derivation above
+# Deliberately loose: t90 fires on a 50-count velocity lattice, so the measured ratio
+# (3.92-4.33) moves ~10 % run to run, and ignored ACC gives ~1.0. Tighten the metric, not this.
+T90_RATIO_MIN = 2.5        # t90(acc=10)/t90(acc=150)
 
-# Cost bounds at four servos, 100 Hz, 1 Mbaud (Phase 3). Before Phase 3 the read cycle was four
-# sequential FeedBack() round trips -- 3.072 ms measured at this cadence, probe 3 Q1b -- and the
-# driver measured 3.0646 ms (phase2 hil_out4 H1.read_ms), i.e. the driver adds nothing above the
-# bus. Phase 3 makes it one sync read of four ids.
-#
-# MEASURED, not predicted (PHASE3 5.11's binding rule, applied at 5.31 step 11): the mean H1 read
-# average of the three candidate A/B runs is 1.64538 ms (phase3_evidence/cand_r1 1.64125,
-# cand_r2 1.64664, cand_r3 1.64823), against the 1.734 ms probe 3 Q1 predicted. The rule is
-# ceil_to_0.05(mean + 0.35): 1.64538 + 0.35 = 1.99538 -> 2.00. The 0.35 is 15x the 0.023 ms
-# HEAD-vs-HEAD spread of 30 identical-code Phase 1 runs -- the only run-to-run variation ever
-# measured in this statistic here. NOT a tail factor: this bounds a MEAN. The recomputed value is
-# SMALLER than the 2.15 this constant shipped with, so it is tightened, not relaxed. These are
-# BENCH bounds for four servos, not a promise about any other robot.
+# Bench bound on the mean read cycle (4 servos, 100 Hz, 1 Mbaud): measured 1.645 ms + 0.35,
+# rounded up.
 READ_MS_AVG_MAX = 2.00
-# The max is cumulative since activation and is dominated by the non-RT kernel, not by the bus:
-# 30 runs of IDENTICAL Phase 1 code spanned 3.64..4.98 ms at a 3.06 mean, an excursion of up to
-# 1.92 ms over a ~2000-cycle window. Re-derived on the measured mean rather than the predicted
-# one: 1.64538 + 1.92 = 3.5654, rounded up to 3.60 (it was 1.73 + 1.92 -> 4.00). Every gated
-# candidate window clears it with 0.94 ms to spare -- the worst read max any sync-read H1 or H9
-# produced is 2.6571 ms (cand_full_r1 H1), over a 2.17..2.66 ms span across nine such windows.
-# SCOPE: a ~2000-cycle window, i.e. the 9 s / 12 s captures of H1 and H9 ONLY. It does not
-# transfer to the soak, whose window is 30x longer -- see h11 (PHASE3 5.15), which deliberately
-# does not gate on it.
+# Max read cycle: cumulative since activation and set by kernel jitter (mean + 1.92, rounded
+# up). Valid only for the short captures of H1 and H9, not for the soak.
 READ_MS_MAX_MAX = 3.60
-# Write: 1.4521 ms before (hil_out4), of which SyncWriteSpe for two wheels is 1.152 ms at this
-# cadence (probe 2 Q1b). MEASURED (5.11's binding rule): the three candidate A/B runs mean
-# 0.013578 ms (cand_r1 0.01402, cand_r2 0.01341, cand_r3 0.01331) -- 22x below the 0.30 ms the
-# spec predicted, because what Phase 3 removed was two blocking Ack() round trips inside
-# SyncWriteSpe, not airtime, so there is no residual driver-side cost to leave room for.
-# ceil_to_0.05(0.013578 + 0.30) = 0.35, again tighter than the 0.60 shipped.
+# Mean write cycle: measured 0.0136 ms + 0.30, rounded up.
 WRITE_MS_AVG_MAX = 0.35
-# Worst write excursion above the mean seen in Phase 1/2 is 0.88 ms (2.3240 - 1.4475, recon
-# hil_and_docs.md 4.1, hil_cand_r3_b S2 enforce true). 0.30 + 0.88 = 1.18, rounded up to 1.50.
-# NOT re-derived on the measured mean, deliberately: 5.11's binding rule covers the two avg
-# constants only, and unlike the read max the write max is not stationary enough to bound. Across
-# the nine gated sync-read windows it spans 0.0434..0.6287 ms, a 14x spread (worst: cand_t20_r1
-# H9), and the three ten-minute soaks span 0.0645..0.4539 ms. 0.013578 + 0.88 would give 0.90,
-# which the worst observed value already reaches 70 % of. The same principle 5.11 states for
-# raising a bound applies to lowering one: do not fit a threshold to a tail nobody has
-# characterised (PHASE3 section 8 Q10). Same ~2000-cycle scope caveat as READ_MS_MAX_MAX.
+# Max write cycle: not fitted to the measured mean, because the write max varies 14x between
+# windows. Valid only for the short captures of H1 and H9.
 WRITE_MS_MAX_MAX = 1.50
 
-# The soak of PHASE3 5.13. Probe 3 Q1 saw 0 failures in 60 000 sync reads over ten minutes at
-# 100 Hz; with zero events the honest statement is an upper bound, and the rule of three gives
-# 3/60000 = 50 per million at 95 % confidence. The gate therefore asserts only that this bench is
-# no worse than the bound its own measurement could resolve. It is a RATE, not a count, so a
-# shortened soak (WAVESHARE_HIL_SOAK_S) uses the same threshold.
+# 0 failures in 60 000 reads: the rule of three gives 50 per million (95 %). A rate, so a
+# shortened soak uses it too. See docs/bench-check.md, "Soak (H11)".
 SOAK_FAIL_PER_MILLION_MAX = 50.0
 # Below this the rule of three cannot resolve 50 per million at all (3/30000 = 100), so the row
 # SKIPs rather than passing vacuously. 30 000 transactions is five minutes at 100 Hz.
 SOAK_MIN_TRANSACTIONS = 30000
-# Probe 3 Q1 measured a longest consecutive failing run of 0 over 60 000 cycles. Two allows an
-# isolated hiccup and still fires 25x before max_read_fails (50) would drop a servo.
+# The longest failing run measured in 60 000 cycles was 0. Two allows an isolated hiccup and
+# still fires 25x before max_read_fails (50) would drop a servo.
 SOAK_WORST_CONSECUTIVE_MAX = 2
-# PHASE3 5.13 makes a turning wheel part of the soak's definition -- "a stationary bus is not the
-# bus a robot runs on" -- but the scenario asks for it with one unchecked `topic pub`, and no other
-# H11 row can tell a spinning bus from a stopped one (a constant position with a zero velocity
-# satisfies g1a/g1b/g1c/g2 exactly, and the failed-transaction rate of a stopped bus is not the
-# number jazzy.md item 3 asks for). Half of the commanded 1.0 rad/s: six reported-velocity quanta
-# (VQ = 0.0767 rad/s) above zero, and far enough below 1.0 to survive any plausible load droop.
+# The soak wheels must turn at >= half the commanded 1.0 rad/s: no other H11 row can tell a
+# turning bus from a stopped one.
 SOAK_WHEEL_MIN_RAD_S = 0.5
 
 NAN = float('nan')
@@ -308,7 +117,7 @@ def stale_runs(t, p, v, min_len=STALE_MIN, moving=STALE_MOVING):
 
 
 def _excluded(t, p, v):
-    """Return every stale index plus the first sample after each run (12.2)."""
+    """Return every stale index plus the first sample after each run."""
     out = set()
     for first, last in stale_runs(t, p, v):
         out.update(range(first, min(last + 2, len(p))))
@@ -403,11 +212,8 @@ def g3(t, p, v):
             'd': abs(travel - integral), 'tol': tol, 'wraps': int(abs(integral) / (2 * PI))}
 
 
-#
-# The run directory, as hil_check.sh writes it: one sub-directory per scenario holding
-# facts.json (the shell's key=value facts), the recorder's <label>.json, the stop_wheels
-# readbacks, the port_probe results and log.txt (the stack's merged stdout).
-#
+# A run directory holds one sub-directory per scenario: facts.json, recordings, log.txt.
+# See docs/bench-check.md, "Report and verdicts".
 
 
 def _load(path):
@@ -525,15 +331,14 @@ def median(values):
     return ordered[n // 2] if n % 2 else 0.5 * (ordered[n // 2 - 1] + ordered[n // 2])
 
 
-# Not a median: every velocity row of 12.5 asks for an average, and the reported velocity is
-# quantised at VQ, so a median can only ever be a lattice value -- up to half a quantum away.
+# Not a median: the reported velocity is quantised at VQ, so a median can be VQ/2 off.
 def mean(values):
     """Return the arithmetic mean of the values, or NaN when there are none."""
     return sum(values) / len(values) if values else NAN
 
 
 def flips(quantity):
-    """Whether `inverted` flips this quantity (PHASE2_SPEC 3.2, D4). The H7 rows read it."""
+    """Whether `inverted` flips this quantity; the H7 rows read it."""
     return quantity in INVERTED_FLIPS
 
 
@@ -549,10 +354,8 @@ def cycle_ms(text, which):
 BUS_TOTALS = re.compile(
     r'bus totals: transactions (\d+), failed (\d+) \([\d.]+ per million\), '
     r'worst consecutive (\d+), dropped (\d+)')
-# The per-servo tail the driver is required to print (PHASE3 5.14, frozen string L5). The rate row
-# bounds the aggregate, so this is parsed for two reasons only: so a FAIL can say which ids the
-# failures fell on, and so H11.per_servo can assert the tail is there at all (5.30 row 23 -- an
-# aggregate alone does not satisfy jazzy.md item 3's "per servo").
+# The per-servo tail of the driver's bus totals line: it names the ids that failed, and
+# H11.per_servo requires it. See docs/bus-timing.md, "Bus totals line".
 BUS_TOTALS_TAIL = re.compile(r'\bid(\d+) (\d+)')
 
 
@@ -587,7 +390,7 @@ def kv(**facts):
 
 
 class Report:
-    """Hold the stable-keyed rows of PHASE2_SPEC 12.4."""
+    """Hold the report's stable-keyed rows."""
 
     def __init__(self, allowed):
         self.rows = []
@@ -603,7 +406,7 @@ class Report:
         self.rows.append({'key': key, 'verdict': verdict, 'detail': text})
 
     def ck(self, key, ok, text='', **facts):
-        """Append one gated row. Nothing rewrites a FAIL (decision D5)."""
+        """Append one gated row. Nothing rewrites a FAIL."""
         self.row(key, 'PASS' if ok else 'FAIL', (kv(**facts) + ' ' + text).strip())
 
     def count(self, verdict):
@@ -632,74 +435,32 @@ def gate_rows(R, joint, t, p, v, unwrap=False):
 
 
 def port_rows(R, S):
-    """Emit the two port-holder rows every scenario carries (PHASE2_SPEC 12.4 item 3)."""
+    """Emit the two port-holder rows every scenario carries."""
     R.ck('port_free_before', S.flag('port_free_before'), '[%s]' % S.fact('port_holders_before'))
     R.ck('port_free_after', S.flag('port_free_after'), '[%s]' % S.fact('port_holders_after'))
 
 
-# One second of a 100 Hz loop. H9.cycle_recorded needs enough samples AFTER the component came
-# back for g1c to be able to see a multi-turn reset in them, and one step is all it takes: a
-# reset shows up as a single oversized position difference between two consecutive samples. A
-# hundred is therefore not a statistical floor, it is "the recorder was still running and the
-# loop was really turning over", set far enough above 2 that a recording which stopped in the
-# middle of the transition cannot squeak past it.
+# One second at 100 Hz after the cycle: proves the recorder still ran. g1c needs only one
+# step to see a multi-turn reset.
 H9_CYCLE_MIN_SAMPLES = 100
 
-# H2's two numbers, reused verbatim so H9's post-cycle move is measured the same way H2 measures
-# the arm it is being compared against: 0.005 rad of target error (h2's `target` rows) and
-# 0.40 rad/s of step between the first or last pair of velocity samples (h2's `no_lurch`).
+# H2's arm bounds, reused by H1B and H9: 0.005 rad target error and a 0.40 rad/s velocity
+# step at either end of the recording.
 ARM_TARGET_TOL = 0.005
 ARM_LURCH_MAX = 0.40
 
 
+# See docs/bench-check.md, "Component cycle (H9)".
 def cycle_rows(R, S, rec):
     """
-    Emit the recovery rows for the inactive/active component cycle (jazzy.md section 6 step 6).
+    Emit the recovery rows for H9's inactive/active component cycle.
 
-    WHAT WAS ALREADY GATED, and is deliberately NOT repeated here. H9 has cycled the hardware
-    component since Phase 2, but exactly one consequence of the cycle was ever gated, and only
-    implicitly: g1c.joint3 and g1c.joint4, emitted by gate_rows() over this same `interfaces`
-    recording. g1c (hil_gates.py:359-362) asks whether any consecutive step of the unwrapped
-    position ever needed reducing mod 2*pi, and a cycle that reset a wheel's multi-turn count
-    shows up there as exactly one oversized step. That is measured, not assumed: Phase 4's commit
-    e0293cc replaced on_activate's unconditional reset with a seeded check, and the two archived
-    runs bracket it --
-
-      phase5_evidence/pre_phase4_driver_2026-09-21_1445/hil_check.txt
-        FAIL  H9.g1c.joint3  pairs=... reduced=37.6991      (and the same row for joint4)
-      phase5_evidence/post_phase4_baseline_2026-09-21_1659/hil_check.txt
-        PASS  H9.g1c.joint3  pairs=... reduced=0.0000       (and the same row for joint4)
-
-    37.6991 rad is 6 * 2*pi, i.e. the whole accumulated turn count vanishing in one sample. So
-    requirement (c) -- the unwrapped wheel position is continuous across the cycle -- is COVERED,
-    by a row with a real failure on record. A second row asserting continuity would add a PASS
-    and no coverage, and would make this report overstate what it checks.
-
-    WHAT WAS NOT GATED, and is added here. Two things the cycle is supposed to restore, neither
-    of which any row could see before:
-
-    (a) the component returns to 'active'. Both set_hardware_component_state calls sent their
-        output to /dev/null and their exit status was discarded, and no state was read back
-        afterwards, so a cycle that left the component INACTIVE scored nothing at all. Worse, it
-        would have made (c) vacuous rather than red: an inactive component publishes no
-        /joint_states, g1c would have seen no post-cycle samples, and it would have PASSED.
-
-    (b) the arm still tracks a commanded move. H9's two arm moves (arm_fast, arm_back) both run
-        BEFORE t_cycled, so nothing was commanded after the cycle. 'active' is the controller
-        manager's opinion of its own state machine; it is not evidence that the write path to
-        the bus came back. A move is.
-
-    And one guard that makes (c)'s existing coverage honest rather than incidental:
-    cycle_recorded. g1c can only see a reset in samples taken after the component came back, and
-    before Phase 5 the 40 s recorder was finishing within a couple of seconds of the cycle. A
-    recorder that stops first does not fail g1c -- it PASSES it over a window that cannot contain
-    the defect, the same vacuous-gate shape EXAMPLE_IDS had in h1. This row is what stops the
-    recorder duration from quietly drifting back under the cycle.
+    g1c already gates wheel continuity; these add state, post-cycle samples and an arm move.
     """
     R.ck('cycle_state',
          S.fact('hw_state_after_cycle') == 'active' and S.fact('cycle_inactive_rc') == '0' and
          S.fact('cycle_active_rc') == '0',
-         'the component came back from the inactive/active cycle of section 6 step 6',
+         'the component came back from the inactive/active cycle',
          state=S.fact('hw_state_after_cycle'), expected='active',
          inactive_rc=S.fact('cycle_inactive_rc'), active_rc=S.fact('cycle_active_rc'))
     done = S.number('t_cycle_done', NAN)
@@ -720,42 +481,23 @@ def cycle_rows(R, S, rec):
                  bound=ARM_LURCH_MAX)
 
 
-#
-# The ten scenarios of PHASE2_SPEC 12.5. Each checker takes the report (already prefixed with
-# the scenario name), its scenario directory, and a context shared between scenarios.
-#
+# Scenario checkers. Each takes the report (prefixed with the scenario name), its scenario
+# directory, and a context shared between scenarios.
 
 IFACES = ('position', 'velocity', 'effort', 'current', 'voltage', 'temperature', 'load',
           'status', 'torque')
 OFFSET = 1.570796          # the offset every pos joint of the bench descriptions carries
 ESCAPE = ('controller_manager hardware_components_initial_state.'
           'shutdown_on_initial_state_failure: false keeps the node alive with the component '
-          'unconfigured (decision D1)')
+          'unconfigured')
 PING_DIAGNOSIS = ('a status of 1, 2, 3, 4 or 9 means the driver latched SCS::Error from a Ping '
                   'or an Ack (src/SCS.cpp:261, Error = bBuf[2]) instead of the feedback Read')
-# Every servo id the shipped example declares: description/ros2_control/example.ros2_control.xacro
-# gives joint1..joint4 the ids 1, 2, 3 and 4 (:72-133, one <param name="id"> each). H1 is the only
-# scenario that runs that description, so this is the only place the gates learn what "all of them
-# answered" means there. It lives here, beside the other facts about the descriptions, because it
-# was open coded as (1, 2, 3) inside h1() until now: Phase 4 added joint4 and the tuple there was
-# not part of the change, so for a whole phase a dead id 4 passed H1.activate -- the single gate
-# over the shipped launch. A joint added to the example has to come past this line to be gated.
+# Servo ids the shipped example declares (example.ros2_control.xacro, joint1..joint4); H1 and
+# H1B run that example. Add the id of a new example joint here too.
 EXAMPLE_IDS = (1, 2, 3, 4)
 
-# H12, the limits scenario of jazzy.md section 6 step 8. The first four numbers are the stimulus
-# h_H12 renders and publishes (test/hil_check.sh); they are repeated here so the rows can be
-# written in terms of them, and H12.stimulus compares every one of them against the fact the
-# scenario recorded, so the two files cannot drift apart in silence the way a hard-coded
-# expectation can. Beside them are the driver's OWN ceilings, which is what makes a clamp
-# attributable at all: each command below sits between the description's ceiling and the driver's,
-# so only the controller manager's JointSaturationLimiter can produce the clamped value. Note that
-# POS_CMD_LIMIT equals OFFSET on this bench by coincidence of the mechanics -- it is the arm's
-# <command_interface name="position"> max, declared once per arm joint and identical in both:
-# test/hil/descriptions/bench.urdf.xacro:113-116 for joint1 (the max itself at :115) and :125-128
-# for joint2 (at :127). It is NOT the offset (:108 and :123, the same 1.570796) and it is not the
-# xacro:if that would add a max_speed param at :110-112, which is what this comment cited until
-# Phase 5's review; a render that changed one of the three would leave the other two where they
-# were, which is exactly why the number is named by its own line here.
+# H12 stimulus (h_H12 renders it; H12.stimulus checks it) and the driver's own ceilings.
+# POS_CMD_LIMIT is the arm's command-interface max; it equals OFFSET only by coincidence.
 H12_JOINTS = ('joint1', 'joint2', 'joint3', 'joint4')
 H12_ARM_LIMIT = 0.8            # rad, the <limit lower/upper> H12 renders (arm_pos_limit)
 H12_ARM_COMMAND = 1.2          # rad, past that limit and inside the driver's POS_CMD_LIMIT
@@ -763,15 +505,8 @@ H12_WHEEL_LIMIT = 2.0          # rad/s, the <limit velocity> H12 renders (wheel_
 H12_WHEEL_COMMAND = 8.0        # rad/s, past that limit and inside the driver's V_CAP
 POS_CMD_LIMIT = 1.570796       # rad, the arm's <command_interface> max: the driver's own ceiling
 
-# The attribution argument of h12(), executed rather than asserted in prose. Every clamp row of
-# H12 reads "the command landed on the description's ceiling and not on the driver's", and that
-# sentence is only evidence if the three numbers per axis really are ordered ceiling < command <=
-# driver. Edit one constant -- tighten the driver's command interface, raise the rendered <limit>,
-# lower a command -- and each clamp row would keep passing while proving nothing, because the two
-# candidate explanations would no longer be distinguishable by the value alone. The same shape as
-# the INVERTED_FLIPS guard at the top of this file, and for the same reason: a precondition that
-# cannot be measured on the bench is checked where it is written down. It runs at import, so it
-# guards a real --run-dir report and not only --self-test.
+# Import-time guard: each H12 axis needs limit < command <= driver ceiling, or a clamp at the
+# limit would not prove that the limiter made it.
 for _axis, _limit, _command, _driver in (
         ('position', H12_ARM_LIMIT, H12_ARM_COMMAND, POS_CMD_LIMIT),
         ('velocity', H12_WHEEL_LIMIT, H12_WHEEL_COMMAND, V_CAP)):
@@ -780,38 +515,22 @@ for _axis, _limit, _command, _driver in (
             "hil_gates: H12's %s clamp is no longer attributable: the rendered <limit> %.6f, the "
             'command %.6f and the driver-side ceiling %.6f must satisfy limit < command <= '
             'driver, or a clamp landing on the limit is not evidence that the controller '
-            "manager's JointSaturationLimiter produced it (jazzy.md section 6 step 8)"
+            "manager's JointSaturationLimiter produced it"
             % (_axis, _limit, _command, _driver))
 
-# How far inside the tightened limit the arm has to be parked before the limited stack starts.
-# This is not a tolerance on anything measured. The throw of trap (c) fires 0.0087 rad outside the
-# <limit> (joint_limits/joint_limits_helpers.hpp:32, OUT_OF_BOUNDS_EXCEPTION_TOLERANCE, commented
-# there as "0.5 degrees"), and h_H12's park sends the arm to 0.0, so the row only has to separate
-# "parked" from "somewhere near the edge": 0.05 rad is 33 encoder ticks, 5.7x the throw tolerance
-# and 15x the 0.0033 rad the arm was measured to settle short of a commanded target
-# (H2.target.move_to_06, final=0.5967, in the post-Phase-4 baseline run). It cannot fail a park
-# that worked, and it cannot pass an arm the limiter is about to throw on.
+# The arm must rest within 0.05 rad of 0 before the limited stack starts: the limiter throws,
+# not clamps, 0.0087 rad outside <limit>. See docs/bench-check.md, "Command limits (H12)".
 H12_PARK_MARGIN = 0.05
 
-# The clamped position, taken from the last sample of the recording. 0.010 rad = 6.5 ticks covers
-# the two terms between a settled servo and the ceiling it was clamped at: the 0.0033 rad the arm
-# settles short of a target (measured above; H2.target gates that same quantity at 0.005), plus
-# the 0.002 rad POSITION_BOUNDS_TOLERANCE of joint_limits_helpers.hpp:30, which is the slack the
-# limiter itself may carry around a bound. It leaves 0.39 rad of clear air below the 1.2 rad an
-# unclamped command would have reached, so nothing is given away by rounding it up to 0.010.
+# 0.010 rad: the arm's settle error (0.0033) plus the limiter's 0.002 bound tolerance,
+# rounded up.
 H12_POS_TOL = 0.010
 
-# The clamped wheel speed: the same +-0.060 rad/s H8.speed_wheel uses, and for the same reason.
-# That row is this row's stimulus measured against the other clamp -- a wheel commanded 8.0 rad/s
-# into a 2.0 rad/s ceiling, there the driver's max_speed and here the description's <limit> -- so
-# its spread is the only figure available that was taken under these conditions. The post-Phase-4
-# baseline recorded it at mean=1.9942 (1.99418 is 26 reported-velocity quanta, the lattice value
-# just under 2.0), i.e. 0.0058 of the 0.060 used.
+# The same +-0.060 rad/s as H8.speed_wheel, measured under the same 8.0 -> 2.0 rad/s clamp.
 H12_VEL_TOL = 0.060
 
-# hardware_interface logs this once per joint when enforce_command_limits is on; the format string
-# is `Creating JointSaturationLimiter for joint '%s' in hardware '%s'` in libhardware_interface.so.
-# Parsed rather than counted because the joint name is the whole point of H12.limiter_lines.
+# Logged once per joint by hardware_interface when enforce_command_limits is on; parsed for
+# the joint names that H12.limiter_lines checks.
 LIMITER_LINE = re.compile(r"Creating JointSaturationLimiter for joint '([^']+)' "
                           r"in hardware '([^']+)'")
 
@@ -851,10 +570,8 @@ def final_of(rec, joint):
 def h1(R, S, C):
     port_rows(R, S)
     pings = sum(S.logged("unable to ping motor id '%d'" % i) for i in EXAMPLE_IDS)
-    # The same warning about an id EXAMPLE_IDS does not list, counted as a group. A per-id sum can
-    # only ever be as current as its list, so this is the other half of the gate: if the example
-    # grows a fifth servo and EXAMPLE_IDS is not updated with it, the silent servo still lands on
-    # a FAIL row here instead of on nothing, and the row names the drift rather than hiding it.
+    # Pings for ids not in EXAMPLE_IDS, counted as a group: a servo added to the example but not
+    # to EXAMPLE_IDS still fails this row.
     unlisted = S.logged('unable to ping motor id') - pings
     live = S.logged("Successful 'activate'")
     R.ck('activate', S.flag('controllers_active') and live and not pings and not unlisted,
@@ -881,32 +598,25 @@ def h1(R, S, C):
         gate_rows(R, joint, *series(rec, joint))
 
 
+# See docs/bench-check.md, "Example stack (H1 and H1B)".
 def h1b(R, S, C):
     """
-    Gate the shipped example while it is COMMANDED (jazzy.md section 6 steps 1, 3, 4 and 7).
+    Gate the shipped example while it is commanded.
 
-    H1 proves the packaged launch comes up and idles cleanly. Every proof that it MOVES anything,
-    and every proof about how it shuts down, was against the bench description and bench.yaml --
-    files that ship with the tests, not with the package. These rows are the same measurements
-    H2, H3 and H10 make, taken on the stack a user actually runs. Where a bound here matches one
-    of theirs it is theirs verbatim, so the two can be read side by side; the comments say which.
+    Uses the measurements and bounds of H2 (arm), H3 (wheels) and H10 (shutdown).
     """
     port_rows(R, S)
     R.ck('activate', S.flag('controllers_active') and S.fact('hw_state') == 'active',
          'the three example controllers reached active and the component is up',
          active=S.fact('controllers_active'), hw_state=S.fact('hw_state'), expected='active')
-    # Phase 4 ships diff_drive_controller loaded-but-inactive on purpose, because it claims the
-    # same joint3/joint4 velocity command interfaces as joint_velocity_controller and
-    # ros2_control gives each command interface to exactly one controller. Two regressions land
-    # on this row: 'active' (the wheels would be taken away from the controller H1B commands)
-    # and '' (the controller is not loaded at all, which on this bench means the separate
-    # ros-jazzy-diff-drive-controller apt package is missing). Neither had a row before.
+    # diff_drive_controller must be loaded but inactive: it claims the same wheel command
+    # interfaces as joint_velocity_controller. '' means it did not load (package missing).
     state = S.fact('diff_drive_state')
     R.ck('diff_drive', state == 'inactive', 'loaded and inactive, as example.launch.py spawns it '
          "(--inactive); '' means the controller never loaded",
          state=state or "''", expected='inactive')
-    # Step 3, the arm. H2's numbers verbatim: 0.005 rad of target error, 0.40 rad/s of lurch at
-    # either end of the recording, 0.02 rad of overshoot on the move that has somewhere to go.
+    # The arm, with H2's bounds: 0.005 rad target error, a 0.40 rad/s lurch at either end, and
+    # 0.02 rad of overshoot on the move that has somewhere to go.
     for label, target in (('ex_move_to_0', 0.0), ('ex_move_to_06', 0.6)):
         t, p, v = series(S.rec(label), 'joint1')
         final = p[-1] if p else NAN
@@ -917,29 +627,24 @@ def h1b(R, S, C):
     p = series(S.rec('ex_move_to_06'), 'joint1')[1]
     R.ck('overshoot', (max(p) - 0.6 if p else NAN) <= 0.02, bound=0.02,
          overshoot=max(p) - 0.6 if p else NAN)
-    # The guard that keeps the wheel rows from going quiet. h_H1B skips the wheel command if the
-    # component is no longer active after the arm move -- the safe thing to do, because a stack
-    # that has just died cannot publish the stop either -- but a skip that reports nothing is how
-    # the jazzy.md section 7 crash would hide. It is a FAIL here, and it names the states.
+    # h_H1B skips the wheels when the component is not active after the arm move; this row makes
+    # that skip a FAIL that names the states.
     R.ck('arm_survived', S.fact('hw_state_after_arm') == 'active' and
          S.fact('arm_state_after') == 'active' and S.flag('vel_attempted'),
-         'the example JTC claims both position and velocity command interfaces (jazzy.md '
-         'section 7); this row is where that crash would land',
+         'the example JTC claims both position and velocity command interfaces, a setup '
+         'suspected of crashing the control node; this row is where that crash would land',
          hw_state=S.fact('hw_state_after_arm'), controller=S.fact('arm_state_after') or "''",
          wheels_commanded=S.fact('vel_attempted'))
-    # Step 4, the wheels. H3's numbers verbatim: mean speed within 0.020 rad/s of 2.0 (its "1
-    # percent"), and after the stop a mean |v| under 0.05 rad/s with under 0.01 rad of drift.
+    # The wheels, with H3's bounds: mean speed within 0.020 rad/s of 2.0, and after the stop a
+    # mean |v| under 0.05 rad/s with under 0.01 rad of drift.
     rec = S.rec('ex_vel_2')
     for joint in ('joint3', 'joint4'):
         t, p, v = series(rec, joint)
         mean_v, n = mean_vel(rec, joint, 1.0, 0.5)
         R.ck('mean_vel.%s' % joint, abs(mean_v - 2.0) <= 0.020, mean=mean_v, target=2.0,
              tol=0.020, n=n)
-        # Monotonicity, which H3 leaves to g1b/g2 and which is asked explicitly here because a
-        # wheel commanded one way and reported as travelling the other is the failure this
-        # scenario exists to catch on the shipped stack. One encoder tick of slack: the position
-        # state is quantised at TICK, so two consecutive samples of a barely-moving wheel can
-        # legitimately differ by a tick in either direction.
+        # No sample may go backwards by more than one tick (position is quantised at TICK): a
+        # wheel reported against its command is what H1B exists to catch.
         inside = between(t, rec.get('t_cmd', 0.0) + 1.0, rec.get('t_stop', 0.0) - 0.5)
         steps = [p[b] - p[a] for a, b in zip(inside, inside[1:])]
         back = sum(1 for d in steps if d < -TICK)
@@ -952,25 +657,8 @@ def h1b(R, S, C):
         R.ck('stopped.%s' % joint, rest < 0.05 and drift < 0.01, mean_abs_v=rest, bound=0.05,
              dp=drift, dp_bound=0.01)
         gate_rows(R, joint, t, p, v)
-    # Step 7, the SIGINT teardown of the packaged launch, asked of the wrapper a user runs and of
-    # a stack that has just driven an arm and a wheel.
-    #
-    # This row gates `ros2 launch`'s AGGREGATE status and nothing narrower, which is weaker than
-    # H10's `exit`: that one waits on the controller manager's own process (`wait "$CM_WRAP"`,
-    # hil_check.sh's h_H10) and so speaks only for the driver's teardown, while ros2 launch
-    # returns non-zero if ANY process it launched did -- either spawner, robot_state_publisher,
-    # the controller manager. So a red row here says "something in the packaged launch exited
-    # badly under SIGINT" and cannot by itself name the driver. That is still worth gating: it is
-    # the status a user's shell sees from the packaged launch, and no other row in this suite
-    # looks at it.
-    #
-    # The separable teardown claim is the `sequence` row below, which finds the controller
-    # manager's own 'deactivate' before its own 'shutdown' in the launch output. Reading the CM's
-    # exit code out of that output instead was considered and rejected: it would mean parsing
-    # launch's own process-exit lines, whose wording is a launch implementation detail, and there
-    # is no archived H1B run to pin that wording against (the scenario is new in Phase 5, and
-    # phase5_evidence/post_phase4_baseline_2026-09-21_1659/ has no H1B directory). An unverifiable
-    # parse asserting a stronger claim is worse than a weaker claim stated honestly.
+    # SIGINT teardown. `exit` is ros2 launch's aggregate status (any process), weaker than
+    # H10.exit; `sequence` is the check for the driver's own teardown.
     R.ck('exit', S.fact('launch_exit_code') == '0',
          "ros2 launch's aggregate exit status: non-zero if the CM, either spawner or the "
          'robot_state_publisher exited badly, so read it with `sequence` below',
@@ -1160,18 +848,15 @@ def h6(R, S, C):
         pid = S.fact('%s_probe_pid' % label)
         held = S.rec(label)
         took = held.get('verdict') == 'acquired' and str(held.get('no_exclusive')).lower() == excl
-        # The refusal is only evidence about the driver if it happened while the holder still had
-        # the port. A hold that expired first lets the driver configure, which is the run's fault
-        # and not a driver defect: this row is what tells the two apart.
+        # The refusal counts only if the holder still had the port; an expired hold is a run
+        # fault, not a driver defect.
         within = S.fact('%s_refusal_within_hold' % label)
         R.ck(key.replace('driver_refused', 'refusal_within_hold'), within == 'true',
              'false means the hold expired before the driver reached on_configure; rerun it, the '
              'row below is then not evidence about the driver', within=within or 'unrecorded',
              probe_pid=pid or 'none')
-        # 12.5 asks for the readback after the probe exits to be bit-identical to the one before
-        # it: the baseline is this holder's own pre readback, taken while the port was free and
-        # immediately before it, not the scenario's pre_readback, which H6's own active stack
-        # legitimately wrote over.
+        # Baseline: this holder's own pre readback, not the scenario's pre_readback, which H6's
+        # own stack legitimately overwrote.
         unchanged, detail = registers_unchanged(S, '%s_pre' % label, '%s_post' % label,
                                                 (1, 2, 3, 4))
         ok = (took and within == 'true' and
@@ -1192,7 +877,7 @@ def h6(R, S, C):
              serial_speed_lines=S.fact('%s_serial_speed_lines' % label, 'n/a'))
     released = S.rec('probe_after_release')
     R.ck('released', released.get('verdict') == 'acquired',
-         'a refusal here is a leaked exclusive flag (PHASE2_SPEC 12.4)',
+         'a refusal here is a leaked exclusive flag',
          verdict=released.get('verdict'), rc=released.get('rc'))
 
 
@@ -1204,8 +889,8 @@ def h7(R, S, C):
         R.ck('pos_reported.%s' % joint, abs(final - 0.6) <= 0.005,
              'inversion must be invisible above the driver', final=final, target=0.6, tol=0.005)
     centre = round(OFFSET * STEPS_PER_RAD)
-    # joint2 and joint4 are the inverted half of each mirrored pair, so every register they
-    # carry is mirrored exactly when `inverted` flips that quantity (D4).
+    # joint2 and joint4 are the inverted half of each mirrored pair: a register is mirrored
+    # exactly when `inverted` flips that quantity.
     mirror = {'position': -1 if flips('position') else 1,
               'velocity': -1 if flips('velocity') else 1}
     goal = {i: S.reg('pos_readback', i, 'goal_position_raw') for i in (1, 2)}
@@ -1264,7 +949,7 @@ def h7(R, S, C):
     else:
         unsigned = not (flips('effort') or flips('current'))
         R.ck('effort_unsigned', unsigned and min(amps) >= 0.0 and min(torques) >= 0.0,
-             'both must be >= 0 on every joint, the inverted ones included (D4)',
+             'both must be >= 0 on every joint, the inverted ones included',
              min_current=min(amps), min_effort=min(torques), unsigned_family=unsigned)
     signs = []
     for joint in ('joint3', 'joint4'):
@@ -1321,24 +1006,8 @@ def h9(R, S, C):
     rec = S.rec('interfaces')
     real, ghost = ('joint1', 'joint2', 'joint3', 'joint4'), 'joint5'
     order = {j: ifaces_of(rec, j) for j in real}
-    # H9's old single `present` row asked two questions at once and gated on both: does every
-    # declared name arrive for every joint, and does it arrive in the declared order? Only the
-    # first is the driver's to answer, so they are split (decision U2).
-    #
-    # The gate is presence. A name the description declares and the driver never exports is a
-    # real defect -- the resource manager refuses such a description outright.
-    #
-    # The order is a NOTE and never a gate, because the driver does not own it.
-    # WaveshareServos::on_export_state_interfaces (src/waveshare_servos.cpp:817-836) builds its
-    # name list by walking info_.joints, and each joint's state_interfaces, in description order,
-    # and handles_named (src/waveshare_servos.cpp:797-814) returns the handles in exactly that
-    # order; test_load_waveshare_servos.cpp's
-    # state_interfaces_are_exported_in_description_order_for_any_subset pins that behaviour in
-    # `colcon test`. The reordering seen on /dynamic_joint_states therefore happens downstream of
-    # the export -- in the resource manager's handoff or in joint_state_broadcaster's own map --
-    # and it is uniform rather than sporadic: every one of the 18,810 joint-blocks of the Phase 2
-    # run carried the same permutation. So a surprising order below is not a driver bug; do not
-    # "fix" the driver for it. What a consumer may rely on is the name, not its index.
+    # Presence is gated; order is only a NOTE: the driver exports in description order and the
+    # broadcaster reorders. See docs/configuration.md, "State interfaces".
     absent = {j: [i for i in IFACES if i not in order[j]] for j in real}
     R.ck('present', not any(absent.values()),
          '; '.join('%s=%s' % (j, ','.join(v) or 'none') for j, v in absent.items()),
@@ -1390,7 +1059,7 @@ def h9(R, S, C):
         for torque, kgfcm in zip(values[(j, 'effort')], values[(j, 'torque')]):
             if kgfcm != 0.0:
                 alias = max(alias, abs(torque / kgfcm - NM_PER_KGFCM))
-    R.ck('effort_vs_current', pair <= 1e-9, 'a magnitude identity: neither side flips (D4)',
+    R.ck('effort_vs_current', pair <= 1e-9, 'a magnitude identity: neither side flips',
          worst=pair, bound=1e-9, k_t=TORQUE_CONSTANT_NM_PER_A)
     R.ck('torque_alias', alias <= 1e-6, worst=alias, bound=1e-6, nm_per_kgfcm=NM_PER_KGFCM)
     warned = [S.logged("joint '%s' declares the deprecated" % j) for j in real + (ghost,)]
@@ -1401,30 +1070,8 @@ def h9(R, S, C):
          non_finite=sum(1 for x in status if not math.isfinite(x)))
     R.ck('status_zero', bool(status) and all(x == 0.0 for x in status),
          non_zero=sum(1 for x in status if x != 0.0), of=len(status))
-    # The window is t_cycle_done, not t_cycled, because this row's detail says "after the
-    # inactive/active cycle" and t_cycled is recorded BEFORE both transitions (hil_check.sh:928,
-    # against the transitions at :942 and :946 and t_cycle_done at :951). The old window was a
-    # superset of the claim -- it could not miss a leaked status, but it could report one that
-    # arrived before the cycle and blame the cycle for it, and the diagnosis it prints
-    # (PING_DIAGNOSIS: a status latched from a Ping or an Ack) is specifically about the ping
-    # on_activate runs when the component comes back. Narrowing the window to the marker that
-    # really means "after" is what makes the row measure its own sentence.
-    #
-    # Narrowing costs no coverage, which is why it is the right fix rather than rewording the
-    # detail: status_zero above gates EVERY sample of this recording for a non-zero status, and a
-    # value equal to a servo id is non-zero, so a leak anywhere still turns a row red. Measured on
-    # the fixture with a status of 3.0 injected between t_cycled and t_cycle_done: status_zero
-    # FAILs and status_not_ping passes, which is exactly the division of labour intended -- one
-    # row says "a status was not zero", this one says "and the cycle's ping is why".
-    #
-    # NaN-guarded the way cycle_recorded is (hil_gates.py:705-711), and for a sharper reason: an
-    # unparseable or missing t_cycle_done makes every `between` comparison false, so the window
-    # would be EMPTY and the row would PASS while having looked at nothing. That vacuous pass is
-    # the failure mode this file keeps finding (EXAMPLE_IDS in h1, the recorder in
-    # cycle_recorded), so the fact has to be there. n is reported so a window that is legitimately
-    # present but short is visible; how short it may be is cycle_recorded's row, which fails below
-    # H9_CYCLE_MIN_SAMPLES samples after the same marker, and it is the reason this row does not
-    # gate a sample count of its own.
+    # The window starts at t_cycle_done (after both transitions); status_zero covers every
+    # sample. A missing t_cycle_done fails the row instead of passing an empty window.
     done = S.number('t_cycle_done', NAN)
     after = []
     for j in real:
@@ -1454,21 +1101,8 @@ def h9(R, S, C):
     if math.isnan(read_avg):
         R.row('cost', 'SKIP', 'no read_cycle.execution_time in /diagnostics')
     else:
-        # The two max terms are NEW in Phase 3 (5.11): this row asserted averages only before, so
-        # H9 has never checked a maximum. H9's diagnostics capture is 6 s, the same ~2000-cycle
-        # window the two *_MAX_MAX bounds were derived over, so the scope matches -- unlike h11,
-        # which deliberately leaves its maxima ungated.
-        #
-        # The rate term is the known-weak one, and it predates Phase 3. rate_hz() reads
-        # /joint_states header stamps AS RECEIVED BY hil_record.py, so a recorder that misses
-        # messages reads as a control loop that missed cycles. Measured on a healthy bench: a
-        # single ~0.34 s recorder hole drags this term to 95.6 Hz and FAILs the row while the
-        # controller manager's own periodicity.average in the same /diagnostics file reads
-        # 100.0008 Hz and its periodicity.min never fell below 91 Hz -- i.e. no cycle ever ran
-        # long. It happened on both arms (phase3_evidence/SUITE_DIFF.md, cand_r2 and
-        # base_full_r1). The fix, when someone wants it, is to gate on periodicity.average from
-        # /diagnostics, which is what the CM publishes for exactly this purpose; it is left alone
-        # here because Phase 3 does not re-base a pre-existing term it did not cause.
+        # Maxima gated (short capture). The rate term uses recorder stamps, so a recorder gap
+        # can fail it. See docs/bench-check.md, "Component cycle (H9)".
         R.ck('cost', read_avg < READ_MS_AVG_MAX and write_avg < WRITE_MS_AVG_MAX and
              read_max < READ_MS_MAX_MAX and write_max < WRITE_MS_MAX_MAX and
              abs(rate_hz(stamps) - 100.0) <= 2.0,
@@ -1491,8 +1125,8 @@ def h9(R, S, C):
         verdict = 'inconclusive'
     R.row('current_sign_verdict', 'NOTE', kv(verdict=verdict, plus_counts=counts[0],
           plus_a=median(plus), minus_counts=counts[1], minus_a=median(minus)) +
-          ' evidence, never a gate: signed_by_direction opens a Phase 3 item, it does not change '
-          'a Phase 2 rule (D4)')
+          ' evidence, never a gate: signed_by_direction calls for a follow-up, it does not '
+          'change the rule that current is an unsigned magnitude')
 
 
 def h10(R, S, C):
@@ -1506,7 +1140,7 @@ def h10(R, S, C):
          'holders 10 s after exit=[%s]' % S.fact('port_holders_after_exit'))
     R.ck('retakeable', S.rec('probe_after_exit').get('verdict') == 'acquired',
          'released, not merely closed', verdict=S.rec('probe_after_exit').get('verdict'))
-    # the second stimulus of 12.5: SIGTERM to a bare ros2_control_node with a wheel turning
+    # The second stimulus: SIGTERM to a bare ros2_control_node with a wheel turning.
     R.ck('term_exit', S.fact('term_exit_code') == '0', exit_code=S.fact('term_exit_code'),
          expected=0)
     R.ck('term_wheels', S.rec('term_after_exit').get('any_moving') is False and
@@ -1534,8 +1168,7 @@ def h11(R, S, C):
          hw_state=S.fact('hw_state'), unable_to_ping=S.logged('unable to ping'))
     totals = bus_totals(S.log)
     if totals is None:
-        # All four, not three: a row that is simply absent is invisible in the report, and
-        # H11.no_drop and H11.per_servo are both Phase 3 gates (5.30 rows 10 and 23).
+        # All four rows, not three: a row that is simply absent is invisible in the report.
         R.row('transactions', 'SKIP', 'no "bus totals:" line; the stack was killed, not stopped')
         R.row('fail_rate', 'SKIP', 'no "bus totals:" line')
         R.row('no_drop', 'SKIP', 'no "bus totals:" line')
@@ -1552,18 +1185,15 @@ def h11(R, S, C):
             R.row('fail_rate', 'SKIP', kv(transactions=n, need=SOAK_MIN_TRANSACTIONS))
         else:
             rate = fail_per_million(n, bad)
-            # The tail rides in the detail, not in a fact: it is here so a FAIL says which ids the
-            # failures fell on, which is the first question a non-zero rate raises (5.18).
+            # The per-servo tail rides in the detail, so a FAIL names the failing ids.
             R.ck('fail_rate', rate <= SOAK_FAIL_PER_MILLION_MAX and
                  worst <= SOAK_WORST_CONSECUTIVE_MAX, named, transactions=n, failed=bad,
                  per_million=rate, bound=SOAK_FAIL_PER_MILLION_MAX, worst_consecutive=worst,
                  worst_bound=SOAK_WORST_CONSECUTIVE_MAX)
         R.ck('no_drop', dropped == 0 and S.logged('stopped answering') == 0, dropped=dropped,
              drop_lines=S.logged('stopped answering'))
-        # 5.30 row 23: jazzy.md item 3 asks for the count PER SERVO, so the bracketed tail of L5 is
-        # required, not a courtesy. Presence only, and deliberately not "one pair per declared
-        # servo": nothing this checker can see says how many servos the run declared, and a gate
-        # that guesses that would fail a healthy bench. A missing tail is unambiguous.
+        # The per-servo tail is required. Presence only: nothing here says how many servos the
+        # run declared.
         R.ck('per_servo', bool(pairs), named, servos=len(pairs))
     rec = S.rec('steady_soak')
     names = joints_of(rec)
@@ -1574,24 +1204,15 @@ def h11(R, S, C):
     if math.isnan(read_avg):
         R.row('cost', 'SKIP', 'no read_cycle.execution_time in /diagnostics')
     else:
-        # Averages and rate only. The maxima ride along as facts because they are cumulative
-        # since activation, i.e. the extreme of ~60 000 cycles here against the ~2000 the
-        # READ_MS_MAX_MAX / WRITE_MS_MAX_MAX bounds were derived over (5.15). Gating them here
-        # would fail a healthy bench and then pressure H1's bound upwards.
+        # Averages and rate only: the maxima span ~60 000 cycles here, far beyond the short
+        # windows the *_MAX_MAX bounds came from.
         R.ck('cost', read_avg < READ_MS_AVG_MAX and write_avg < WRITE_MS_AVG_MAX and
              abs(rate_hz(stamps) - 100.0) <= 2.0, '[no-regression]', read_ms=read_avg,
              write_ms=write_avg, hz=rate_hz(stamps), read_max_ungated=read_max,
              write_max_ungated=write_max)
     R.ck('gap', max_gap(stamps) <= 0.050, hz_gap_s=max_gap(stamps), bound=0.050)
-    # The soak's LOAD, which nothing else here checks. hil_check.sh asks for it with one
-    # fire-and-forget `topic pub` whose return value it discards, so a publish that times out
-    # waiting for a matching subscription -- a spawner race, a daemon hiccup, a wheels controller
-    # that is up but not yet matched -- leaves both wheels at 0 rad/s for the full ten minutes, and
-    # every other row still passes. That soak's failed-transaction rate is then measured on a load
-    # PHASE3 5.13 forbids and reported by 5.18 under conditions that did not hold. `all`, not a
-    # mean of the two: one wheel turning is not the recorded load either. A NaN mean (no samples
-    # for that joint) fails the comparison, which is the right direction -- no evidence of motion
-    # is not evidence of motion.
+    # The soak's load: both wheels must turn (one lost `topic pub` leaves them still). A NaN
+    # mean (no samples) fails.
     turning = [mean(series(rec, joint)[2]) for joint in ('joint3', 'joint4')]
     R.ck('wheels_turning', all(abs(w) >= SOAK_WHEEL_MIN_RAD_S for w in turning),
          joint3=turning[0], joint4=turning[1], bound=SOAK_WHEEL_MIN_RAD_S)
@@ -1609,84 +1230,16 @@ def h11(R, S, C):
         gate_rows(R, joint, *series(rec, joint))
 
 
+# See docs/bench-check.md, "Command limits (H12)".
 def h12(R, S, C):
     """
-    Gate the JointSaturationLimiter clamp of jazzy.md section 6 step 8 (h_H12, hil_check.sh:1157).
+    Gate H12: the controller manager's JointSaturationLimiter clamps at the rendered <limit>.
 
-    THE ATTRIBUTION ARGUMENT, which is the whole of this scenario and the reason every row below
-    is worth anything. The driver clamps too, and it would clamp these same commands: a position
-    command is held inside the command interface's own min/max (parsed at
-    src/waveshare_servos.cpp:591-621, clamped in write() at :1894-1899) and a wheel's goal speed
-    inside max_speed_counts (:1939-1941), 6000 counts = V_CAP = 9.2039 rad/s when no max_speed
-    param is given. A command clamped at a number both mechanisms agree on is evidence
-    for neither of them -- that is what H8 already measures, on the driver's side. So h_H12
-    renders the two <limit> ceilings TIGHTER than the driver's own and leaves the driver's where
-    they are:
-
-      joint           rendered <limit>   the driver's own ceiling   commanded here
-      joint1/joint2   +-0.8 rad          +-1.570796 rad             1.2 rad
-      joint3/joint4   2.0 rad/s          9.2038847 rad/s            8.0 rad/s
-
-    Each command is INSIDE what the driver would pass and OUTSIDE what the description allows, so
-    a value landing on 0.8 rad or 2.0 rad/s can only have come from the limiter: nothing else in
-    the stack knows those two numbers, and the driver never reads a URDF <limit> at all. That
-    ordering is a precondition of reading any row here, so it is not left in this docstring -- the
-    import-time guard beside the constants (hil_gates.py:775-786) refuses to run at all if a
-    constant is ever edited to break it.
-
-    WHAT IS COVERED.
-      stimulus            the four numbers are the shell's, not this file's opinion of them.
-      park                the precondition stack came up, so the arm was driven at all.
-      arm_inside_limits   where the arm actually came to rest, off the servos, port free. This is
-                          trap (c) of the Phase 4 amendment: an arm more than 0.0087 rad outside
-                          the tightened <limit> makes compute_position_limits THROW and the
-                          controller manager deactivate the arm controller instead of clamping.
-      limited_stack       the limiters-on stack came up, so a silent clamp row means "no clamp"
-                          rather than "no stack".
-      limiter_lines       one JointSaturationLimiter per joint was really built. Without it,
-                          every clamp row could be satisfied by a stack with the limiters OFF and
-                          a driver that happened to clamp somewhere similar.
-      pos_clamp           the arm stopped at the rendered limit, not at the command.
-      vel_clamp           the wheels turned at the rendered limit, not at the command.
-      vel_register        the driver's own last write of the same clamp, read off the servo.
-      arm_state_after     the arm controller is still ACTIVE. A limiter throw takes it down mid
-                          scenario, and without this row the throw is silent and every other row
-                          here becomes unreadable: pos_clamp would report wherever the arm was
-                          abandoned, and a reader would have no way to tell that from a clamp.
-      wheels_stopped      the bench was handed back with the wheels stopped.
-      arm_parked_after    ... and with the arm off its limit, which is the state the NEXT run
-                          needs (5.7 ticks from the trap-(c) throw is not a safe resting place).
-
-    WHAT IS NOT COVERED, and why not.
-      - The consistency gates (g1a/g1b/g1c/g2/g3) are deliberately NOT emitted over these
-        recordings, unlike h2/h3/h1b. They ask whether the driver's reported position and
-        velocity agree with each other, which is a property of the driver's state path and is
-        measured over H3, H4 and H9's recordings under the ordinary render. Here they would be
-        narrower versions of those same measurements (the arm move is 2 s plus 2.5 s of
-        post-roll; the wheel spin publishes no stop, so there is no rest window at all), and a
-        red g2 could not distinguish a limiter fault from a driver fault, which is the one
-        distinction this scenario exists to make. pos_clamp reports the recording's maximum
-        beside its final sample so the approach is visible without being gated.
-      - joint2's position clamp. h_H12 commands joint1 alone (`move pos_clamp joint1 1.2`), so
-        joint2 has no clamped position to read; joint2 is covered by limiter_lines (its limiter
-        was built) and by arm_inside_limits / arm_parked_after (it is parked at both ends).
-      - limited_cm_exit_code is reported and never gated: that stack is SIGKILLed on purpose, so
-        137 is the correct answer and a 0 there would mean the kill missed.
-      - That the limiter passes a LEGAL command through untouched. Every legal arm and wheel move
-        in this suite is measured with enforce_command_limits false (bench.yaml:7 for the bench
-        scenarios, bringup/config/example_controllers.yaml:23 for H1/H1B), so nothing
-        here would catch a limiter that clamped everything to its <limit>. It would take a second
-        limited stack and a legal command to add, and jazzy.md section 6 step 8 does not ask for
-        it; a limiter that clamped a legal command would show up as H12.pos_clamp passing while
-        H2/H7's arm rows still passed on the unlimited render, i.e. as nothing at all. Named here
-        so the gap is on the record rather than mistaken for coverage.
+    Each command lies between <limit> and the driver's own ceiling, so only the limiter clamps.
     """
     port_rows(R, S)
-    # The stimulus, compared fact by fact against the constants above rather than assumed. Both
-    # sides are decimal literals of the same text, so the comparison is exact equality and any
-    # mismatch is real drift, not float noise: the shell rendered or published a number this
-    # file's rows are not written for, and every clamp row below would be measuring the wrong
-    # ceiling while still passing. A missing fact reads as NaN, which compares unequal.
+    # Exact equality with the constants (same decimal text), so a mismatch is real drift; a
+    # missing fact is NaN and fails.
     stimulus = (('arm_pos_limit', H12_ARM_LIMIT), ('arm_command', H12_ARM_COMMAND),
                 ('wheel_vel_limit', H12_WHEEL_LIMIT), ('wheel_command', H12_WHEEL_COMMAND))
     drifted = ['%s=[%s] wanted %s' % (key, S.fact(key), want)
@@ -1695,29 +1248,16 @@ def h12(R, S, C):
          'the four numbers h_H12 rendered and published: %s'
          % (', '.join(drifted) or 'all four agree with the constants in this file'),
          **{key: S.number(key) for key, _ in stimulus})
-    # The first half of the trap-(c) precondition. h_H12 also guards these two and ABORTS the
-    # scenario before the limited stack when they are bad, so on the healthy path this row is a
-    # second reading of the same numbers -- kept because the guard is in the other file: a guard
-    # removed, reordered or made conditional there leaves this row as the only thing that still
-    # sees a park stack that never came up. park_cm_exit_code is gated ONLY here (the guard does
-    # not read it), and 0 is the right expectation because stop_stack sent TERM: H7, H9 and H11
-    # all recorded cm_exit_code 0 for a TERM teardown in the post-Phase-4 baseline run, and 137
-    # would mean the driver had to be killed instead of deactivating.
+    # The park stack came up and stopped cleanly (TERM -> exit 0; 137 = killed). Repeats h_H12's
+    # guard on purpose, and is the only gate on park_cm_exit_code.
     R.ck('park', S.fact('park_spawner_rc') == '0' and S.flag('park_controllers_active') and
          S.fact('park_cm_exit_code') == '0',
          'the limiters-off stack that parks the arm before the clamp test',
          spawner_rc=S.fact('park_spawner_rc') or "''",
          controllers_active=S.fact('park_controllers_active') or "''",
          cm_exit_code=S.fact('park_cm_exit_code') or "''")
-    # The second half, and the one no amount of guarding can force: where the arm actually is.
-    # Read off the servos with the port free, so it is the servo's own measured position and not
-    # the controller's idea of it -- which is the quantity compute_position_limits throws on.
-    # pos_last_raw is a raw encoder tick count; the joint angle is raw * TICK - offset for a pos
-    # joint whose `inverted` is false, which is what both arm joints render here (the offset is
-    # 1.570796 at bench.urdf.xacro:108 and :123, and inverted2 defaults to false, which h_H12's
-    # renders never override). The bound is H12_PARK_MARGIN, far inside the +-0.8 <limit> rather
-    # than at the 0.8087 rad where the throw begins: the park commands 0.0, so this row says "the
-    # park did what it says" and not merely "we got away with it".
+    # Where the arm really rests, read off the servos with the port free: raw * TICK - OFFSET
+    # (both arm joints are non-inverted). Must be within H12_PARK_MARGIN of 0.
     for servo in (1, 2):
         raw = S.regs('arm_pre', servo).get('pos_last_raw', -1)
         rad = raw * TICK - OFFSET
@@ -1726,26 +1266,16 @@ def h12(R, S, C):
              'and the controller manager then deactivates the arm instead of clamping'
              % H12_ARM_LIMIT,
              pos_last_raw=raw, rad=rad, margin=H12_PARK_MARGIN)
-    # The stack the whole scenario is about. Its own keys, because h_H12 runs three stacks and the
-    # shared spawner_rc / controllers_active facts end up holding the LAST one's values (the final
-    # park's). Without this row a clamp row that reported nothing would be ambiguous between "the
-    # limiter did not clamp" and "there was never a stack to clamp with".
+    # Own keys: h_H12 runs three stacks and the shared facts hold the last one's. Tells "no
+    # clamp" apart from "no stack".
     R.ck('limited_stack', S.fact('limited_spawner_rc') == '0' and
          S.flag('limited_controllers_active'),
          'the enforce_command_limits stack (bench_limits.yaml) came up',
          spawner_rc=S.fact('limited_spawner_rc') or "''",
          controllers_active=S.fact('limited_controllers_active') or "''",
          cm_exit_code=S.fact('limited_cm_exit_code') or "''")
-    # The limiters were really built, one per joint. Read out of the ONE controller-manager log
-    # h_H12 names in limited_cm_log, not out of S.log: scenario_end concatenates every *.stdout
-    # in the directory into log.txt, so the scenario's three stacks all land there and a count
-    # taken over the lot could not say which stack produced the lines.
-    #
-    # Matched as a SET and never by index. jazzy.md's Phase 4 amendment to section 6 step 8
-    # records that hardware_interface emits these in hash-map order, so the order carries no
-    # information at all; `sorted` on both sides keeps the multiplicity, which does -- the claim
-    # is exactly one line per joint, and two lines for one joint or none for another is a real
-    # defect in the render.
+    # From the limited stack's own log (log.txt mixes all three stacks). Compared sorted: the
+    # lines come in hash-map order, but exactly one per joint is required.
     limited_log = S.fact('limited_cm_log')
     found = LIMITER_LINE.findall(S.txt(limited_log))
     joints = sorted(name for name, _ in found)
@@ -1755,26 +1285,16 @@ def h12(R, S, C):
          log=limited_log or "''", joints=','.join(joints) or 'none',
          expected=','.join(sorted(H12_JOINTS)),
          hardware=','.join(sorted({hw for _, hw in found})) or 'none')
-    # The position clamp. The final sample, after 2.5 s of post-roll: the arm was commanded 1.2
-    # rad and the three candidate resting places are 0.8 (the rendered <limit>), 1.2 (no clamp at
-    # all) and 1.570796 (the driver's own command-interface ceiling, which would mean the driver
-    # clamped and the limiter did not). The nearest pair of those is 0.4 rad apart -- 261 encoder
-    # ticks, 40x H12_POS_TOL -- so the row cannot confuse two of them. `max` is reported and not
-    # gated: it says whether the approach ever went past the ceiling on its way (see the
-    # docstring's list of what is not covered).
+    # Final sample after 2.5 s of post-roll: 0.8 (limiter), 1.2 (no clamp) or 1.5708 (driver).
+    # 0.8 is 0.4 rad (40x the tolerance) from the nearest other; `max` is reported, not gated.
     arm = S.rec('pos_clamp')
     final, samples = final_of(arm, 'joint1'), series(arm, 'joint1')[1]
     R.ck('pos_clamp', abs(final - H12_ARM_LIMIT) <= H12_POS_TOL,
          'clamped at the rendered <limit>, not at the command and not at the driver ceiling',
          final=final, clamped_at=H12_ARM_LIMIT, tol=H12_POS_TOL, commanded=H12_ARM_COMMAND,
          driver_ceiling=POS_CMD_LIMIT, max=max(samples) if samples else NAN)
-    # The velocity clamp, one row per wheel, measured the way H8.speed_wheel measures the same
-    # stimulus against the driver's clamp: the arithmetic mean of the reported velocity between
-    # t_cmd + 1.0 and t_stop - 0.5. Same window and same tolerance, so the two rows can be read
-    # side by side -- there the wheel was commanded 8.0 rad/s into the driver's 2.0 rad/s
-    # max_speed, here into the description's 2.0 rad/s <limit>. No stop is published in this
-    # recording (the SIGKILL has to land while 8.0 still stands), so t_stop is t_cmd + hold and
-    # there is no rest window to read; the stop is proved by wheels_stopped instead.
+    # Measured as H8.speed_wheel (mean over t_cmd + 1.0 .. t_stop - 0.5, same tolerance). No
+    # stop is published here; wheels_stopped proves the stop.
     wheels = S.rec('vel_clamp')
     for joint in ('joint3', 'joint4'):
         mean_v, n = mean_vel(wheels, joint, 1.0, 0.5)
@@ -1782,12 +1302,8 @@ def h12(R, S, C):
              'clamped at the rendered <limit velocity>, not at the command',
              mean=mean_v, clamped_at=H12_WHEEL_LIMIT, tol=H12_VEL_TOL,
              commanded=H12_WHEEL_COMMAND, driver_ceiling=V_CAP, n=n)
-    # The same clamp, by a completely different path: the goal-speed register as the driver last
-    # wrote it, read back off the servo after the stack was SIGKILLed. The rows above measure what
-    # the encoder reported through the driver's READ path; this one is the driver's WRITE path,
-    # so a clamp that shows up in both did not come from a misreporting state interface. Exactly
-    # H8's register rows in shape, bound and tolerance (+-1 count of rounding): 2.0 rad/s is
-    # 1303.797 counts, and an unclamped 8.0 rad/s would have been 5215 -- nowhere near.
+    # The driver's write path, read off the servo after SIGKILL: 2.0 rad/s = 1303.797 counts
+    # (+-1 rounding); an unclamped 8.0 rad/s would be 5215.
     want = round(H12_WHEEL_LIMIT * STEPS_PER_RAD)
     for servo in (3, 4):
         raw = S.reg('vel_readback', servo, 'goal_speed_raw')
@@ -1795,32 +1311,21 @@ def h12(R, S, C):
              "the driver's own last write of the clamped command, independent of the read path",
              goal_speed_raw=raw, expected=want,
              unclamped=round(H12_WHEEL_COMMAND * STEPS_PER_RAD))
-    # The row that keeps every row above readable. A limiter throw does not happen at activation
-    # -- it happens the first time the limiter enforces -- so limited_stack was true either way
-    # and the controller manager simply deactivates the arm controller mid-scenario. Then
-    # pos_clamp reports wherever the arm was abandoned, which can be anywhere at all including
-    # inside H12_POS_TOL of 0.8, and nothing else in the report would say why.
+    # A limiter throw comes at the first enforcement, not at activation, and leaves pos_clamp
+    # meaningless; this row makes the throw visible.
     state = S.fact('arm_state_after')
     R.ck('arm_state_after', state == 'active',
          'the arm controller survived the clamp; a trap-(c) throw deactivates it and makes every '
          'other H12 row unreadable',
          state=state or "''", expected='active')
-    # Handback, part one: the wheels. Read off the bus by h_H12's vel_stop, i.e. after the limited
-    # stack was SIGKILLed with 8.0 rad/s still commanded, which is the one place in this suite
-    # where a latched goal speed could outlive its process.
+    # Read off the bus after the SIGKILL left a goal speed standing: a latched goal speed can
+    # outlive its process. See docs/operation.md, "Safety".
     stopped = S.rec('vel_stop')
     R.ck('wheels_stopped', stopped.get('any_moving') is False,
          'the SIGKILL left a goal speed standing; this is the read that says it was cleared',
          any_moving=stopped.get('any_moving'))
-    # Handback, part two: the arm, off its limit. park_final runs on an ordinary limiters-off
-    # stack whose driver-side ceiling is +-1.570796, so it can always drive back from 0.8; the
-    # park_back move inside the limited stack cannot be trusted to, because the case that matters
-    # is the one where that stack's arm controller is already gone. All three of the stack's own
-    # numbers ride along in this row's detail rather than in rows of their own: if the arm is not
-    # parked they are the explanation, and if it is parked they add nothing to gate. All three,
-    # deliberately -- a fact nothing reads is the shape H12.park exists to prevent, so
-    # park_final_cm_exit_code is printed here beside its two siblings rather than left recorded
-    # and unread.
+    # The arm off its limit, parked by a limiters-off stack (park_final). Its three stack facts
+    # ride in the detail as the explanation if the park failed.
     for servo in (1, 2):
         raw = S.regs('arm_post', servo).get('pos_last_raw', -1)
         rad = raw * TICK - OFFSET
@@ -1833,39 +1338,27 @@ def h12(R, S, C):
              park_final_cm_exit_code=S.fact('park_final_cm_exit_code') or "''")
 
 
-#
-# Phase 6 (PHASE6_SPEC E.2-E.8): the tools scan, set_id and calibrate_midpoint on the bench, and
-# the bench's EEPROM as hil_eeprom reads it. H13 scans, H14 proves every tool refuses a held port
-# and writes nothing when it refuses, H15 and H16 are the two EEPROM writers (journaled, restored),
-# and H17 compares the bench at the end of the run with the bench at its start and with E.0's
-# golden baseline. Every row that is not a NOTE is proved red by an injected defect
-# (TOOL_INJECTIONS).
-#
+# Tool scenarios H13-H17: scan, refusals, set_id, calibrate_midpoint, and the EEPROM as found.
+# See docs/bench-check.md, "Tool scenarios (H13 to H17)".
 
-# The bench's servo ids. The SAME four ids as EXAMPLE_IDS, and named twice on purpose: EXAMPLE_IDS
-# is what the shipped example declares, BENCH_IDS is what answers on this bench's bus, and the
-# tool scenarios gate on the second. They agree because the example was written for this bench; a
-# bench with a fifth servo would change BENCH_IDS and not the example.
+# Ids that answer on this bench (the tool scenarios gate on these); equal to EXAMPLE_IDS only
+# because the example was written for this bench.
 BENCH_IDS = EXAMPLE_IDS
-BENCH_MODES = {1: 0, 2: 0, 3: 1, 4: 1}         # register 33 as E.0 read it: two arms, two wheels
+BENCH_MODES = {1: 0, 2: 0, 3: 1, 4: 1}         # register 33: two arms (0), two wheels (1)
 SAFE_SILENT_IDS = (200, 201, 44)               # H14's write targets; 44 is 300 narrowed to 8 bits
 TEMP_ID = 253                                  # H15's temporary id: the top of scan's range
 CALIB_ID = 2                                   # H16 calibrates the arm that rests near 1026
-WHEEL_ID = 3                                   # ... and is refused on this wheel [Q1]
-MIDPOINT_TOL = 3                               # ticks, servo_tools kMidpointTolTicks (G.2 R3)
-# A full scan pings 250-odd silent ids three times at 5 ms each (C.1). The floor is 90 % of that
-# alone, before rclcpp start-up, so a scan that lost its retries (one attempt: ~1.8 s with
-# start-up) lands under it. The ceiling catches a 20 or 100 ms timeout. It cannot see a narrowed id
-# range -- 1..253 or 0..230 still takes more than 3.8 s -- which the exact ping-count tests of
-# D.4/D.5 and H15.scan_sees_move cover instead.
+WHEEL_ID = 3                                   # ... and is refused on this wheel
+MIDPOINT_TOL = 3                               # ticks, servo_tools.hpp kMidpointTolTicks
+# Scan time: ~250 silent ids x 3 attempts x 5 ms. The floor catches lost retries, the ceiling
+# a long timeout; a narrowed id range is H15.scan_sees_move's job.
 SCAN_FLOOR_S = 0.9 * 250 * 3 * 0.005
 SCAN_CEIL_S = 12.0
 EEPROM_ADDRS = (0, 1) + tuple(range(3, 40))    # every EEPROM byte hil_eeprom reads; 2 is undefined
 
 
-# scan's stdout contract (C.1), which is all the HIL knows about the table: the header's eleven
-# column names, then one row per servo of exactly eleven tokens starting with its id, then the
-# footer. `?` is a legal token anywhere but in the id column.
+# scan's stdout: a header of these 11 columns, one 11-token row per servo, then the footer.
+# `?` is legal in any column but id. See docs/tools.md, "scan".
 SCAN_COLUMNS = ('id', 'type', 'mode', 'model', 'baud_reg', 'baud', 'position', 'voltage_V',
                 'temp_C', 'status', 'offset')
 SCAN_FOOTER = re.compile(r'found (no servo|\d+ servo\(s\)) on \S+ at \d+ baud(: ids( \d+)+)? '
@@ -1876,13 +1369,9 @@ DETAIL_LINE = re.compile(r'^[a-z_]+: detail (.*)$')
 
 def scan_table(text):
     """
-    Parse scan's stdout into (header_ok, rows_by_id, bad_lines, footer) by the C.1 contract.
+    Parse scan's stdout into (header_ok, rows_by_id, bad_lines, footer).
 
-    The header is the first line and names exactly SCAN_COLUMNS; the footer is the last line and
-    matches SCAN_FOOTER; everything between is a data row of eleven tokens whose first is an id
-    not seen before, and any other line is a bad line. rows_by_id maps each id to {column: token}.
-    The rows are parsed whether the header is right or not, so a drifted header is H13.table's
-    business alone and does not also empty every row that reads the table.
+    Rows are parsed even when the header is wrong, so a drifted header fails only H13.table.
     """
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     header_ok = bool(lines) and tuple(lines[0].split()) == SCAN_COLUMNS
@@ -1898,7 +1387,7 @@ def scan_table(text):
 
 
 def tool_detail(err_text):
-    """Return the key=value fields of a tool's last `<tool>: detail` line (C.2, C.3), or None."""
+    """Return the key=value fields of a tool's last `<tool>: detail` line, or None."""
     found = None
     for line in err_text.splitlines():
         match = DETAIL_LINE.match(line.strip())
@@ -1940,12 +1429,9 @@ def _ids(values):
 
 def snap_file(path):
     """
-    Parse a hil_eeprom .snap file (E.1, DEVIATIONS D-5) into the shape of its RESULT json.
+    Parse a hil_eeprom .snap file into the shape of its RESULT json.
 
-    H17 reads the pre-flight's initial snapshot and E.0's golden baseline as .snap files -- the
-    baseline has no RESULT json beside it in the scenario directory -- so the same comparison can
-    run over both kinds. An unreadable value stays the string 'x' and a missing or foreign file
-    parses to {}, which every comparison below counts as a difference.
+    An unreadable value stays 'x'; a missing or foreign file parses to {} (a difference).
     """
     lines = _text(path).splitlines()
     if not lines or lines[0].strip() != 'hil_eeprom snapshot 1':
@@ -2006,10 +1492,7 @@ def _diffs(a, b, ids, regs, with_census=False):
     """
     Compare two loaded snapshots register by register; return [{'at': (id, reg) or None, 'text'}].
 
-    Never vacuous (E.2): a snapshot that is missing, carries an error (port_busy_skipped,
-    no_result) or says ok false is a difference, and so is an id missing on either side and a
-    value either side could not read. Those carry at=None, so a caller that allows a few
-    registers to change (H16.only_offset_changed) can never mistake an unreadable byte for one.
+    Never vacuous: a bad snapshot, a missing id or an unreadable value is a difference, at=None.
     """
     out = [{'at': None, 'text': '%s: %s' % (side, why)}
            for side, snap in (('A', a), ('B', b)) for why in _snapshot_problems(snap)]
@@ -2037,10 +1520,7 @@ def eeprom_diff(S, a, b, ids, eeprom_only, census=False):
     """
     Return the differences between two snapshots over EEPROM, plus 40 and 55 unless eeprom_only.
 
-    a and b are snapshot labels in the scenario directory (their RESULT json) or snapshots already
-    loaded (snap_file). Every missing id, ok false, port_busy_skipped or unreadable value counts
-    as a difference, so an empty list always means both snapshots were read and were equal. With
-    census=True the two censuses must also be present and equal.
+    An empty list means both were read and are equal (the censuses too, with census=True).
     """
     loaded = [S.rec(x) if isinstance(x, str) else x for x in (a, b)]
     regs = EEPROM_ADDRS + (() if eeprom_only else (40, 55))
@@ -2057,10 +1537,7 @@ def holders_left(S, allowed):
     """
     Name each tool run whose `<label>_holders_after` holds a pid not allowed for that label.
 
-    tool() records the port's holders after every run, on every path. A holder that was there
-    before the tool and is still there (the controller manager in H14's stage A, the flock-only
-    probe in stage B) is allowed; any other pid is a leaked lock, and a label with no fact at all
-    means the run's facts are incomplete, which is not evidence of a release either.
+    A holder from before the tool is allowed; any other pid, or a missing fact, is a leak.
     """
     left = []
     for label, pids in allowed.items():
@@ -2115,14 +1592,9 @@ def scan_fields(row, block):
 
 def h13(R, S, C):
     """
-    Gate scan on the bench (E.3): one explicit scan, cross-checked against hil_eeprom's snapshot.
+    Gate scan on the bench: one scan, cross-checked against hil_eeprom's independent snapshot.
 
-    Scan and hil_eeprom read the same registers by two paths that share nothing above ServoBus --
-    the tool's id-checked 37-byte identity block and feedback block, the helper's single vendored
-    reads -- so a column swap, a wrong byte order, an offset decoded on the wrong bit or one
-    servo's data printed under another's id makes the two disagree in `fields`. The default-port
-    run, the stale name and the positional port are the three ways a user's old command line meets
-    the new tool; `read_only` is the whole-EEPROM proof that none of the four scans wrote anything.
+    The two share nothing above ServoBus; read_only proves that no scan wrote anything.
     """
     port_rows(R, S)
     journal_row(R, S)
@@ -2130,7 +1602,7 @@ def h13(R, S, C):
     out = S.txt('scan.out.txt')
     header_ok, rows, bad, footer = scan_table(out)
     R.ck('table', header_ok and footer is not None and not bad,
-         'C.1: the header, rows of 11 tokens, the footer, and nothing else on stdout',
+         'the header, rows of 11 tokens, the footer, and nothing else on stdout',
          header=header_ok, rows=len(rows), footer=footer is not None, bad_lines=len(bad),
          first_bad=repr(bad[0]) if bad else 'none')
     ids = sorted(rows)
@@ -2158,7 +1630,7 @@ def h13(R, S, C):
          seconds=seconds, floor=SCAN_FLOOR_S, ceiling=SCAN_CEIL_S)
     lines, on_stdout = int_fact(S, 'scan_serial_speed_lines'), out.count('serial speed')
     R.ck('serial_speed', lines == 1 and on_stdout == 0,
-         'opened once, through open_bus, which sends the vendored line to stderr (R19)',
+         'opened once, through open_bus, which sends the vendored line to stderr',
          lines=S.fact('scan_serial_speed_lines') or "''", expected=1, on_stdout=on_stdout)
     if S.fact('scan_default_skipped'):
         R.row('default_params', 'SKIP', S.fact('scan_default_skipped'))
@@ -2203,15 +1675,9 @@ def _names_pid(text, pid):
 
 def h14(R, S, C):
     """
-    Gate every tool's refusals, which must all write nothing (E.4).
+    Gate every tool's refusals, which must all write nothing.
 
-    Stage A runs the three tools while the controller manager holds the port, stage B while a
-    flock-only port_probe does, stage C with the port free and arguments that must be refused.
-    Every set_id and calibrate call addresses only ids no servo answers (200, 201, 300 -> 44), so
-    even a tool whose refusals are all broken writes nothing; nothing_written is the proof, over
-    the whole EEPROM. via_servobus is the discriminating row of Phase 6 item 4: a tool that opens
-    with a raw SMS_STS::begin gets past a flock-only holder and prints `serial speed`, while one
-    that goes through ServoBus is refused before begin() and prints nothing.
+    Stage A: the CM holds the port; B: a flock-only probe holds it; C: port free, bad arguments.
     """
     port_rows(R, S)
     journal_row(R, S)
@@ -2293,13 +1759,9 @@ def h14(R, S, C):
 
 def h15(R, S, C):
     """
-    Gate set_id's round trip 4 -> 253 -> 4 (E.5), the first of the two EEPROM writers.
+    Gate set_id's round trip 4 -> 253 -> 4, the first of the two EEPROM writers.
 
-    moved_eeprom is hil_eeprom's own reading of the bench between the two runs, taken by a path
-    set_id shares nothing with above ServoBus, so `moved` and `only_id_changed` do not rest on the
-    tool's word. back_eeprom is the bench as the tool's own way back left it -- restored_by_tool
-    -- BEFORE the helper's restore, which could otherwise mask a dirty round trip; restore_writes
-    then proves that restore had no EEPROM byte left to write.
+    Reads hil_eeprom's own snapshots; back_eeprom is taken before the helper's restore.
     """
     start = 4
     port_rows(R, S)
@@ -2324,7 +1786,7 @@ def h15(R, S, C):
          'servo %d reads as it did at %d but for register 5, ids 1-3 untouched' % (TEMP_ID, start),
          diffs=len(wrong))
     R.ck('lock_closed', _reg(now, 55) == 1 and _reg(_block(back, start), 55) == 1,
-         'the tools leave register 55 at 1 (C.0 verified lock)',
+         'the tools leave register 55 at 1 (the verified lock)',
          moved=_reg(now, 55), back=_reg(_block(back, start), 55))
     _, scanned, _, _ = scan_table(S.txt('moved_scan.out.txt'))
     R.ck('scan_sees_move', int_fact(S, 'moved_scan_rc') == 0 and sorted(scanned) == moved_ids,
@@ -2334,9 +1796,8 @@ def h15(R, S, C):
     R.ck('restored_by_tool', not diffs and census(S, 'back_eeprom') == list(BENCH_IDS),
          '; '.join(diffs[:6]) or 'the round trip alone left EEPROM and census as found',
          census=_ids(census(S, 'back_eeprom') or []))
-    # A refused restore (exit 3: ambiguous census, an unreadable register, a model or register-5/6
-    # difference) prints `writes: []` too, so the empty list counts only from a restore that ran
-    # to its end: its rc 0 and its RESULT ok (review fix F15/F24).
+    # A refused restore (exit 3) also prints `writes: []`, so the empty list counts only when the
+    # restore ran to the end: rc 0 and RESULT ok.
     restore = S.rec('restore')
     writes = restore.get('writes')
     eeprom_writes = [w for w in writes if w.get('kind') == 'eeprom'] \
@@ -2361,12 +1822,9 @@ def h15(R, S, C):
 
 def h16(R, S, C):
     """
-    Gate calibrate_midpoint on id 2 and its refusal on the wheel id 3 (E.6) [Q1-Q3].
+    Gate calibrate_midpoint on id 2, and its refusal on the wheel id 3.
 
-    position_2048 is hil_eeprom's own read of the position, taken right after the tool; the tool's
-    word is not asked. offset_delta needs the offset register to have really moved, by as much as
-    the tool's own settled, torque-off position_before was off 2048 -- so a calibration of a servo
-    already at its midpoint could not pass it (the precondition in h_H16 aborts on one).
+    offset_delta: the offset must move by as much as position_before was off 2048.
     """
     port_rows(R, S)
     journal_row(R, S)
@@ -2397,7 +1855,8 @@ def h16(R, S, C):
           'only id %d registers 31-32' % CALIB_ID),
          changed=len(diffs), stray=len(stray))
     R.ck('lock_closed', _reg(_block(cal, CALIB_ID), 55) == 1, lock=_reg(_block(cal, CALIB_ID), 55))
-    R.ck('torque_off', _reg(_block(cal, CALIB_ID), 40) == 0, 'the lurch hazard of G.1.1 Q2',
+    R.ck('torque_off', _reg(_block(cal, CALIB_ID), 40) == 0,
+         'left off: with torque on, the servo moves to its old goal in the new frame',
          torque=_reg(_block(cal, CALIB_ID), 40))
     diffs = eeprom_diff(S, cal, wheel, BENCH_IDS, False)
     names_mode = re.search(r'\bis in mode %d\b' % BENCH_MODES[WHEEL_ID],
@@ -2420,18 +1879,16 @@ def h16(R, S, C):
     R.row('creep_after_tool', 'NOTE', 'cal_pos %s - position_after %s = %s' % (
         value, after_tool, value - after_tool
         if isinstance(value, int) and isinstance(after_tool, int) else '?'))
-    R.row('goal_register', 'NOTE', 'register 42 after the calibration %s, before it %s (G.2 R6)'
+    R.row('goal_register', 'NOTE', 'register 42 after the calibration %s, before it %s'
           % (_block(cal, CALIB_ID).get('volatile', {}).get('42'),
              _block(pre, CALIB_ID).get('volatile', {}).get('42')))
 
 
 def h17(R, S, C):
     """
-    Gate the bench's EEPROM as the run found it (E.7): the run's start, and E.0's golden baseline.
+    Gate the bench's EEPROM at the end of the run against the run's start and a golden baseline.
 
-    initial_eeprom.snap is the pre-flight's snapshot of this run, so eeprom_as_found says the whole
-    run -- every scenario, the two EEPROM writers included -- left the EEPROM as it found it.
-    matches_baseline compares with the snapshot taken before any Phase 6 tool touched the bench.
+    matches_baseline needs WAVESHARE_HIL_EEPROM_BASELINE.
     """
     port_rows(R, S)
     initial = snap_file(os.path.join(S.path, 'initial_eeprom.snap'))
@@ -2447,13 +1904,13 @@ def h17(R, S, C):
     if os.path.exists(path):
         diffs = eeprom_diff(S, snap_file(path), 'final_eeprom', BENCH_IDS, True, census=True)
         R.ck('matches_baseline', not diffs, '; '.join(diffs[:6]) or
-             'EEPROM and census as the golden baseline of E.0', diffs=len(diffs))
+             'EEPROM and census as the golden baseline', diffs=len(diffs))
     elif S.fact('baseline_source'):
         R.ck('matches_baseline', False, 'a baseline was given (%s) but never reached the '
              'scenario directory' % S.fact('baseline_source'))
     else:
         R.row('matches_baseline', 'SKIP', 'no baseline given (WAVESHARE_HIL_EEPROM_BASELINE '
-              'unset); the acceptance run always gives one (I.9)')
+              'unset); set it to compare the bench with a golden snapshot')
     final = S.rec('final_eeprom')
     R.row('sram', 'NOTE', 'the driver scenarios legitimately touch torque; initial -> final: %s'
           % ' '.join('id%d:40=%s->%s,55=%s->%s' % (
@@ -2468,27 +1925,16 @@ CHECKERS = (('H1', h1), ('H1B', h1b), ('H2', h2), ('H3', h3), ('H4', h4), ('H5A'
 TOOL_SCENARIOS = ('H13', 'H14', 'H15', 'H16', 'H17')
 
 
-# Directories that live beside the scenarios in the run directory and are not scenarios.
-# `roslog` is created per scenario by scenario_begin (ROS_LOG_DIR="$OUT/roslog/$SCEN"); anything
-# a self-test or a human drops in for scratch is expected to lead with '_' or '.'.
+# Not scenarios: `roslog` (the per-scenario ROS_LOG_DIR). Scratch directories must start with
+# '_' or '.'.
 NOT_A_SCENARIO = ('roslog',)
 
 
 def unchecked_rows(R, run_dir):
     """
-    Fail loudly for a scenario directory that ran on the bench and that no checker claimed.
+    FAIL for a scenario directory that ran on the bench but that no checker in CHECKERS reads.
 
-    run() walks CHECKERS, not the directory listing, so a scenario added to hil_check.sh's
-    SCENARIOS list but never added to CHECKERS produces a directory full of recordings that
-    nothing reads, no rows at all, and a report that looks complete. That is not hypothetical:
-    H12 (jazzy.md section 6 step 8) was added to the shell, given a controller YAML, given its
-    constants in this file and left out of CHECKERS, and every motorless check stayed green --
-    including the self-test's own "every scenario reaches the report", which asks the question
-    the wrong way round, of CHECKERS rather than of the bench.
-
-    A scenario nothing checks is worse than a missing scenario: it drives the motors, costs the
-    run its minutes, and buys nothing, while the summary line counts only the rows that exist.
-    So the row is a FAIL and it names the directory.
+    run() walks CHECKERS, so such a scenario would drive the motors and gate nothing.
     """
     try:
         present = sorted(name for name in os.listdir(run_dir)
@@ -2511,9 +1957,8 @@ def run(run_dir, allowed, seconds, port_free, expected=None):
         key, _, detail = line.partition('\t')
         if key.strip():
             aborted[key.strip()] = detail.strip()
-    # The scenario list hil_check.sh was asked to run. Without it a scenario that silently never
-    # ran -- its h_ function returned before scenario_begin, or the loop skipped it -- would be a
-    # SKIP, the same verdict as a scenario nobody asked for; with it, it is a FAIL (E.2).
+    # The scenario list hil_check.sh ran: an expected scenario with no directory and no abort is
+    # FAIL did_not_run, not the SKIP of a scenario nobody asked for.
     expected = expected.split() if isinstance(expected, str) else list(expected or ())
     missing = '%s was in the scenario list of this run, but left no directory and no abort'
     context = {}
@@ -2530,9 +1975,8 @@ def run(run_dir, allowed, seconds, port_free, expected=None):
             report.prefix = name
             checker(report, scenario, context)
     report.prefix = ''
-    # Names no checker knows. An abort of one is reported rather than dropped -- it is how a
-    # SCENARIOS entry with no h_ function surfaces (the loop aborts it as rc 127) -- and one that
-    # left nothing at all is did_not_run; a directory it left is unchecked_rows' business.
+    # Names no checker knows: an abort is reported (a SCENARIOS entry with no h_ function aborts
+    # with rc 127); one that left nothing is did_not_run.
     known = [name for name, _ in CHECKERS]
     for name in sorted(set(aborted) - set(known)):
         report.row(name, 'ABORTED', aborted[name])
@@ -2593,7 +2037,7 @@ def _self_test():
     expect(not g1c(t, jumped)['ok'], 'injected 2 pi jump caught by G1c')
     expect(g1a(t, jumped)['ok'], '... and G1a passes it, as an aliased step must')
 
-    # Defect 2: a frozen run and its catch-up step (PHASE2_SPEC 8.9, gated as H10.freeze).
+    # Defect 2: a frozen run and its catch-up step (gated on the bench as H10.freeze).
     start = len(p) // 3
     frozen = [p[start] if start <= k < start + 6 else x for k, x in enumerate(p)]
     runs = stale_runs(t, frozen, v)
@@ -2611,9 +2055,8 @@ def _self_test():
     expect(not aliasing_safe([0.4 * k for k in range(20)], [V_CAP] * 20)['ok'],
            'too-slow sampling caught by aliasing_safe')
 
-    # The rows of 12.5 average the reported velocity, and a median is not an average: the
-    # reported velocity is quantised at VQ, so a median snaps to a lattice value up to VQ/2
-    # away -- nearly twice the +-0.020 rad/s those rows allow.
+    # Velocity rows need a mean: a median of a VQ-quantised series can be VQ/2 off, nearly twice
+    # the +-0.020 rad/s the rows allow.
     lattice = [2.0 - 0.5 * VQ] * 5 + [2.0 + 0.5 * VQ] * 4
     expect(abs(mean(lattice) - 2.0) < 0.020 <= abs(median(lattice) - 2.0),
            'a quantised velocity needs its mean, not its median')
@@ -2624,13 +2067,12 @@ def _self_test():
     got, n = mean_vel(fake, 'w', 0.0, 0.0)
     expect(n == 200 and abs(got - mean(window)) < 1e-12, 'mean_vel is the arithmetic mean')
 
-    # The H7 rows are built from INVERTED_FLIPS, so a wrong constant changes a gate (A9).
+    # The H7 rows are built from INVERTED_FLIPS, so a wrong constant changes a gate.
     expect(flips('position') and flips('velocity') and flips('load') and
            not flips('effort') and not flips('current') and not flips('torque'),
            'INVERTED_FLIPS drives the H7 rows')
 
-    # The soak parser of PHASE3 5.14/15, clean and defective, the way every other gate here is
-    # proved: a gate that cannot fire is not a gate.
+    # The soak parser, clean and defective: a gate that cannot fire is not a gate.
     clean = ('[INFO] bus totals: transactions 60000, failed 0 (0.0 per million), '
              'worst consecutive 0, dropped 0 [id1 0]\n')
     expect(bus_totals(clean) == (60000, 0, 0, 0), 'bus_totals reads the driver totals line')
@@ -2642,8 +2084,7 @@ def _self_test():
     expect(fail_per_million(60000, 6) > SOAK_FAIL_PER_MILLION_MAX,
            'injected 100-per-million failure rate caught by the soak bound')
     expect(math.isnan(fail_per_million(0, 0)), 'an empty soak is NaN, not a division by zero')
-    # The bracketed tail of L5 is required, not decorative (PHASE3 5.14, 5.30 row 23), so the
-    # parser behind H11.per_servo is proved on a line that has one and a line that does not.
+    # The per-servo tail is required, so H11.per_servo's parser is proved with and without it.
     expect(bus_totals_tail(two) == [(1, 0)], 'bus_totals_tail reads the last line per-servo tail')
     expect(bus_totals_tail(clean.replace(' [id1 0]', '')) == [],
            'a totals line that dropped its per-servo tail is caught')
@@ -2661,26 +2102,9 @@ def _self_test():
 
 def _self_test_limits_yaml(expect):
     """
-    Prove test/hil/controllers/bench_limits.yaml is bench.yaml with exactly one line changed.
+    Prove controllers/bench_limits.yaml is bench.yaml with only enforce_command_limits flipped.
 
-    The check bench_limits.yaml's own header promises, and which until Phase 5's review did not
-    exist anywhere -- the header said "--self-test reads both files and fails unless their
-    non-comment lines differ in exactly one place ... (_self_test_limits_yaml)" while --self-test
-    never opened either file. The invariant held; the claim that it was checked did not.
-
-    Why it is worth checking rather than trusting. H12 is the only scenario that runs against
-    bench_limits.yaml, and the whole of its attribution rests on that file being the SAME bench as
-    the other fourteen scenarios with enforce_command_limits flipped on. A controller setting added
-    to bench.yaml and forgotten here (or the reverse) would silently give H12 a different stack,
-    and no row in the report could see it: h12's clamp rows would keep passing, because a limiter
-    clamping at 0.8 rad is exactly as true on a stack whose update_rate or arm controller type has
-    drifted. The two files cannot be collapsed into one -- enforce_command_limits is read at
-    hardware-component init, so it cannot be a runtime parameter override -- so the duplication
-    stays and this is what holds it honest.
-
-    Line numbers are carried through so a failure names the offending line in both files rather
-    than only its text. Comments and blank lines are dropped on both sides, which is what lets the
-    two files keep their own (very different) headers.
+    H12's attribution needs the same bench with the limiters on; comments are ignored.
     """
     here = os.path.dirname(os.path.abspath(__file__))
     bodies = []
@@ -2694,10 +2118,7 @@ def _self_test_limits_yaml(expect):
            'bench.yaml and bench_limits.yaml have the same significant-line count (%d vs %d)'
            % (len(plain), len(limited)))
     diff = [(a, b) for a, b in zip(plain, limited) if a[1] != b[1]]
-    # zip() stops at the shorter file, so a line one file has and the other does not would
-    # otherwise slip past the comparison and be caught only by the count check above -- and only
-    # when it happens to be appended at the end. The surplus is named here so "they differ in
-    # exactly one place" means it whichever file is longer.
+    # zip() stops at the shorter list, so lines that only one file has are named as surplus.
     surplus = plain[len(limited):] + limited[len(plain):]
     expect(len(diff) == 1 and not surplus,
            'they differ in exactly one significant line (%s%s)'
@@ -2712,14 +2133,9 @@ def _self_test_limits_yaml(expect):
 
 def _self_test_checkers(expect):
     """
-    Drive h1..h17 and the whole evaluator over a synthetic run tree (hil_fixture.py).
+    Drive every checker and run() over a synthetic run tree (hil_fixture.py).
 
-    The primitives above cannot see a defect that stops a checker from running at all -- a local
-    rebinding a module-level helper, a missing key, a new file label that is never written. That
-    is the class of bug that once let `colcon test` report GREEN while the evaluator could not
-    process a single real run and wrote no report. These checks assert only that every checker
-    runs and emits rows, and that run() writes hil_check.json with a row for every scenario; the
-    verdicts are the bench's business, not the self-test's.
+    Catches a checker that cannot run at all; verdicts are left to the dedicated self-tests.
     """
     import shutil
     import tempfile
@@ -2769,16 +2185,9 @@ def _self_test_checkers(expect):
 
 def _self_test_soak_load(expect, root):
     """
-    Prove H11.wheels_turning fires, by re-running h11 over the fixture with the wheels stopped.
+    Prove H11.wheels_turning fires: re-run h11 on a copy of the fixture with the wheels still.
 
-    The rest of _self_test_checkers deliberately ignores verdicts, but this one row exists only to
-    catch a condition every other H11 row is blind to (PHASE3 5.13's turning wheels), so "the
-    checker ran" is no evidence at all: the row has to be shown passing on the moving fixture and
-    failing on a copy of it with joint3/joint4 held still. Copied into a sibling directory rather
-    than mutated in place -- run() drives the fixture again afterwards. The leading underscore
-    on the copy is what keeps it inert now that unchecked_rows() DOES read the directory
-    listing: without it the copy would look like a scenario no checker claims, which is exactly
-    the thing that row exists to fail on.
+    The copy's name starts with '_', so run() keeps the original and unchecked_rows() skips it.
     """
     import shutil
 
@@ -2816,20 +2225,9 @@ def _self_test_soak_load(expect, root):
 
 def _self_test_h1_ping(expect, root):
     """
-    Prove H1.activate fires for every id in EXAMPLE_IDS, one silent servo at a time.
+    Prove H1.activate fails for each silent id in EXAMPLE_IDS, and for an unlisted id 5.
 
-    H1 is the only scenario that runs the shipped example.launch.py, and H1.activate is the only
-    row there that can see a servo that did not answer on_configure's ping. That made it exactly
-    the kind of row the rest of _self_test_checkers is blind to: it ignores verdicts, so between
-    Phase 4 and here the id list in h1() read (1, 2, 3) against a four-joint example, a dead id 4
-    scored `unable_to_ping=0`, and the whole self-test still printed "all checks passed". A row
-    nothing can fail is not a gate, so the claim is made per id and asserted rather than assumed.
-
-    Each id gets its own copy of the H1 directory with one warning line appended to log.txt, the
-    same shape src/waveshare_servos.cpp:996 writes. Copies, not a mutation in place: run() drives
-    the fixture again afterwards, and the leading underscore keeps the copies out of
-    unchecked_rows()'s directory scan (the reasoning of _self_test_soak_load, which does the
-    same).
+    Each case is a '_'-prefixed copy of H1 with one driver `unable to ping` warning appended.
     """
     import shutil
 
@@ -2863,27 +2261,9 @@ def _self_test_h1_ping(expect, root):
 
 def _self_test_h12_clamps(expect, root):
     """
-    Prove H12's clamp rows fire, by re-running h12 over copies where the clamp did not happen.
+    Prove H12's clamp rows, and only they, fail when the command arrives unclamped.
 
-    H12's two clamp rows are the only rows in the whole report that can see the controller
-    manager's JointSaturationLimiter fail to clamp, which is the one thing jazzy.md section 6
-    step 8 asks the bench to check. _self_test_checkers ignores verdicts, so "h12 ran and emitted
-    rows" is no evidence about them at all -- the same blindness that let h1()'s id list read
-    (1, 2, 3) against a four-joint example for a whole phase (see _self_test_h1_ping). So the
-    baseline is asserted green first, and then each row is shown red on a copy of the fixture
-    carrying exactly one defect: the command arrived unclamped.
-
-    The defect is a single column of a single recording, which is what the failure would really
-    look like: an arm that went all the way to the commanded 1.2 rad, and wheels that turned at
-    the commanded 8.0 rad/s. The velocity injection rewrites the velocity column only and leaves
-    the position column consistent with 2.0 rad/s, which would be a contradiction on the bench --
-    it is not one here because h12 deliberately emits none of the consistency gates over these
-    recordings (see h12's docstring on what is not covered), so nothing reads the wheels' position
-    column and the defect stays confined to the rows under test.
-
-    Copies in sibling directories, not mutations in place: run() drives the fixture again
-    afterwards. Their names lead with an underscore so unchecked_rows() does not see them as
-    scenarios nothing claims.
+    One recording column gets the command; h12 emits no consistency gates, so that is safe.
     """
     import shutil
 
@@ -2897,9 +2277,8 @@ def _self_test_h12_clamps(expect, root):
     unhappy = sorted(key for key, verdict in base.items() if verdict != 'PASS')
     expect(not unhappy, 'a clamped H12 fixture passes every h12 row (not PASS: %s)'
            % (','.join(unhappy) or 'none'))
-    # (label, the recording, the column index in a joint_states sample, the unclamped command,
-    # the rows that and only that must go red). Sample layout is [rx, stamp, names, positions,
-    # velocities, efforts], as hil_fixture.rec() builds it.
+    # (what, recording, joint_states column, unclamped command, the only rows that must fail).
+    # Sample layout: [rx, stamp, names, positions, velocities, efforts] (hil_fixture.rec).
     for what, label, column, value, keys in (
             ('arm position', 'pos_clamp', 3, H12_ARM_COMMAND, ('H12.pos_clamp',)),
             ('wheel velocity', 'vel_clamp', 4, H12_WHEEL_COMMAND,
@@ -2921,18 +2300,8 @@ def _self_test_h12_clamps(expect, root):
                'else (red: %s)' % (what, value, ','.join(keys), ','.join(red) or 'none'))
 
 
-#
-# E.8: the injected defects of the tool scenarios. Each entry of TOOL_INJECTIONS is (description,
-# mutation, expected rows): the mutation makes ONE defect in a copy of one green fixture scenario
-# (hil_fixture.build_tools), and the expected rows are exactly the rows it must turn -- FAIL unless
-# another verdict is named -- while every other row of that scenario keeps its verdict. The table
-# is data rather than code so that _self_test_row_coverage can read it: a row of h13..h17 that no
-# entry names is a row nothing has ever seen fail, and the self-test fails on it.
-#
-# Where an entry names more rows than PHASE6_SPEC's tables list, it is because the row definitions
-# themselves make the defect visible in more than one place (phase6_evidence/DEVIATIONS.md, H step
-# 11): the injections are derived from the gates, never the other way round.
-#
+# Injected defects for H13-H17: (description, mutation, rows it must turn, FAIL unless named).
+# Each makes ONE defect in a fixture copy; every non-NOTE row must appear in some entry.
 
 
 def _save(path, data):
@@ -2999,12 +2368,9 @@ def _register(label, servo, reg, value):
 
 def _unreadable(label, value=True, flag=True):
     """
-    Mutation: a snapshot byte hil_eeprom could not read.
+    Mutation: a byte hil_eeprom could not read ('x' in the value, n one short, ok false).
 
-    hil_eeprom reports one as 'x' in the value, n one short, and ok false (E.1). `value` and
-    `flag` switch the two halves separately, so the non-vacuity self-test can prove that a row
-    reads BOTH: a gate that trusted ok alone would miss an 'x' written by a bug that forgot the
-    flag, and one that only looked at the values would miss ok false on a byte it never compares.
+    `value` and `flag` inject the two halves separately, so a row must check both.
     """
     def change(data):
         if value:
@@ -3062,10 +2428,10 @@ def _red(*keys):
 
 
 def _tool_injections():
-    """Build TOOL_INJECTIONS, the E.2-E.7 tables' last column (see the comment above _save)."""
+    """Build TOOL_INJECTIONS (see the comment above _save)."""
     scans = ('scan.out.txt', 'scan_default.out.txt')    # a bench fault shows in BOTH scans
     out = []
-    # The rows every tool scenario carries (E.2): the two port rows, and the journal for H13-H16.
+    # Rows every tool scenario carries: the two port rows, and the journal for H13-H16.
     for name in TOOL_SCENARIOS:
         out += [('port_free_before=false', _set_facts({'port_free_before': 'false'}),
                  _red(name + '.port_free_before')),
@@ -3077,7 +2443,7 @@ def _tool_injections():
                     ('the fact journal_left deleted', _set_facts({'journal_left': None}),
                      _red(name + '.journal_cleared'))]
 
-    # H13, scan (E.3).
+    # H13, scan.
     out += [
         ('scan_rc=7', _set_facts({'scan_rc': '7'}), _red('H13.rc')),
         ("header column 'offset' renamed",
@@ -3127,7 +2493,7 @@ def _tool_injections():
                     _scan_cell(('scan.out.txt',), servo, 8, lambda v: str(int(v) + 5)),
                     _red('H13.fields.%d' % servo)))
 
-    # H14, the refusals (E.4).
+    # H14, the refusals.
     tools = (('scan', 'scan'), ('set_id', 'set_id'), ('calibrate', 'calibrate_midpoint'))
     out += [
         ('controllers_active=false', _set_facts({'controllers_active': 'false'}),
@@ -3184,7 +2550,7 @@ def _tool_injections():
         out.append(('%s_rc=0' % label, _set_facts({'%s_rc' % label: '0'}),
                     _red('H14.usage.' + label)))
 
-    # H15, set_id 4 -> 253 -> 4 (E.5).
+    # H15, set_id 4 -> 253 -> 4.
     out += [
         ('move_rc=6', _set_facts({'move_rc': '6'}), _red('H15.move_rc')),
         ('back_rc=5', _set_facts({'back_rc': '5'}), _red('H15.back_rc')),
@@ -3206,8 +2572,7 @@ def _tool_injections():
          _edit_json('restore', lambda d: d['writes'].append(
              {'id': 4, 'reg': 5, 'from': 253, 'to': 4, 'bytes': 1, 'kind': 'eeprom'})),
          _red('H15.restore_writes')),
-        # review fix F15/F24: a restore that refused (exit 3) prints `writes: []` too, so an empty
-        # list alone says nothing -- the row reads the helper's rc and its RESULT `ok` as well
+        # A refused restore (exit 3) also prints `writes: []`, so the row reads rc and ok too.
         ('restore_rc=3 (the restore refused; its RESULT still has writes [])',
          _set_facts({'restore_rc': '3'}), _red('H15.restore_writes')),
         ('the restore RESULT ok false, exit 3, writes []',
@@ -3215,9 +2580,8 @@ def _tool_injections():
          _red('H15.restore_writes')),
         ('post id 4 reg 5 = 253', _register('post_eeprom', 4, 5, 253), _red('H15.restored'))]
 
-    # H16, calibrate_midpoint (E.6). A calibration's register writes persist, so a defect in one
-    # shows in cal AND in wheel, the snapshot taken after it: injected into both, or wheel_refused
-    # (wheel == cal) would turn as well and the injection would not be one defect any more.
+    # H16. Calibration writes persist, so a defect is injected into both cal and wheel snapshots;
+    # otherwise wheel_refused (wheel == cal) would change too.
     def persisted(servo, reg, value):
         return _each(_register('cal_eeprom', servo, reg, value),
                      _register('wheel_eeprom', servo, reg, value))
@@ -3254,8 +2618,8 @@ def _tool_injections():
         ('post id 2 reg 31 differs', _register('post_eeprom', CALIB_ID, 31, lambda v: v + 1),
          _red('H16.restored'))]
 
-    # H17, the bench as found (E.7). final is compared with the initial snapshot AND with the
-    # golden baseline, so a changed final turns both rows; the two sources are injected alone.
+    # H17. final is compared with both initial and baseline, so a changed final turns both rows;
+    # the two sources are injected alone.
     out += [
         ('final id 2 reg 31 differs', _register('final_eeprom', 2, 31, lambda v: v + 1),
          _red('H17.eeprom_as_found', 'H17.matches_baseline')),
@@ -3314,13 +2678,9 @@ def _injected(root, name, tag, mutate):
 
 def _self_test_tools(expect, root):
     """
-    Prove every row of h13..h17 by differential injection (E.8), the H12 pattern for all of them.
+    Prove every row of h13..h17 by differential injection, as for H12.
 
-    The baseline is asserted first: every row of the green fixture is PASS or NOTE, and there are
-    rows at all -- a checker that emits nothing would otherwise make every injection below look
-    like a row that did not move, which is not the same thing as a row that cannot. Then each
-    entry of TOOL_INJECTIONS runs over its own copy, and the rows that changed verdict must be
-    exactly the entry's rows, with exactly the entry's verdicts.
+    The green fixture must be all PASS or NOTE; each injection must change exactly its rows.
     """
     base = {}
     for name in TOOL_SCENARIOS:
@@ -3350,7 +2710,7 @@ def _self_test_tools(expect, root):
 
 
 def _self_test_row_coverage(expect, root):
-    """Every non-NOTE row of h13..h17 over the green fixture is in some injection's rows (E.8)."""
+    """Prove every non-NOTE row of h13..h17 has an injection, and every injection a row."""
     emitted = set()
     for name in TOOL_SCENARIOS:
         try:
@@ -3370,12 +2730,9 @@ def _self_test_row_coverage(expect, root):
 
 def _self_test_unreadable_snapshots(expect, root):
     """
-    Prove an 'x' or ok false in any snapshot a row reads turns that row red (E.8, non-vacuity).
+    Prove an 'x' or ok false in any snapshot a row reads turns that row red.
 
-    A snapshot hil_eeprom could not read completely is not evidence that nothing changed: a
-    comparison that skipped the byte it could not read, or that read the missing value as equal,
-    would pass a bench it never saw. Each half of an unreadable byte is injected on its own (see
-    _unreadable), into each snapshot each row reads.
+    Each half is injected on its own (see _unreadable) into each snapshot in SNAPSHOT_ROWS.
     """
     for key, labels in SNAPSHOT_ROWS:
         name, row = key.split('.', 1)
@@ -3393,7 +2750,7 @@ def _self_test_unreadable_snapshots(expect, root):
 
 
 def _self_test_unchecked_rows(expect):
-    """Prove a stray scenario directory no checker claims gives FAIL unchecked_scenarios (E.8)."""
+    """Prove a stray scenario directory no checker claims gives FAIL unchecked_scenarios."""
     import shutil
     import tempfile
 
@@ -3419,7 +2776,7 @@ def _self_test_unchecked_rows(expect):
 
 
 def _self_test_expected(expect):
-    """Prove an expected scenario with no directory and no abort is FAIL did_not_run (E.8)."""
+    """Prove an expected scenario with no directory and no abort is FAIL did_not_run."""
     import shutil
     import tempfile
 
@@ -3466,13 +2823,9 @@ def _self_test_expected(expect):
 
 def _self_test_scenario_membership(expect):
     """
-    Prove the default SCENARIOS of hil_check.sh and CHECKERS name the same set (E.8).
+    Prove hil_check.sh's default SCENARIOS and CHECKERS name the same set, in a valid order.
 
-    run() walks CHECKERS and the shell walks SCENARIOS, and nothing else keeps the two in step: a
-    scenario that runs and no checker claims is caught at run time by unchecked_rows, but a
-    checker whose scenario the default list forgot is only a SKIP -- this is where it fails
-    instead. The ORDER is checked too, for the one property that depends on it (R14): the tool
-    scenarios, the two EEPROM writers among them, run before the soak, and H17 runs last.
+    Order: H13-H16 run before the soak H11, and H17 runs last.
     """
     script = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'hil_check.sh')
     found = re.findall(r'^SCENARIOS=\$\{WAVESHARE_HIL_SCENARIOS:-"([^"]*)"\}$', _text(script),
@@ -3487,7 +2840,7 @@ def _self_test_scenario_membership(expect):
     order = {name: k for k, name in enumerate(names)}
     expect('H11' in order and names[-1:] == ['H17'] and
            all(order.get(name, len(names)) < order['H11'] for name in TOOL_SCENARIOS[:-1]),
-           'H13-H16 run before the soak H11 and H17 runs last (R14): %s' % ' '.join(names))
+           'H13-H16 run before the soak H11 and H17 runs last: %s' % ' '.join(names))
 
 
 def main(argv):

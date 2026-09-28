@@ -1,34 +1,7 @@
 """
-README.md agrees with the code, and its links and anchors resolve.
+The reference blocks in docs/*.md agree with the code, and the docs' links and citations resolve.
 
-The README's reference sections are written from the code by hand, so nothing but this test keeps
-them from drifting. Eight blocks are fenced by HTML-comment markers that render as nothing,
-`<!-- reference:<name>:begin -->` ... `<!-- reference:<name>:end -->`, each on its own line:
-  - hardware-parameters, joint-parameters, state-interfaces: pipe tables whose first column is
-    one backticked name, compared as sets with the driver's own name tables; the hardware table's
-    `default` column is compared with src/driver_defaults.hpp as well, and a known parameter
-    whose `k<Name>` constant is missing there is a failure, not a skipped row;
-  - status-bits: a pipe table of bits 0-7 whose `name the driver prints` column must spell the
-    driver's bit names in bit order;
-  - exit-codes: a bullet list of the tools' exit codes, compared with `enum class Exit`;
-  - launch-arguments: a pipe table of the example launch file's arguments and their defaults;
-  - tool-parameters: a pipe table, one row per tool, of the parameter names each tool accepts and
-    the ranges of its id parameters;
-  - log-lines: a bullet list of every driver and tool log line the README quotes, with `<name>`
-    where the program substitutes text; each literal fragment of eight characters or more must
-    occur in the package's own C++ string literals, and a line with no such fragment at all is
-    a failure, because nothing of it would be checked.
-A missing block is a failed case, never a skip. Every code-side extractor has a pinned count
-(the constants below), so an extractor that silently matches nothing fails.
-
-It also checks what a reader clicks and what the code cites: the release documents are linked,
-every relative link and anchor in README.md and THIRD_PARTY.md resolves, no document cites a
-driver file by line number, and the README headings that comments in the code point at exist.
-
-No fixture reads a file: each case first asserts that the file it needs exists, and a case that
-reads several files collects every problem into one list. The self-tests use synthetic input or
-code files only. No motors, no port, no ROS graph, no git. The test reads the SOURCE tree through
-its own __file__.
+Reads README.md, THIRD_PARTY.md, docs/*.md and the source tree only. See docs/development.md.
 """
 
 import ast
@@ -41,6 +14,22 @@ PKG_ROOT = Path(__file__).resolve().parents[1]
 README = PKG_ROOT / 'README.md'
 THIRD_PARTY = PKG_ROOT / 'THIRD_PARTY.md'
 CHANGELOG = PKG_ROOT / 'CHANGELOG.rst'
+DOCS = PKG_ROOT / 'docs'
+# A tuple, not a glob, so a missing page fails.
+DOC_FILES = tuple(DOCS / name for name in (
+    'setup.md', 'configuration.md', 'bus-timing.md', 'operation.md', 'tools.md', 'bench-check.md',
+    'design.md', 'development.md'))
+# The page that holds each reference block.
+REFERENCE_FILES = {
+    'hardware-parameters': DOCS / 'configuration.md',
+    'joint-parameters': DOCS / 'configuration.md',
+    'state-interfaces': DOCS / 'configuration.md',
+    'status-bits': DOCS / 'configuration.md',
+    'launch-arguments': DOCS / 'setup.md',
+    'tool-parameters': DOCS / 'tools.md',
+    'exit-codes': DOCS / 'tools.md',
+    'log-lines': DOCS / 'operation.md',
+}
 
 DRIVER_CPP = PKG_ROOT / 'src' / 'waveshare_servos.cpp'
 UNITS_CPP = PKG_ROOT / 'src' / 'units.cpp'
@@ -55,7 +44,7 @@ VENDORED_NAMES = frozenset({
     'INST.h', 'SCS.h', 'SCSCL.h', 'SCSerial.h', 'SCServo.h', 'SMSBL.h', 'SMSCL.h', 'SMS_STS.h',
     'SCS.cpp', 'SCSCL.cpp', 'SCSerial.cpp', 'SMSBL.cpp', 'SMSCL.cpp', 'SMS_STS.cpp'})
 
-# Pinned code-side counts. Each changes only together with the code it counts and the README.
+# Pinned code-side counts. Each changes only together with the code it counts and the docs.
 EXPECTED_HARDWARE_PARAMS = 11
 EXPECTED_JOINT_PARAMS = 7
 EXPECTED_STATE_INTERFACES = 9
@@ -66,17 +55,79 @@ EXPECTED_TOOLS = 4
 EXPECTED_TOOL_PARAMETER_NAMES = 12
 EXPECTED_DEFAULTS = 11
 EXPECTED_ID_LIMITS = 3
-# Comments in the code that send the reader to a README heading by quoting it.
-EXPECTED_README_QUOTES = 6
-# Lines in the README's reference:log-lines block. Change it together with the block.
+# Citations of a docs heading in the code, as doc_quotes() finds them.
+EXPECTED_DOC_QUOTES = 172
+# Lines in the reference:log-lines block. Change it together with the block.
 EXPECTED_LOG_LINES = 65
 
-# README headings that other files cite by their text; renaming one breaks the citation.
+# (page, heading) pairs that the code cites by their text; renaming one breaks the citation.
 CITED_HEADINGS = (
-    'Running the bus slower, or off the control thread',
-    '`io_timeout_ms`, and how often a transaction fails',
-    'Recovery after a servo is lost',
-    'Hardware parameters',
+    ('docs/setup.md', 'Try it without hardware'),
+    ('docs/setup.md', 'Drive a differential base'),
+    ('docs/configuration.md', 'Adapt the example'),
+    ('docs/configuration.md', 'Hardware parameters'),
+    ('docs/configuration.md', 'Parameter values'),
+    ('docs/configuration.md', 'Joint parameters'),
+    ('docs/configuration.md', 'Joint frame'),
+    ('docs/configuration.md', 'Command interfaces and limits'),
+    ('docs/configuration.md', 'State interfaces'),
+    ('docs/configuration.md', 'Status bits'),
+    ('docs/configuration.md', 'Multi-turn wheel position'),
+    ('docs/bus-timing.md', 'Cost per servo'),
+    ('docs/bus-timing.md', 'Feedback mode'),
+    ('docs/bus-timing.md', 'Transaction timeout'),
+    ('docs/bus-timing.md', 'Timeout floor'),
+    ('docs/bus-timing.md', 'Cost of a silent servo'),
+    ('docs/bus-timing.md', 'Bus totals line'),
+    ('docs/bus-timing.md', 'rw_rate and is_async'),
+    ('docs/operation.md', 'Safety'),
+    ('docs/operation.md', 'Recovery after a servo is lost'),
+    ('docs/operation.md', 'Known issues'),
+    ('docs/tools.md', 'Tool parameters'),
+    ('docs/tools.md', 'scan'),
+    ('docs/tools.md', 'Two servos on one id'),
+    ('docs/tools.md', 'calibrate_midpoint'),
+    ('docs/tools.md', 'factory_reset'),
+    ('docs/tools.md', 'Exit codes'),
+    ('docs/bench-check.md', 'Run the bench check'),
+    ('docs/bench-check.md', 'Scenarios'),
+    ('docs/bench-check.md', 'Example stack (H1 and H1B)'),
+    ('docs/bench-check.md', 'Component cycle (H9)'),
+    ('docs/bench-check.md', 'Soak (H11)'),
+    ('docs/bench-check.md', 'Command limits (H12)'),
+    ('docs/bench-check.md', 'Tool scenarios (H13 to H17)'),
+    ('docs/bench-check.md', 'Report and verdicts'),
+    ('docs/bench-check.md', 'Gate thresholds'),
+    ('docs/bench-check.md', 'EEPROM journal'),
+    ('docs/bench-check.md', 'Recover an interrupted run'),
+    ('docs/bench-check.md', 'hil_eeprom'),
+    ('docs/bench-check.md', 'port_probe'),
+    ('docs/bench-check.md', 'stop_wheels'),
+    ('docs/design.md', 'Code layout'),
+    ('docs/design.md', 'Port lock'),
+    ('docs/design.md', 'Servo registers'),
+    ('docs/design.md', 'Signed values'),
+    ('docs/design.md', 'Sync write'),
+    ('docs/design.md', 'Sync read'),
+    ('docs/design.md', 'Receive buffer'),
+    ('docs/design.md', 'Late frames'),
+    ('docs/design.md', 'Feedback block'),
+    ('docs/design.md', 'Read cycle'),
+    ('docs/design.md', 'Wheel acceleration'),
+    ('docs/design.md', 'Goal speed'),
+    ('docs/design.md', 'Position unwrapper'),
+    ('docs/design.md', 'Lifecycle'),
+    ('docs/design.md', 'Vendored library traps'),
+    ('docs/design.md', 'Tool structure'),
+    ('docs/design.md', 'Checked transactions'),
+    ('docs/design.md', 'Late acks'),
+    ('docs/design.md', 'Signals during an EEPROM write'),
+    ('docs/development.md', 'Development rules'),
+    ('docs/development.md', 'Fake servo bus'),
+    ('docs/development.md', 'Keep tests off the bench'),
+    ('docs/development.md', 'Launch and render tests'),
+    ('THIRD_PARTY.md', 'The rule: these files are not edited'),
+    ('THIRD_PARTY.md', 'Licensing'),
 )
 RELEASE_DOCUMENTS = ('LICENSE', 'CHANGELOG.rst', 'THIRD_PARTY.md')
 
@@ -109,10 +160,10 @@ LINK = re.compile(
 CITATION = re.compile(
     r'(?<![\w./-])(/?(?:[\w.-]+/)*[\w.-]+\.(?:cpp|hpp|h|py|sh|xacro|yaml|xml|txt|rst|md))'
     r':(\d+(?:-\d+)?)(?![\w-])')
-README_QUOTE = re.compile(r'README(?:\'s)?,? "([^"]+)"')
+DOC_QUOTE = re.compile(r'((?:docs/[\w-]+|THIRD_PARTY)\.md),? "([^"]+)"')
 CONVERSION = re.compile(
     r'%[-+ #0]*(?:\d+|\*)?(?:\.(?:\d+|\*))?(?:hh|h|ll|l|j|z|t|L)?[diouxXeEfFgGaAcspn%]')
-# Joins literal groups and stands for a printf conversion: no fragment of a README line holds it.
+# Joins literal groups and stands for a printf conversion: no fragment of a quoted line holds it.
 SENTINEL = '\x00'
 # A placeholder (`<name>`) or an elision (`...`, with the spaces around it) in a quoted log line:
 # the text on either side is checked separately.
@@ -177,7 +228,7 @@ def links(markdown_text):
             for match in LINK.finditer(text)]
 
 
-def reference_block(markdown_text, name):
+def reference_block(markdown_text, name, page):
     """Return the lines between the reference:<name> markers, or None if there is no block."""
     lines = [line.strip() for line in markdown_text.splitlines()]
     begins = [i for i, line in enumerate(lines) if line == f'<!-- reference:{name}:begin -->']
@@ -185,7 +236,7 @@ def reference_block(markdown_text, name):
     if not begins and not ends:
         return None
     assert len(begins) == 1 and len(ends) == 1 and begins[0] < ends[0], (
-        f'README.md: the reference:{name} markers are not one begin/end pair (begin on lines '
+        f'{page}: the reference:{name} markers are not one begin/end pair (begin on lines '
         f'{[i + 1 for i in begins]}, end on lines {[i + 1 for i in ends]})')
     return markdown_text.splitlines()[begins[0] + 1:ends[0]]
 
@@ -323,19 +374,21 @@ def id_limits():
     return {name: int(value) for name, value in re.findall(r'\b(k\w+)\s*=\s*(\d+)', body)}
 
 
-def readme_quotes():
-    """Return (file, quote) for every comment in the code that quotes a README heading."""
+def doc_quotes():
+    """Return (file, cited page, quote) for every citation of a docs heading in the code."""
     quotes = []
+    paths = [PKG_ROOT / 'CMakeLists.txt', PKG_ROOT / 'package.xml']
     for directory in ('src', 'include', 'test', 'description', 'bringup'):
-        for path in sorted((PKG_ROOT / directory).rglob('*')):
-            relative = path.relative_to(PKG_ROOT)
-            hidden = any(part.startswith('.') or part == '__pycache__' for part in relative.parts)
-            if hidden or not path.is_file() or path.name in VENDORED_NAMES:
-                continue
-            lines = path.read_text(encoding='utf-8', errors='replace').splitlines()
-            text = ' '.join(re.sub(r'^\s*(?://+|#+|<!--|-->)', '', line) for line in lines)
-            quotes += [(relative.as_posix(), quote)
-                       for quote in README_QUOTE.findall(' '.join(text.split()))]
+        paths += sorted((PKG_ROOT / directory).rglob('*'))
+    for path in paths:
+        relative = path.relative_to(PKG_ROOT)
+        hidden = any(part.startswith('.') or part == '__pycache__' for part in relative.parts)
+        if hidden or not path.is_file() or path.name in VENDORED_NAMES:
+            continue
+        lines = path.read_text(encoding='utf-8', errors='replace').splitlines()
+        text = ' '.join(re.sub(r'^\s*(?://+|#+|<!--|-->)', '', line) for line in lines)
+        quotes += [(relative.as_posix(), page, quote)
+                   for page, quote in DOC_QUOTE.findall(' '.join(text.split()))]
     return quotes
 
 
@@ -448,11 +501,11 @@ def missing_fragments(line, corpus):
 # Glue shared by the cases
 
 
-def reference_table(markdown_text, name, required_headers, problems):
+def reference_table(markdown_text, name, required_headers, problems, page):
     """Return the rows of a reference table as {header: cell}; append every problem found."""
-    lines = reference_block(markdown_text, name)
+    lines = reference_block(markdown_text, name, page)
     if lines is None:
-        problems.append(f'README.md has no reference:{name} block')
+        problems.append(f'{page} has no reference:{name} block')
         return []
     header, rows = pipe_table(lines)
     if not header:
@@ -480,7 +533,7 @@ def named_rows(rows, name, problems):
 
 
 def compare_names(readme_names, code_names, name, source, problems):
-    """Append every difference between the README's names and the code's."""
+    """Append every difference between the documented names and the code's."""
     for extra in sorted(set(readme_names) - set(code_names)):
         problems.append(f'reference:{name} lists {extra!r}, which {source} does not have')
     for missing in sorted(set(code_names) - set(readme_names)):
@@ -492,6 +545,21 @@ def compare_names(readme_names, code_names, name, source, problems):
 def readme_text():
     assert README.is_file(), 'README.md is missing'
     return README.read_text(encoding='utf-8')
+
+
+def package_path(path):
+    """Return the path of a package file from the package root, as messages name it."""
+    return path.relative_to(PKG_ROOT).as_posix()
+
+
+def document_text(path):
+    assert path.is_file(), f'{package_path(path)} is missing'
+    return path.read_text(encoding='utf-8')
+
+
+def reference_page(name):
+    """Return (package path, text) of the page that holds the reference:<name> block."""
+    return package_path(REFERENCE_FILES[name]), document_text(REFERENCE_FILES[name])
 
 
 def link_path(target):
@@ -511,7 +579,7 @@ def camel(name):
 
 
 def same_default(readme_token, code_value):
-    """Compare a README default with a driver_defaults.hpp value: numbers numerically."""
+    """Compare a documented default with a driver_defaults.hpp value: numbers numerically."""
     if isinstance(code_value, bool):
         return readme_token == ('true' if code_value else 'false')
     if isinstance(code_value, (int, float)):
@@ -523,7 +591,7 @@ def same_default(readme_token, code_value):
 
 
 # ---------------------------------------------------------------------------------------------
-# M1-M5: links, anchors, slugs
+# Links, anchors, slugs
 
 
 def test_readme_links_the_release_documents():
@@ -534,9 +602,9 @@ def test_readme_links_the_release_documents():
 
 def test_relative_links_resolve_to_files_in_the_package():
     problems = []
-    for document in (README, THIRD_PARTY):
+    for document in (README, THIRD_PARTY) + DOC_FILES:
         if not document.is_file():
-            problems.append(f'{document.name} is missing')
+            problems.append(f'{package_path(document)} is missing')
             continue
         for lineno, target in links(document.read_text(encoding='utf-8')):
             if is_external(target) or target.startswith('#'):
@@ -545,19 +613,19 @@ def test_relative_links_resolve_to_files_in_the_package():
             resolved = (document.parent / path.lstrip('/')).resolve()
             inside = resolved == PKG_ROOT or PKG_ROOT in resolved.parents
             if not path or not inside or not resolved.exists():
-                problems.append(f'{document.name}:{lineno}: ({target}) is not a file in the '
-                                'package')
+                problems.append(f'{package_path(document)}:{lineno}: ({target}) is not a file in '
+                                'the package')
     assert not problems, 'broken relative links:\n' + '\n'.join(problems)
 
 
 def test_in_page_and_cross_file_anchors_resolve():
     problems = []
     texts = {}
-    for document in (README, THIRD_PARTY):
+    for document in (README, THIRD_PARTY) + DOC_FILES:
         if document.is_file():
             texts[document] = document.read_text(encoding='utf-8')
         else:
-            problems.append(f'{document.name} is missing')
+            problems.append(f'{package_path(document)} is missing')
     for document, text in texts.items():
         for lineno, target in links(text):
             if is_external(target) or '#' not in target:
@@ -570,8 +638,8 @@ def test_in_page_and_cross_file_anchors_resolve():
             if linked not in texts:
                 texts[linked] = linked.read_text(encoding='utf-8')
             if unquote(anchor) not in heading_slugs(texts[linked]):
-                problems.append(f'{document.name}:{lineno}: ({target}): {linked.name} has no '
-                                f'heading with the anchor #{anchor}')
+                problems.append(f'{package_path(document)}:{lineno}: ({target}): {linked.name} '
+                                f'has no heading with the anchor #{anchor}')
     assert not problems, 'broken anchors:\n' + '\n'.join(problems)
 
 
@@ -609,12 +677,13 @@ def test_link_extractor_ignores_code_and_finds_links():
 
 
 # ---------------------------------------------------------------------------------------------
-# M6-M12, M15: the reference blocks against the code
+# The reference blocks against the code
 
 
 def test_hardware_parameter_table_matches_the_driver():
     problems = []
-    rows = reference_table(readme_text(), 'hardware-parameters', ('default',), problems)
+    page, text = reference_page('hardware-parameters')
+    rows = reference_table(text, 'hardware-parameters', ('default',), problems, page)
     named = named_rows(rows, 'hardware-parameters', problems)
     known = hardware_params()
     compare_names([name for _, name in named], known, 'hardware-parameters',
@@ -633,13 +702,14 @@ def test_hardware_parameter_table_matches_the_driver():
             problems.append(f'reference:hardware-parameters: {name} has no backticked default')
         elif not same_default(tokens[0], defaults[constant]):
             problems.append(f'reference:hardware-parameters: {name} defaults to {tokens[0]!r} '
-                            f'in the README but {defaults[constant]!r} in the driver ({constant})')
+                            f'in {page} but {defaults[constant]!r} in the driver ({constant})')
     assert not problems, '\n'.join(problems)
 
 
 def test_joint_parameter_table_matches_the_driver():
     problems = []
-    rows = reference_table(readme_text(), 'joint-parameters', (), problems)
+    page, text = reference_page('joint-parameters')
+    rows = reference_table(text, 'joint-parameters', (), problems, page)
     names = [name for _, name in named_rows(rows, 'joint-parameters', problems)]
     compare_names(names, joint_params(), 'joint-parameters', 'kKnownJointParams', problems)
     assert not problems, '\n'.join(problems)
@@ -647,7 +717,8 @@ def test_joint_parameter_table_matches_the_driver():
 
 def test_state_interface_table_matches_the_driver():
     problems = []
-    rows = reference_table(readme_text(), 'state-interfaces', (), problems)
+    page, text = reference_page('state-interfaces')
+    rows = reference_table(text, 'state-interfaces', (), problems, page)
     names = [name for _, name in named_rows(rows, 'state-interfaces', problems)]
     compare_names(names, state_interfaces(), 'state-interfaces', 'kStateKindNames', problems)
     assert not problems, '\n'.join(problems)
@@ -656,7 +727,8 @@ def test_state_interface_table_matches_the_driver():
 def test_status_bit_table_matches_the_driver():
     problems = []
     column = 'name the driver prints'
-    rows = reference_table(readme_text(), 'status-bits', (column,), problems)
+    page, text = reference_page('status-bits')
+    rows = reference_table(text, 'status-bits', (column,), problems, page)
     by_bit = {}
     for row in rows:
         cell = next(iter(row.values()), '')
@@ -676,9 +748,10 @@ def test_status_bit_table_matches_the_driver():
 
 def test_exit_code_list_matches_the_tools():
     problems = []
-    lines = reference_block(readme_text(), 'exit-codes')
+    page, text = reference_page('exit-codes')
+    lines = reference_block(text, 'exit-codes', page)
     if lines is None:
-        problems.append('README.md has no reference:exit-codes block')
+        problems.append(f'{page} has no reference:exit-codes block')
         lines = []
     codes = []
     for line in lines:
@@ -700,7 +773,8 @@ def test_exit_code_list_matches_the_tools():
 
 def test_launch_argument_table_matches_the_launch_file():
     problems = []
-    rows = reference_table(readme_text(), 'launch-arguments', ('default',), problems)
+    page, text = reference_page('launch-arguments')
+    rows = reference_table(text, 'launch-arguments', ('default',), problems, page)
     named = named_rows(rows, 'launch-arguments', problems)
     code = launch_arguments()
     compare_names([name for _, name in named], list(code), 'launch-arguments',
@@ -711,7 +785,7 @@ def test_launch_argument_table_matches_the_launch_file():
         tokens = backticked(row.get('default', ''))
         if not tokens or tokens[0] != code[name]:
             problems.append(f'reference:launch-arguments: {name} defaults to '
-                            f'{tokens[:1]} in the README but {code[name]!r} in the launch file')
+                            f'{tokens[:1]} in {page} but {code[name]!r} in the launch file')
     assert not problems, '\n'.join(problems)
 
 
@@ -747,8 +821,9 @@ def test_code_extractors_find_the_pinned_counts():
 
 def test_tool_parameter_table_matches_the_tools():
     problems = []
-    rows = reference_table(readme_text(), 'tool-parameters', ('tool', 'parameters', 'ranges'),
-                           problems)
+    page, text = reference_page('tool-parameters')
+    rows = reference_table(text, 'tool-parameters', ('tool', 'parameters', 'ranges'), problems,
+                           page)
     code = tool_parameters()
     limits = id_limits()
     every_name = {name for names in code.values() for name in names}
@@ -796,7 +871,7 @@ def test_tool_parameter_table_matches_the_tools():
 
 
 # ---------------------------------------------------------------------------------------------
-# M13, M14: line citations, and the headings the code cites
+# Line citations, and the headings the code cites
 
 
 def test_no_line_number_citations_outside_the_vendored_files():
@@ -805,44 +880,49 @@ def test_no_line_number_citations_outside_the_vendored_files():
     problems = []
     if extracted != ['src/servo_bus.cpp:123', 'CMakeLists.txt:46-49', 'src/SCS.cpp:279']:
         problems.append(f'the citation extractor finds {extracted} in {sample!r}')
-    for document in (README, THIRD_PARTY, CHANGELOG):
+    for document in (README, THIRD_PARTY, CHANGELOG) + DOC_FILES:
         if not document.is_file():
-            problems.append(f'{document.name} is missing')
+            problems.append(f'{package_path(document)} is missing')
             continue
         text = document.read_text(encoding='utf-8')
         for lineno, line in enumerate(text.splitlines(), 1):
             for citation in line_citations(line):
                 if citation.split(':')[0].rsplit('/', 1)[-1] not in VENDORED_NAMES:
-                    problems.append(f'{document.name}:{lineno}: {citation}')
+                    problems.append(f'{package_path(document)}:{lineno}: {citation}')
     assert not problems, (
         'line-number citations of non-vendored files (name the function, class or log text '
         'instead):\n' + '\n'.join(problems))
 
 
 def test_headings_the_code_cites_exist():
-    readme_headings = headings(readme_text())
-    problems = [f'README.md has no heading {heading!r}'
-                for heading in CITED_HEADINGS if heading not in readme_headings]
-    quotes = readme_quotes()
-    if len(quotes) != EXPECTED_README_QUOTES:
-        problems.append(f'the code quotes README headings {len(quotes)} times, expected '
-                        f'{EXPECTED_README_QUOTES}: {quotes}')
-    plain = readme_headings + [heading.replace('`', '') for heading in readme_headings]
-    for source, quote in quotes:
+    pages = {package_path(page): headings(document_text(page))
+             for page in (THIRD_PARTY,) + DOC_FILES}
+    problems = [f'{page} has no heading {heading!r}'
+                for page, heading in CITED_HEADINGS if heading not in pages.get(page, [])]
+    quotes = doc_quotes()
+    if len(quotes) != EXPECTED_DOC_QUOTES:
+        problems.append(f'the code cites docs headings {len(quotes)} times, expected '
+                        f'{EXPECTED_DOC_QUOTES}: {quotes}')
+    for source, page, quote in quotes:
+        if page not in pages:
+            problems.append(f'{source} cites {page}, which is not THIRD_PARTY.md or in DOC_FILES')
+            continue
+        plain = pages[page] + [heading.replace('`', '') for heading in pages[page]]
         if not any(quote in heading for heading in plain):
-            problems.append(f'{source} quotes {quote!r}, which is part of no README heading')
+            problems.append(f'{source} quotes {quote!r}, which is part of no heading of {page}')
     assert not problems, '\n'.join(problems)
 
 
 # ---------------------------------------------------------------------------------------------
-# M16, M17: the quoted log lines
+# The quoted log lines
 
 
 def test_quoted_log_lines_appear_in_the_sources():
     problems = []
-    lines = reference_block(readme_text(), 'log-lines')
+    page, text = reference_page('log-lines')
+    lines = reference_block(text, 'log-lines', page)
     if lines is None:
-        problems.append('README.md has no reference:log-lines block')
+        problems.append(f'{page} has no reference:log-lines block')
         lines = []
     quoted = []
     for line in lines:

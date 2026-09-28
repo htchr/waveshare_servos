@@ -1,17 +1,5 @@
-// hil_eeprom core -- the bench's EEPROM oracle and repair tool, as a library (PHASE6_SPEC E.1).
-//
-// Everything hil_eeprom does to a bus lives here, so test/test_hil_eeprom.cpp can drive it on the
-// fake bus in-process (D.6); test/hil/eeprom.cpp is only the signal handlers and a call to run().
-//
-// Independent of servo_tools ON PURPOSE (R12): it reaches the servos through the vendored Ping,
-// Read, readByte, readWord, writeByte and writeWord only, never through ServoBus::checked_*, so a
-// bug in the tools' transactions cannot hide itself behind the oracle that checks them. It still
-// goes through ServoBus::open, so it takes the same exclusive lock and is refused like the tools.
-//
-// A snapshot is every EEPROM byte (0, 1, 3..39, read singly), SRAM 40 and 55, and a few volatile
-// registers kept for evidence. It is written as a plain-text .snap that compare and restore parse
-// back, and as the JSON on the RESULT line that the HIL gates read. An unreadable byte is `x` in
-// both, never 0: a restore that read `x` as 0 would write 0 into an id, limit or mode register.
+// hil_eeprom core: the bench's EEPROM oracle and repair tool, as a library test_hil_eeprom drives.
+// See docs/bench-check.md, "hil_eeprom".
 
 #ifndef HIL__EEPROM_CORE_HPP_
 #define HIL__EEPROM_CORE_HPP_
@@ -32,7 +20,7 @@ namespace waveshare_servos
 namespace hil_eeprom
 {
 
-// Exit codes (E.1). 1 means three things, one per subcommand that can return it.
+// Exit codes. Exit 1 has three causes; a held port has "error": "port_held" in the RESULT JSON.
 constexpr int kExitOk = 0;
 constexpr int kExitPortHeld = 1;
 constexpr int kExitNotEqual = 1;        // compare
@@ -52,19 +40,17 @@ constexpr int kCensusLastId = 253;
 // Every read is tried twice before it is recorded as unreadable: one lost frame on the bench must
 // not turn a snapshot into a refusal, and a byte that fails twice is still `x`.
 constexpr int kReadAttempts = 2;
-// How long a read-back may take to show a write. An EEPROM commit can hold the servo off the bus
-// for longer than its ack window (the fake models this, D.1 #13), so a read-back polls.
+// A read-back polls: an EEPROM commit can keep a servo silent for longer than its ack window.
 constexpr uint32_t kVerifyWindowMs = 1000;
 constexpr uint32_t kVerifyPollMs = 10;
-// The id move: poll Ping(new) this long before calling it failed (E.1 restore step 1.3).
+// The id move: ping the new id this long before the move counts as failed.
 constexpr uint32_t kMoveWindowMs = 500;
 constexpr uint32_t kDriftSampleMs = 50;
-// The longest blockcheck block: the vendored Read's reply buffer is bBuf[255] (src/SCS.cpp:179)
-// and the E.0 probe needs 37. A constant of its own rather than ServoBus::checked_max_bytes, so
-// nothing here leans on the tools' transactions.
+// Longest blockcheck block, below the vendored Read's 255-byte buffer. Deliberately not
+// ServoBus::checked_max_bytes, so nothing here depends on the tools' transactions.
 constexpr int kMaxBlockBytes = 64;
 
-// Register addresses (context/sts3215_memory_table.xlsx; SMS_STS.h names most of them).
+// Register addresses; see docs/design.md, "Servo registers".
 constexpr int kEepromLast = 39;
 constexpr int kRegId = 5;
 constexpr int kRegBaud = 6;

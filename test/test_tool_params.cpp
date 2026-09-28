@@ -1,14 +1,5 @@
-// Tests for src/tool_params.{hpp,cpp} -- the Phase 6 tools' parameter parser (PHASE6_SPEC A, D.3).
-//
-// The parser is pure, so almost every case hands it a std::map<std::string, rclcpp::ParameterValue>
-// built by hand: no rclcpp::init, no node, no bus. The last two cases are the exception on purpose.
-// They pin the two rclcpp/rcl behaviours tool_main depends on and cannot test itself without a
-// real context: that a node's own overrides arrive with their names untouched (so a stale name
-// reaches the parser instead of vanishing), and that rcl keeps an override addressed to another
-// node under that node's name (so it can be refused rather than silently dropped).
-//
-// Every refusal here is what keeps an old or mistyped command line off /dev/ttyACM0: an ignored
-// `device_port` opens the default port, and an id narrowed to 8 bits can be the broadcast id.
+// Tests for src/tool_params, the tools' parameter parser; the ToolParamsRclcpp cases pin rclcpp
+// and rcl override behaviour. See docs/tools.md, "Tool parameters".
 
 #include <gmock/gmock.h>
 
@@ -51,7 +42,7 @@ using Overrides = std::map<std::string, ParameterValue>;
 constexpr Tool kAllTools[] = {
   Tool::kScan, Tool::kSetId, Tool::kCalibrateMidpoint, Tool::kFactoryReset};
 
-// The ids a tool needs, so a case about another parameter is not refused for a missing id (Q4).
+// Adds the ids a tool requires, so a case about another parameter is not refused for a missing id.
 Overrides with_ids(Tool tool, Overrides overrides)
 {
   if (tool == Tool::kSetId) {
@@ -119,8 +110,7 @@ TEST(ToolParams, new_names_are_applied)
 
 TEST(ToolParams, device_port_is_refused_and_names_port)
 {
-  // Ignoring the Phase 1 name would open the default port whatever the command line said. It is
-  // refused even when the new name is given too: the command line is stale either way.
+  // The old name device_port is refused, also next to port: ignoring it opens the default port.
   for (const Tool tool : kAllTools) {
     SCOPED_TRACE(name_of(tool));
     const ParseResult alone = parse_params(
@@ -281,7 +271,7 @@ TEST(ToolParams, ids_are_range_checked_before_narrowing)
 
 TEST(ToolParams, set_id_requires_both_ids)
 {
-  // [Q4] The old defaults were 1, so a bare set_id or calibrate addressed servo 1.
+  // Ids have no default: the old default 1 made a bare set_id or calibrate change servo 1.
   const ParseResult neither = parse_params(Tool::kSetId, {});
   EXPECT_FALSE(neither.config.has_value());
   EXPECT_THAT(
@@ -305,8 +295,8 @@ TEST(ToolParams, calibrate_requires_id)
 
 TEST(ToolParams, factory_reset_takes_a_required_id_and_the_port_parameters)
 {
-  // factory_reset (FACTORY_RESET_SPEC 2): calibrate's surface exactly -- id required and range
-  // checked before narrowing, port and baudrate with the hardware parameters' names and defaults.
+  // factory_reset takes calibrate_midpoint's parameters: a required id (range checked before
+  // narrowing), plus port and baudrate with the hardware parameters' names and defaults.
   EXPECT_EQ(
     only_error(parse_params(Tool::kFactoryReset, {})),
     "parameter 'id' is missing; expected an integer between 0 and 253");
@@ -347,7 +337,7 @@ TEST(ToolParams, factory_reset_takes_a_required_id_and_the_port_parameters)
 
 TEST(ToolParams, scan_takes_no_id)
 {
-  // scan always covers 0..253 [Q5]: an id given to it is an unknown name, not a narrowed scan.
+  // scan always covers 0..253: an id given to it is an unknown name, not a narrowed scan.
   EXPECT_THAT(
     only_error(parse_params(Tool::kScan, {{"id", ParameterValue(int64_t{3})}})),
     StartsWith("parameter 'id' is not a parameter of scan"));
@@ -409,10 +399,8 @@ TEST(ToolParams, overrides_for_another_node_are_refused)
 
 TEST(ToolParams, a_single_star_override_is_accepted_only_for_a_top_level_node)
 {
-  // Review fix F11. rclcpp turns `/*` into the pattern (/\w+) and matches it against the WHOLE
-  // fully qualified name, so it reaches /set_id and not /robot/set_id -- pinned against rclcpp
-  // itself by ToolParamsRclcpp.a_single_star_override_misses_a_namespaced_node. `/**` reaches
-  // both. A `-r __ns:=/robot` would otherwise let a `/*` port be dropped and the default used.
+  // rclcpp's `/*` matches only a top-level node (see ToolParamsRclcpp below); under a namespace it
+  // is dropped silently, so it is refused. See docs/tools.md, "Tool parameters".
   EXPECT_THAT(foreign_override_nodes("/set_id", {{"/*", {"port"}}}), IsEmpty());
   EXPECT_THAT(foreign_override_nodes("/robot/set_id", {{"/**", {"port"}}}), IsEmpty());
   EXPECT_THAT(foreign_override_nodes("/robot/set_id", {{"/robot/set_id", {"port"}}}), IsEmpty());
@@ -428,8 +416,8 @@ TEST(ToolParams, a_single_star_override_is_accepted_only_for_a_top_level_node)
 
 TEST(ToolParams, every_tool_has_a_name_and_its_usage_line)
 {
-  // The names are the executables' and the nodes' (A.1 step 4); the usage lines are printed with
-  // every exit 64 and are the README's command lines.
+  // The names are the executables' and the nodes' names; the usage line is printed with every
+  // usage error (exit 64).
   EXPECT_STREQ(name_of(Tool::kScan), "scan");
   EXPECT_STREQ(name_of(Tool::kSetId), "set_id");
   EXPECT_STREQ(name_of(Tool::kCalibrateMidpoint), "calibrate_midpoint");
@@ -455,8 +443,8 @@ TEST(ToolParams, every_tool_has_a_name_and_its_usage_line)
 namespace
 {
 
-// The two cases below need a live rclcpp context: they pin the library behaviour the parser's
-// callers rely on. The context is created once for the suite and never installs signal handlers.
+// The cases below need a live rclcpp context to pin library behaviour. One context per suite,
+// with no signal handlers.
 class ToolParamsRclcpp : public ::testing::Test
 {
 protected:
@@ -477,9 +465,8 @@ protected:
 
 TEST_F(ToolParamsRclcpp, overrides_from_ros_args_contain_stale_names)
 {
-  // A.1 step 4 reads get_parameter_overrides() and drops every key the node itself declared. For
-  // that to refuse `device_port`, rclcpp must hand the override over under its own name even
-  // though nothing declares it -- and it must list use_sim_time, which rclcpp declares.
+  // tool_main keeps the overrides the node did not declare, so rclcpp must list the undeclared
+  // device_port; it also lists use_sim_time, which rclcpp declares itself.
   const auto node = std::make_shared<rclcpp::Node>(
     "set_id", rclcpp::NodeOptions()
     .arguments({"--ros-args", "-p", "device_port:=/x", "-p", "use_sim_time:=false"})
@@ -506,9 +493,8 @@ TEST_F(ToolParamsRclcpp, overrides_from_ros_args_contain_stale_names)
 
 TEST_F(ToolParamsRclcpp, global_overrides_keep_their_node_name)
 {
-  // rclcpp would drop `-p setid:port:=/x` for a node called set_id. rcl still has it, under the
-  // node name exactly as typed -- measured: "setid", with no leading slash -- and an unprefixed
-  // rule under "/**". Both forms are what foreign_override_nodes() is written against.
+  // Measured: rcl keeps `-p setid:port:=/x` under "setid" (no leading slash) and an unprefixed
+  // rule under "/**". foreign_override_nodes() handles both forms.
   const char * argv[] = {"set_id", "--ros-args", "-p", "setid:port:=/x", "-p", "port:=/y"};
   auto context = std::make_shared<rclcpp::Context>();
   context->init(6, argv, rclcpp::InitOptions().auto_initialize_logging(false));
@@ -538,9 +524,8 @@ TEST_F(ToolParamsRclcpp, global_overrides_keep_their_node_name)
 
 TEST_F(ToolParamsRclcpp, a_single_star_override_misses_a_namespaced_node)
 {
-  // Measured, not assumed (review fix F11): the same params file reaches a top-level node through
-  // `/*` and does not reach that node under a namespace, while `/**` reaches both. This is the
-  // rclcpp behaviour foreign_override_nodes() mirrors for `/*`.
+  // Measured: a params-file `/*` section reaches /set_id but not /robot/set_id, and `/**`
+  // reaches both. foreign_override_nodes() mirrors this.
   const std::string path = (std::filesystem::temp_directory_path() /
     ("test_tool_params_star_" + std::to_string(::getpid()) + ".yaml")).string();
   {

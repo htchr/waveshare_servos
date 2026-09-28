@@ -1,14 +1,5 @@
-// Tests for test/hil/eeprom_core.{hpp,cpp} and the hil_eeprom binary (PHASE6_SPEC D.6, E.1).
-//
-// hil_eeprom is the oracle every "wrote nothing" and "restored" gate of the Phase 6 bench rests
-// on, and the tool that repairs the bench when a scenario did write. A bug in it would either hide
-// a tool's write or make one, so its logic runs here on the fake bus first: the vendored packet
-// code unchanged over an openpty() pair, the fake's frame log for what went on the wire, and its
-// EEPROM model (lock policy, power cycle, commit latency, id re-key) for what a servo keeps.
-//
-// Two cases spawn the built binary ($WAVESHARE_HIL_EEPROM_BIN) instead of calling the library,
-// because what they pin belongs to the process: that compare opens no port at all, and that a
-// SIGTERM in the middle of a restore waits until the EEPROM lock is closed again.
+// Tests for test/hil/eeprom_core and the hil_eeprom binary (the bench check's EEPROM oracle) on
+// the fake bus. See docs/bench-check.md, "hil_eeprom".
 
 #include <gmock/gmock.h>
 
@@ -85,14 +76,11 @@ using waveshare_servos_test::kRegPresentPosition;
 using waveshare_servos_test::kRegTorqueEnable;
 
 constexpr int kBaudrate = 1000000;
-constexpr uint32_t kIoTimeoutMs = 20;   // hil_eeprom's own (E.1)
-// The port a compare that opened one by default would reach: defaults::kPort, spelled out
-// because this target has only test/ and test/hil/ on its include path (B.5).
+constexpr uint32_t kIoTimeoutMs = 20;   // hil_eeprom's own io timeout
+// defaults::kPort, spelled out: src/driver_defaults.hpp is not on this target's include path.
 constexpr const char * kDefaultPort = "/dev/ttyACM0";
 
-// The registers a snapshot holds, written out here rather than taken from eeprom_core, so no case
-// asks the code under test which registers it should have read: EEPROM 0, 1, 3..39 (address 2 is
-// not defined), then SRAM 40 and 55.
+// Written out, not taken from eeprom_core: EEPROM 0, 1, 3..39 (2 is undefined), SRAM 40 and 55.
 std::vector<int> snapshot_registers()
 {
   std::vector<int> regs = {0, 1};
@@ -104,9 +92,8 @@ std::vector<int> snapshot_registers()
   return regs;
 }
 
-// A delivered servo's EEPROM with every byte different from its neighbours and from the other
-// servos', so a byte read from the wrong address or from the wrong servo cannot pass for the right
-// one. Bytes 0, 1, 3 and 4 (firmware and model) are the same on all four, as on the bench.
+// Every byte differs from its neighbours and from the other servos', so a wrong address or
+// servo fails. Bytes 0, 1, 3, 4 (firmware, model) are equal on all four, as on the bench.
 uint8_t seeded(int id, int reg)
 {
   switch (reg) {
@@ -181,9 +168,8 @@ std::string hil_eeprom_bin()
   return bin == nullptr ? std::string() : std::string(bin);
 }
 
-// posix_spawn with stdout and stderr into one file (a file, not a pipe: nothing can block on a
-// full pipe), with an empty signal mask and default dispositions, so the child cannot inherit
-// immunity to the very signal a case sends it. -1 when the spawn failed.
+// stdout and stderr into one file (a pipe could fill and block), with an empty signal mask and
+// default dispositions. -1 when the spawn failed.
 pid_t spawn_to_file(const std::vector<std::string> & args, const std::string & out_path)
 {
   std::vector<char *> argv;
@@ -233,9 +219,8 @@ bool wait_exit(pid_t pid, int * status, std::chrono::seconds limit)
   return false;
 }
 
-// Holds the default port the way test_tools_cli's DefaultPortGuard does (D.5): opened, flocked
-// and made exclusive, and never a byte sent. A compare that opened any port by default would then
-// be refused, which is what makes "compare opens no port" a claim a case can fail.
+// Holds the default port (open, flock, TIOCEXCL; no byte sent), so a compare that opened a port
+// by default is refused. Unlike DefaultPortGuard, it does not wait for another holder.
 class HeldDefaultPort
 {
 public:
@@ -288,10 +273,8 @@ private:
   std::string state_;
 };
 
-// The block read of a firmware whose 37-byte READ disagrees with its single-byte reads, the risk
-// E.0's blockcheck exists for (G.2 R4). Every 43-byte reply -- a 37-byte payload, and nothing else
-// on this bus is that long -- has its register-13 byte changed and its checksum repaired, so the
-// vendored Read accepts it. readSCS is virtual and protected, so a derived bus is the only way in.
+// A firmware whose 37-byte block READ disagrees with single reads (what blockcheck detects):
+// each 43-byte reply gets register 13 changed and its checksum repaired.
 struct DisagreeingBlockBus : ServoBus
 {
 protected:
@@ -344,9 +327,8 @@ protected:
     ASSERT_TRUE(static_cast<bool>(bus_.open(fake_.port(), kBaudrate, kIoTimeoutMs)));
   }
 
-  // A restore source: ids 1-4 as they are now, with the census the fake has. The census is filled
-  // in rather than pinged for -- a census costs 2.5 s of absent-id timeouts, and the ping pass has
-  // a case of its own (census_lists_exactly_the_answering_ids).
+  // Ids 1-4 as they are now. The census is filled in, not pinged: a census costs 2.5 s, and
+  // census_lists_exactly_the_answering_ids tests it.
   Snapshot source_of_now()
   {
     bool interrupted = true;
@@ -691,15 +673,15 @@ TEST_F(HilEeprom, restore_with_allow_regs_refuses_a_difference_elsewhere_with_ze
 {
   const Snapshot source = source_of_now();
   ASSERT_TRUE(source.ok);
-  RestoreOptions phase6_regs;
-  phase6_regs.limit_regs = true;
-  phase6_regs.allow_regs = {5, 31, 32, 33, 40, 55};
+  RestoreOptions tool_written_regs;
+  tool_written_regs.limit_regs = true;
+  tool_written_regs.allow_regs = {5, 31, 32, 33, 40, 55};
 
   // 31 is in the list and 13 is not: nothing is written, and both differences are reported
   fake_.set_byte(2, kRegOffset, static_cast<uint8_t>(seeded(2, kRegOffset) + 1));
   fake_.set_byte(2, 13, static_cast<uint8_t>(seeded(2, 13) + 1));
   fake_.clear_frames();
-  const RestoreReport refused = restore(bus_, source, phase6_regs, &no_stop_);
+  const RestoreReport refused = restore(bus_, source, tool_written_regs, &no_stop_);
   EXPECT_EQ(refused.exit, 3);
   EXPECT_THAT(joined(refused.problems), HasSubstr("id 2 reg 13"));
   std::set<int> reported;
@@ -713,7 +695,7 @@ TEST_F(HilEeprom, restore_with_allow_regs_refuses_a_difference_elsewhere_with_ze
   // the control: with 13 as it was, the same list lets the offset through
   fake_.set_byte(2, 13, seeded(2, 13));
   fake_.clear_frames();
-  const RestoreReport allowed = restore(bus_, source, phase6_regs, &no_stop_);
+  const RestoreReport allowed = restore(bus_, source, tool_written_regs, &no_stop_);
   EXPECT_EQ(allowed.exit, 0) << joined(allowed.problems);
   EXPECT_TRUE(contains(fake_.writes(), WriteRecord{2, kRegOffset, {seeded(2, 31), seeded(2, 32)}}));
 }
@@ -725,11 +707,8 @@ TEST_F(
   fake_.set_byte(2, kRegTorqueEnable, 1);
   const Snapshot source = source_of_now();
   ASSERT_TRUE(source.ok);
-  // what a calibration and a mode switch leave behind: another offset, mode 1, torque still on --
-  // with the offset model on, so rewriting 31-32 moves the frame the present position is read in,
-  // as on the bench (README NOTE: the calibration moved it by 1022 ticks). The goal must be read
-  // AFTER that rewrite; one read before it would drive the arm a quarter turn at torque-on (E.1
-  // step 5; review fix F13). The seed keeps present and moves the model's shaft instead.
+  // Offset model on: rewriting 31-32 moves the frame, so restore must read the goal after it, or
+  // torque-on drives the arm a quarter turn. See docs/bench-check.md, "hil_eeprom".
   fake_.set_offset_model(2, true);
   fake_.set_byte(2, kRegOffset, 0x12);
   fake_.set_byte(2, kRegOffset + 1, 0x04);

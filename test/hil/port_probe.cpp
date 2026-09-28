@@ -1,19 +1,5 @@
-// port_probe: the second opener of the bench check's H6 (PHASE2_SPEC 12.5).
-//
-// It tries to take the tty the driver holds, and reports which layer refused it. It NEVER
-// writes a byte to the tty and NEVER calls read(): a read on a shared bus steals the driver's
-// reply and corrupts exactly the traffic this scenario protects.
-//
-// With --hold it keeps the port for a while so the driver's own on_configure can be made to
-// meet a holder; with --no-exclusive it takes only the advisory lock, so the driver meets a
-// flock-only holder. TIOCNXCL before close is mandatory: a plain close does not clear the
-// exclusive flag while another descriptor keeps the tty alive (PHASE2_SPEC 12.4).
-//
-// Output: one line "RESULT {json}", preceded -- when --hold takes the port -- by one line
-// "HOLDING {json}" printed and flushed before the sleep starts, so a caller can tell a live
-// holder from one whose hold has already expired. The RESULT line only exists once it is over.
-// Exit codes: 0 acquired, 10 refused_by_tiocexcl, 11 refused_by_flock, 20 open_failed,
-//             21 flock_failed, 22 tiocexcl_failed, 64 usage.
+// port_probe: tries to take the tty the driver holds and reports which lock refused it. Never
+// reads or writes the tty. See docs/bench-check.md, "port_probe".
 
 #include <fcntl.h>
 #include <sys/file.h>

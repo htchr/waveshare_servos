@@ -1,19 +1,5 @@
-// Validated getters over a ros2_control <param> block, plus the compiled-in defaults.
-//
-// Driver-owned and header-only, and under src/ on purpose: install(DIRECTORY include/ ...)
-// (CMakeLists.txt) must not pick it up, because it is an implementation detail rather than part of
-// the package's public interface (PHASE2_SPEC 3.7, 4.2).
-//
-// One helper serves both parameter blocks: HardwareInfo::hardware_parameters and
-// ComponentInfo::parameters are the same type, std::unordered_map<std::string, std::string>
-// (hardware_info.hpp:391 and :111), so the hardware parameters of PHASE2_SPEC 4 and the joint
-// parameters of PHASE2_SPEC 5 read the same way and produce the same five message templates.
-//
-// Every getter reports a Status and leaves the caller's value untouched unless it returns kOk, so
-// a compiled-in default survives an absent parameter and a bad value can never half-apply. The
-// conversions are hardware_interface's, not std::sto*: hardware_interface::stod is
-// locale-independent, rejects trailing characters and rejects a non-finite result, which matters
-// because NaN compares false against both range bounds and would otherwise slip through.
+// Validated getters over a ros2_control <param> map; each writes `value` only on kOk. Under src/
+// so it is not installed. See docs/configuration.md, "Parameter values".
 
 #ifndef PARAM_PARSING_HPP_
 #define PARAM_PARSING_HPP_
@@ -33,9 +19,8 @@ namespace params
 
 using ParameterMap = std::unordered_map<std::string, std::string>;
 
-// What a getter found. kDefaulted is the absent case: it is an error only for a required
-// parameter (id, PHASE2_SPEC 5.1), which tests `st != kOk`, while an optional parameter tests
-// `st != kOk && st != kDefaulted` and keeps its default.
+// What a getter found. kDefaulted (absent) is an error only for the required id; an optional
+// parameter accepts it and keeps its default.
 enum class Status
 {
   kOk,
@@ -48,9 +33,7 @@ enum class Status
 namespace detail
 {
 
-// Values arriving from the URDF are already stripped by parse_parameters_from_xml
-// (component_parser.cpp:366-368); stripping again keeps the getters honest when a test, or a
-// future caller, injects a map directly.
+// ros2_control already strips values from the URDF; strip again for a map built directly (tests).
 inline std::string strip(const std::string & text)
 {
   const auto first = text.find_first_not_of(" \t\n\v\f\r");
@@ -109,8 +92,7 @@ inline Status get_bool(const ParameterMap & p, const std::string & name, bool & 
   }
   bool parsed = false;
   try {
-    // parse_bool accepts exactly "true"/"false", case-insensitively (lexical_casts.hpp:108), so
-    // the XML habits 1/0 and yes/no are malformed here.
+    // parse_bool accepts only "true" or "false", in any case: 1/0 and yes/no are malformed.
     parsed = hardware_interface::parse_bool(text);
   } catch (const std::out_of_range &) {
     // Unreachable through parse_bool today; caught first so the three getters read alike and a
@@ -137,9 +119,7 @@ inline Status get_int(
   try {
     parsed = hardware_interface::stoi_generic<int64_t>(text);
   } catch (const std::out_of_range &) {
-    // Order matters: std::out_of_range derives from std::logic_error, not from
-    // std::invalid_argument, but catching the other way round would still be wrong the day one of
-    // them starts deriving -- and reads as if malformed and out of range were the same thing.
+    // Caught before invalid_argument on purpose: an overflow is kOutOfRange, never kMalformed.
     return Status::kOutOfRange;
   } catch (const std::invalid_argument &) {
     return Status::kMalformed;
@@ -169,8 +149,8 @@ inline Status get_double(
   } catch (const std::out_of_range &) {
     return Status::kOutOfRange;
   } catch (const std::invalid_argument &) {
-    // stod throws this for "1.0f" and "1,5" (trailing characters) and for "nan" and "inf"
-    // (non-finite), so no non-finite value ever reaches the range check below.
+    // Jazzy's stod throws this for trailing characters ("1.0f"), "nan", "inf" and an overflow
+    // ("1e999"), so no non-finite value reaches the range check below.
     return Status::kMalformed;
   }
   if ((min_exclusive ? parsed <= min : parsed < min) || parsed > max) {
@@ -180,11 +160,9 @@ inline Status get_double(
   return Status::kOk;
 }
 
-// The five templates of PHASE2_SPEC 4.2, and the only place they are spelled out. `subject` is
-// "hardware parameter '<name>'" or "joint '<joint>' parameter '<name>'"; `raw_value` is raw()
-// above; `expected` completes the sentence ("an integer between 1 and 10"). Always logged as
-// RCLCPP_FATAL(logger, "%s", msg.c_str()), never as a format string, so a value containing a '%'
-// cannot corrupt the call.
+// The FATAL text for a rejected parameter: missing, empty, malformed or out of range ("" for kOk).
+// `subject` names the parameter, `raw_value` is raw(), `expected` completes the sentence.
+// Log it as RCLCPP_FATAL(logger, "%s", msg.c_str()), so a '%' in the value is harmless.
 inline std::string message(
   Status st, const std::string & subject, const std::string & raw_value,
   const std::string & expected)

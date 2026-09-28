@@ -1,6 +1,5 @@
-# Controller manager configuration for the bench check (PHASE2_SPEC 12.5).
-# hil_check.sh substitutes @WHEELS@ with the wheel joint list of the scenario's description:
-# [joint3, joint4], or [joint3, joint4, joint5] when the absent id 9 is declared.
+# Controller manager configuration for the bench check. hil_check.sh replaces @WHEELS@ with
+# [joint3, joint4], or with [joint3, joint4, joint5] when the absent id 9 is declared.
 controller_manager:
   ros__parameters:
     update_rate: 100

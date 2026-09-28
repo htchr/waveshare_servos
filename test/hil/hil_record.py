@@ -1,16 +1,7 @@
 """
-rclpy recorder for the waveshare_servos bench check (PHASE2_SPEC 12.3).
+rclpy recorder for the waveshare_servos bench check.
 
-Trimmed from phase1_evidence/hil/hilctl.py: the /diagnostics subscription is gone (hil_check.sh
-captures that topic through the CLI) and so are the unused --topics permutations. Every
-subcommand records /joint_states, and optionally /dynamic_joint_states, at full rate while it
-acts, so command times and joint data share one clock and one file. Output is one JSON file.
-
-  wait_js  --timeout S                                          exit 0 once /joint_states arrives
-  record   --duration S --out F [--djs]                          record only
-  move     --controller C --joints a,b --positions x,y --duration T --out F
-  vel      --topic T --values v1,v2 --hold H [--stop-values ...] --out F
-  call     --out F [--timeout S] -- <command ...>                run a CLI while recording
+Each subcommand records /joint_states (with --djs, also /dynamic_joint_states) while it acts.
 """
 
 import argparse
@@ -134,9 +125,8 @@ def cmd_move(args):
     # hil_check.sh waits for this line to place a SIGKILL inside the move rather than after it
     print('T_CMD %.6f' % t_cmd, flush=True)
     node.spin_for(args.duration + args.post)
-    # rclpy stores a float64[] field as array.array('d', ...) and a string[] as a plain list;
-    # neither is guaranteed JSON-serializable, so every message field is copied into a list
-    # before it reaches json.dump (the same rule the Recorder callbacks follow).
+    # rclpy gives a float64[] field as array.array, which json.dump cannot write: copy every
+    # message field into a list first (as the Recorder callbacks do).
     node.write(args.out, {'kind': 'move', 'label': args.label, 'controller': args.controller,
                           'joints': list(message.joint_names),
                           'targets': list(point.positions),

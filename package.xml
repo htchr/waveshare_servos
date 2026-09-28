@@ -28,8 +28,7 @@
   <depend>rcl</depend>
   <depend>rcl_yaml_param_parser</depend>
 
-  <!-- The example bringup (launch/, config/, description/) and the ros2 commands the README
-       tells you to run. -->
+  <!-- The example bringup (launch/, config/, description/) and the ros2 commands used with it. -->
   <exec_depend>controller_manager</exec_depend>
   <exec_depend>diff_drive_controller</exec_depend>
   <exec_depend>joint_state_broadcaster</exec_depend>
@@ -45,11 +44,8 @@
   <exec_depend>velocity_controllers</exec_depend>
   <exec_depend>xacro</exec_depend>
 
-  <!-- Test-only dependencies. The tests also use controller_manager, launch, launch_ros and
-       xacro: those are exec_depends above and are not repeated, because `rosdep install`
-       installs every dependency type except doc, and a test_depend on controller_manager puts a
-       CMake warning in the build (see ament_lint_auto_find_test_dependencies() in
-       CMakeLists.txt). -->
+  <!-- Test-only. The tests also use controller_manager, launch, launch_ros and xacro, which are
+       exec_depends above. See docs/development.md, "Development rules". -->
   <!-- Test build tooling. CMakeLists.txt registers cpplint itself, without its copyright rule. -->
   <test_depend>ament_cmake_cpplint</test_depend>
   <test_depend>ament_cmake_gmock</test_depend>
@@ -61,9 +57,8 @@
   <test_depend>lifecycle_msgs</test_depend>
   <test_depend>rcutils</test_depend>
   <test_depend>ros2_control_test_assets</test_depend>
-  <!-- The Python tests. launch_testing_ros and sensor_msgs are imported by
-       controller_manager.test_utils, which test_example_launch.py imports, so every run of that
-       test needs them, motors or not. -->
+  <!-- The Python tests. controller_manager.test_utils, imported by test_example_launch.py,
+       needs launch_testing_ros and sensor_msgs. -->
   <test_depend>ament_index_python</test_depend>
   <test_depend>launch_testing</test_depend>
   <test_depend>launch_testing_ros</test_depend>

@@ -1,15 +1,5 @@
-// Load-time tests for the waveshare_servos/WaveshareServos plugin.
-//
-// The plugin is loaded from a URDF string through the ResourceManager (or the System wrapper) and
-// initialized, but it is NEVER configured or activated: the port is still hard-coded to
-// /dev/ttyACM0, and configure would open it and talk to real servos.
-//
-// Two groups of tests:
-// - WaveshareServosLoad / WaveshareServosRejects pin the behavior of the pre-Jazzy driver at
-//   init time (interfaces, values, on_init checks). They must pass before and after the Phase 1
-//   API migration.
-// - WaveshareServosJazzyApi checks what the migration is meant to change (framework-created
-//   interface handles, the component logger). They fail on the pre-Jazzy driver.
+// Load-time tests: the plugin is loaded and initialized from a URDF string but never configured,
+// so no serial port is opened.
 
 #include <gmock/gmock.h>
 
@@ -152,12 +142,8 @@ TEST_F(WaveshareServosLoad, bench_four_joint_system_loads_unconfigured)
   EXPECT_FALSE(process_has_serial_port_open());
 }
 
-// The resource manager keeps a component's interfaces in the order the component exports them.
-// `ros2 control list_hardware_components` and every controller that claims all interfaces (the
-// joint_state_broadcaster, so the per-joint order of /dynamic_joint_states) show them in that
-// order. The pre-Jazzy driver exported them joint by joint in the order of the description: the
-// four state interfaces in the order on_init requires, then the joint's command interfaces as
-// listed.
+// Interfaces are exported joint by joint in description order, the order that
+// list_hardware_components and /dynamic_joint_states show.
 TEST_F(WaveshareServosLoad, interfaces_are_listed_in_description_order)
 {
   std::vector<Joint> reordered = bench_joints();
@@ -193,12 +179,8 @@ TEST_F(WaveshareServosLoad, interfaces_are_listed_in_description_order)
   EXPECT_FALSE(process_has_serial_port_open());
 }
 
-// The driver serves the interfaces of the <joint> elements and nothing else. A <gpio> or <sensor>
-// in the same <ros2_control> block declares interfaces it never reads or writes, so the pre-Jazzy
-// driver did not export them and the resource manager refused the description ("Discrepancy
-// between robot description file (urdf) and actually exported HW interfaces"). The framework's
-// default export would hand those handles out instead, and the component would load with
-// interfaces that nothing ever updates.
+// Only <joint> interfaces are served: a <gpio> or <sensor> in the block makes the load fail,
+// instead of exporting handles that nothing updates.
 TEST_F(WaveshareServosLoad, gpio_and_sensor_interfaces_are_refused_at_load)
 {
   const std::vector<std::pair<std::string, std::string>> cases = {
@@ -223,10 +205,8 @@ TEST_F(WaveshareServosLoad, gpio_and_sensor_interfaces_are_refused_at_load)
   EXPECT_FALSE(process_has_serial_port_open());
 }
 
-// A command interface listed twice on one joint used to be exported twice, and the resource
-// manager complained about it ("Tried to insert CommandInterface with already existing key"); the
-// interfaces of the joints after it were then not imported, so the description was refused. The
-// framework's interface map would merge the two entries and load the description without a word.
+// A command interface listed twice is exported twice, so the resource manager logs "already
+// existing key" (and refuses the load when joints follow) instead of a silent merge.
 TEST_F(WaveshareServosLoad, a_command_interface_listed_twice_is_reported_at_load)
 {
   {
@@ -317,8 +297,7 @@ namespace
 std::vector<Rejection> rejections()
 {
   return {
-    // PHASE2_SPEC 5.1: `id` is required, and every one of these rows was undefined behaviour in
-    // Phase 1 -- the missing-param case a measured SIGSEGV on the unguarded find("id")->second.
+    // `id` is required: a whole number 1..253, unique within the <ros2_control> block.
     {"id_missing",
       [](std::vector<Joint> & j) {j[1].id = "";},
       "joint 'joint2' has no <param name=\"id\">; every joint needs the bus id of its servo "
@@ -347,16 +326,14 @@ std::vector<Rejection> rejections()
       [](std::vector<Joint> & j) {j[2].id = "1";},
       "joint 'joint3' has id 1, which joint 'joint1' already uses; ids must be unique within a "
       "<ros2_control> block", ""},
-    // hardware_interface::stoi_generic parses through std::stol, which accepts a leading '+' and
-    // leading zeros, so the declared text and the parsed number differ on exactly the path where
-    // the parsed number exists. PHASE2_SPEC 5.1 writes the number.
+    // stoi_generic parses through std::stol, which accepts '+' and leading zeros, so the
+    // message prints the parsed number, not the declared text.
     {"id_duplicate_written_differently",
       [](std::vector<Joint> & j) {j[2].id = "+001";},
       "joint 'joint3' has id 1, which joint 'joint1' already uses; ids must be unique within a "
       "<ros2_control> block", ""},
-    // PHASE2_SPEC 7.2/7.3: the state interfaces are free-form -- any subset, any order -- so the
-    // six fixed-order rows that used to live here all describe legal descriptions now. What is
-    // left to reject is a name the driver does not serve, a non-double data_type and a duplicate.
+    // State interfaces are free-form (any subset, any order). Rejected: an unknown name, a
+    // data_type other than double, and a duplicate.
     {"unknown_state_interface",
       [](std::vector<Joint> & j) {j[0].state_interfaces.push_back(state("torqe"));},
       "joint 'joint1' declares the unsupported state interface 'torqe'; supported names are "
@@ -387,15 +364,14 @@ std::vector<Rejection> rejections()
     {"effort_command_interface",
       [](std::vector<Joint> & j) {j[2].command_interfaces = {command("effort", "-1.0", "1.0")};},
       "a joint is using a command interface that isn't position or velocity", ""},
-    // PHASE2_SPEC 5.2. 'position' is the ros2_control interface name, not the enum token this
-    // param takes, so it is the typo the message has to name.
+    // 'position' is the interface name, not a `type` value (pos | vel): the likely typo.
     {"type_not_pos_or_vel",
       [](std::vector<Joint> & j) {j[1].type = "position";},
       "joint 'joint2' has type 'position'; it must be 'pos' or 'vel'", ""},
     {"type_empty",
       [](std::vector<Joint> & j) {j[1].type = kEmptyParam;},
       "joint 'joint2' has type ''; it must be 'pos' or 'vel'", ""},
-    // row E8 of the PHASE2_SPEC 5.2 table: a wheel takes only a velocity command
+    // a wheel (type vel) takes only a velocity command
     {"type_vel_with_a_position_command",
       [](std::vector<Joint> & j) {
         j[2].type = "vel";
@@ -403,7 +379,7 @@ std::vector<Rejection> rejections()
       },
       "joint 'joint3' has type 'vel' but declares a position command interface; a velocity joint "
       "runs its servo in wheel mode and takes only <command_interface name=\"velocity\">", ""},
-    // row E7 (D3): a velocity command interface only paces the move, it cannot replace the goal
+    // a velocity command only paces a position joint's move; it cannot replace the goal
     {"type_pos_without_a_position_command",
       [](std::vector<Joint> & j) {
         j[0].type = "pos";
@@ -439,9 +415,8 @@ std::vector<Rejection> rejections()
         j[0].command_interfaces[0] = command("position", "-1.570796", "nan");
       },
       "joint 'joint1' has a position min or max that is not a number", ""},
-    // PHASE2_SPEC 5.3: offset is a servo-frame constant, so a bad one is only visible as the tick
-    // its joint limits map to. joint1 is offset 1.570796 rad with limits +-1.570796 -> ticks
-    // [0, 2048]; every row below moves that window off one end of the servo's single turn.
+    // A bad offset shows only in the ticks the limits map to. joint1 (offset pi/2, limits
+    // +-pi/2) is ticks [0, 2048]; each row below moves that window out of [0, 4095].
     {"offset_not_a_number",
       [](std::vector<Joint> & j) {j[0].offset = "half_pi";},
       "joint 'joint1' has an offset that is not a finite number: 'half_pi'", ""},
@@ -471,11 +446,8 @@ std::vector<Rejection> rejections()
       },
       "maps its zero position to servo tick -65, outside the servo's single-turn range [0, 4095]",
       ""},
-    // An offset that is finite but astronomically large overflows the tick arithmetic. std::lround
-    // of a double outside long's range is unspecified -- on this target it is LONG_MIN -- so an
-    // enormous positive offset would otherwise be reported as an enormous negative tick. The
-    // verdict is a rejection either way; what this row pins is that the number printed still has
-    // the sign of the offset.
+    // std::lround outside long's range is unspecified (LONG_MIN here); the row checks that the
+    // printed tick keeps the sign of the offset.
     {"offset_past_the_range_of_a_long",
       [](std::vector<Joint> & j) {
         j[2].type = "pos";
@@ -484,12 +456,12 @@ std::vector<Rejection> rejections()
       },
       "maps its zero position to servo tick 4611686018427387904, outside the servo's single-turn "
       "range [0, 4095]", ""},
-    // PHASE2_SPEC 5.3: '1' and '0' are deliberately not accepted, so neither is anything else
+    // only 'true'/'false'; '1' and '0' are refused on purpose
     {"inverted_not_a_bool",
       [](std::vector<Joint> & j) {j[0].inverted = "yes";},
       "joint 'joint1' has inverted='yes'; it must be 'true' or 'false'", ""},
-    // PHASE2_SPEC 5.4: max_speed is rad/s in the joint frame. A value of 0 would make
-    // std::clamp(speed, 1.0, 0.0) undefined behaviour on the write path, so it is refused here.
+    // max_speed is rad/s in the joint frame. 0 is refused: std::clamp(speed, 1.0, 0.0) on the
+    // write path would be undefined behaviour.
     {"max_speed_not_a_number",
       [](std::vector<Joint> & j) {j[0].max_speed = "fast";},
       "joint 'joint1' has a max_speed that is not a finite number: 'fast'", ""},
@@ -513,8 +485,8 @@ std::vector<Rejection> rejections()
     {"max_accel_rounds_to_zero_counts",
       [](std::vector<Joint> & j) {j[0].max_accel = "0.05";},
       "rounds to 0 acceleration-register counts", ""},
-    // PHASE2_SPEC 5.5 / 8.2: unwrapping a position joint would break the goal-speed pacing, the
-    // limit check and the activation seed, so it is a FATAL rather than a silently ignored param
+    // unwrap on a position joint is FATAL, not ignored: it would break the goal-speed pacing,
+    // the limit check and the activation seed
     {"unwrap_not_a_bool",
       [](std::vector<Joint> & j) {j[2].unwrap = "yes";},
       "joint 'joint3' has unwrap='yes'; it must be 'true' or 'false'", ""},
@@ -567,13 +539,12 @@ TEST_F(WaveshareServosLoad, unmodified_example_description_is_accepted)
 }
 
 // ---------------------------------------------------------------------------------------------
-// Item 1: the <hardware><param> block, its validation and the resolved-configuration INFO line.
+// The <hardware><param> block, its validation and the resolved-configuration INFO line.
 
 namespace
 {
 
-// The PHASE2_SPEC 4.5 line for a description that declares no hardware parameter at all: every
-// value is the compiled-in default, and the two doubles print with %.7g (%g would round
+// The configuration line with no hardware param. Doubles print with %.7g (%g would round
 // 0.8825985 to 0.882599).
 constexpr char kDefaultConfigurationLine[] =
   "bus configuration: port '/dev/ttyACM0', 1000000 baud, protocol 'sms_sts', io timeout 5 ms, "
@@ -581,8 +552,7 @@ constexpr char kDefaultConfigurationLine[] =
   "feedback_mode 'auto', 4096 encoder steps per revolution, 0.006 A per current count, "
   "0.8825985 N m/A";
 
-// The configuration lines of PHASE2_SPEC 4.5, in the order they were logged. on_init logs exactly
-// one per successful load and none at all when a value is rejected.
+// The "bus configuration" INFO lines in log order: one per successful load, none on a reject.
 std::vector<std::string> configuration_lines(const LogCapture & logs)
 {
   std::vector<std::string> lines;
@@ -594,10 +564,8 @@ std::vector<std::string> configuration_lines(const LogCapture & logs)
   return lines;
 }
 
-// The two timeout advisories of PHASE3 2.82 and 2.85, in the order they were logged. Selecting by
-// the parameter name rather than by the whole sentence lets a case say "exactly one" without
-// having to know which of the two fired, which is the point of
-// `the_two_timeout_warnings_never_contradict_each_other`.
+// The io_timeout_ms WARNs (floor and ceiling) in log order. Selected by the parameter name,
+// so a case can require "exactly one" without naming which.
 std::vector<std::string> timeout_warnings(const LogCapture & logs)
 {
   std::vector<std::string> selected;
@@ -609,8 +577,8 @@ std::vector<std::string> timeout_warnings(const LogCapture & logs)
   return selected;
 }
 
-// The INFO of PHASE3 2.82's third rung: a DEFAULTED timeout below the floor is raised to it, so
-// that a stock description on a ten-joint bus keeps the fast path instead of silently demoting.
+// The INFO for a defaulted timeout below the floor: it is raised, so a stock description on a
+// large bus keeps sync read.
 std::vector<std::string> raise_infos(const LogCapture & logs)
 {
   std::vector<std::string> selected;
@@ -622,12 +590,8 @@ std::vector<std::string> raise_infos(const LogCapture & logs)
   return selected;
 }
 
-// A description with `count` velocity joints, ids 1..count. The sync-read floor scales with the
-// joint count and only passes the 5 ms default from ten joints up -- min_io_timeout_ms(10) is 6 ms
-// and (20) is 9 ms (PHASE3 R9) -- so the upper rungs of 2.82's ladder are unreachable with the
-// four joints the example carries. Every joint named in a <ros2_control> block must also exist in
-// the URDF, so the ones past joint4 are added there as continuous joints, the way kUrdfJoint4 adds
-// the second wheel.
+// `count` velocity joints, ids 1..count; the floor exceeds the 5 ms default only from 10 joints
+// (6 ms; 9 ms at 20). Joints past joint4 are added to the URDF as continuous joints.
 std::string many_joint_description(size_t count, const std::string & declared)
 {
   std::string urdf = std::string(ros2_control_test_assets::urdf_head) + kUrdfJoint4;
@@ -646,7 +610,7 @@ std::string many_joint_description(size_t count, const std::string & declared)
   return urdf + "</ros2_control>\n" + ros2_control_test_assets::urdf_tail;
 }
 
-// The "ignoring it" warnings of PHASE2_SPEC 4.3, in the order they were logged.
+// The "is not used by this driver; ignoring it" WARNs, in log order.
 std::vector<std::string> unknown_parameter_warnings(const LogCapture & logs)
 {
   std::vector<std::string> warnings;
@@ -663,8 +627,7 @@ std::string hardware_param(const std::string & name, const std::string & value)
   return "<param name=\"" + name + "\">" + value + "</param>\n";
 }
 
-// The three message templates of PHASE2_SPEC 4.2 a hardware parameter can reach, spelled out here
-// independently of the driver's own params::message().
+// The three hardware-param message templates, written independently of params::message().
 std::string empty_param(const std::string & name, const std::string & expected)
 {
   return "hardware parameter '" + name + "' is empty; expected " + expected;
@@ -694,8 +657,7 @@ Rejection hw_reject(
 
 std::vector<Rejection> hw_param_rejections()
 {
-  // PHASE3 R8 / 5.20a: the lower bound moved from 1 to 2, and the sentence explains why in terms
-  // of the batched read, because a user who sees "out of range" for 1 ms deserves the reason.
+  // The lower bound is 2 ms, and the message gives the reason in terms of the batched read.
   const std::string timeout =
     "an integer between 2 and 1000 (milliseconds); 1 ms is not enough for a batched feedback "
     "read, which needs about 0.48 ms plus 0.29 ms per servo";
@@ -732,8 +694,8 @@ std::vector<Rejection> hw_param_rejections()
     hw_reject(
       "protocol_unknown", "protocol", "feetech",
       malformed("protocol", "feetech", "a known protocol; expected 'sms_sts'")),
-    // PHASE3 2.71 / 2.126. A misspelt transport must not fall back to a working default: the whole
-    // point of the parameter is to pin the read path when the firmware's behaviour is in question.
+    // A misspelt feedback_mode is refused, not replaced by a default: the parameter exists to
+    // pin the read path.
     hw_reject(
       "feedback_mode_empty", "feedback_mode", "",
       empty_param("feedback_mode", "'auto', 'sync_read' or 'per_servo'")),
@@ -742,10 +704,8 @@ std::vector<Rejection> hw_param_rejections()
       malformed("feedback_mode", "syncread", modes)),
     hw_reject(
       "io_timeout_ms_zero", "io_timeout_ms", "0", out_of_range("io_timeout_ms", "0", timeout)),
-    // PHASE3 4.T52. 1 ms was legal through Phase 2 and is now refused outright: at 1 ms a sync
-    // read of four servos fails 98.55 %, and 8 of 3000 "clean" reads at that setting were the
-    // PREVIOUS cycle's frames, with correct headers, ids, slots, lengths and checksums [P3 Q4/Q6].
-    // A setting that silently publishes stale samples as fresh ones must not be reachable.
+    // 1 ms is refused: it fails most sync reads and passes some stale ones as fresh.
+    // See docs/bus-timing.md, "Transaction timeout".
     hw_reject(
       "io_timeout_ms_one", "io_timeout_ms", "1", out_of_range("io_timeout_ms", "1", timeout)),
     hw_reject(
@@ -811,9 +771,9 @@ std::vector<Rejection> hw_param_rejections()
 
 }  // namespace
 
-TEST_F(WaveshareServosLoad, hardware_params_default_to_the_phase1_constants)
+TEST_F(WaveshareServosLoad, hardware_params_default_to_the_compiled_in_constants)
 {
-  // no <param> at all in <hardware>: every value below is the compiled-in Phase 1 constant
+  // no <param> in <hardware>: every value is the compiled-in default
   auto params = resource_manager_params(robot_description(kExampleName, example_joints()));
   hardware_interface::ResourceManager rm(params, false);
   ASSERT_TRUE(rm.load_and_initialize_components(params));
@@ -850,9 +810,8 @@ TEST_F(WaveshareServosLoad, explicit_hardware_params_appear_in_the_configuration
   std::string declared = hardware_param("port", "/dev/ttyUSB1");
   declared += hardware_param("baudrate", "115200");
   declared += hardware_param("protocol", "sms_sts");
-  // 7 and not 5: 5 became the default in PHASE3 5.19, and a column that reads the same whether
-  // the parameter was honoured or ignored proves nothing. 7 is above min_io_timeout_ms(4) == 3 and
-  // below the 8 ms ceiling WARN, so neither timeout advisory fires here (PHASE3 5.20).
+  // 7, not the default 5, so the line proves the value was used; 7 is between the 4-joint floor
+  // (3 ms) and the 8 ms ceiling, so no timeout WARN fires.
   declared += hardware_param("io_timeout_ms", "7");
   declared += hardware_param("ping_attempts", "1");
   declared += hardware_param("max_read_fails", "7");
@@ -874,10 +833,8 @@ TEST_F(WaveshareServosLoad, explicit_hardware_params_appear_in_the_configuration
       "1 ping attempt(s), drop a servo after 7 consecutive read failures, allow_missing_servos "
       "true, feedback_mode 'sync_read', 1024 encoder steps per revolution, 0.0065 A per current "
       "count, 1.5 N m/A"));
-  // All eleven names are in kKnownHardwareParams. Parsing a value and listing its name are two
-  // separate edits (PHASE3 2.71 item 1), and a name left out of the table is still parsed
-  // correctly -- the only visible symptom is the driver announcing it ignores a parameter it is
-  // in fact honouring, which is what this assertion catches.
+  // All eleven names must also be in kKnownHardwareParams, or the driver warns that it ignores
+  // a parameter that it in fact uses.
   EXPECT_THAT(unknown_parameter_warnings(logs_), IsEmpty());
   EXPECT_THAT(logs_.messages(RCUTILS_LOG_SEVERITY_FATAL), IsEmpty());
   EXPECT_FALSE(process_has_serial_port_open());
@@ -903,21 +860,16 @@ TEST_F(WaveshareServosLoad, feedback_mode_is_normalised_to_lower_case)
   ASSERT_TRUE(rm.load_and_initialize_components(params));
 
   EXPECT_THAT(configuration_lines(logs_), ElementsAre(HasSubstr("feedback_mode 'per_servo'")));
-  // The name has to be in kKnownHardwareParams as well as parsed, or this same load also tells
-  // the user the parameter was ignored (PHASE3 2.71 item 1).
+  // The name must also be in kKnownHardwareParams, or the load warns that it is ignored.
   EXPECT_THAT(unknown_parameter_warnings(logs_), IsEmpty());
   EXPECT_THAT(logs_.messages(RCUTILS_LOG_SEVERITY_FATAL), IsEmpty());
   EXPECT_FALSE(process_has_serial_port_open());
 }
 
 // ---------------------------------------------------------------------------------------------
-// PHASE3 2.82 (R10): the four-way ladder that io_timeout_ms and feedback_mode form together. The
-// floor is ServoBus::min_io_timeout_ms(min(joints, 30)) -- 3 ms at four joints, 6 at ten, 9 at
-// twenty (R9) -- and what happens below it depends on whether the user chose the value and on
-// which transport was asked for.
+// io_timeout_ms against the sync-read floor and ceiling. See docs/bus-timing.md, "Timeout floor".
 
-// 4.T53 / 3.39. The default is the one value a user gets without asking, so it must sit above the
-// floor and below the ceiling on the reference bench: five servos' worth of headroom either way.
+// The default must be at or above the floor and below the ceiling on the four-servo bench.
 TEST_F(WaveshareServosLoad, the_default_io_timeout_is_five_milliseconds)
 {
   auto params = resource_manager_params(robot_description(kExampleName, example_joints()));
@@ -932,9 +884,8 @@ TEST_F(WaveshareServosLoad, the_default_io_timeout_is_five_milliseconds)
   EXPECT_THAT(logs_.messages(RCUTILS_LOG_SEVERITY_FATAL), IsEmpty());
 }
 
-// 3.39, with R9's floor and R10's response: a USER-SET value below the floor under 'auto' warns
-// with L3's frozen text and latches the per-servo path, which is the one transport measured
-// reliable at every setting down to 1 ms [P3 Q2].
+// A user-set value below the floor under 'auto' warns and switches to per-servo reads, the
+// one path measured reliable at every setting down to 1 ms.
 TEST_F(WaveshareServosLoad, a_timeout_below_the_sync_read_floor_warns_with_the_joint_count)
 {
   auto params = resource_manager_params(
@@ -950,15 +901,14 @@ TEST_F(WaveshareServosLoad, a_timeout_below_the_sync_read_floor_warns_with_the_j
   // The latch is visible in the configuration line: the user asked for nothing, got 'auto', and
   // the driver reports the transport it will actually use rather than the word it parsed.
   EXPECT_THAT(configuration_lines(logs_), ElementsAre(HasSubstr("feedback_mode 'per_servo'")));
-  // A user-set value is never rewritten -- it is also the cost of a dead servo, which is theirs
-  // to choose (2.82, 4.T54).
+  // A user-set value is never rewritten: it is also what a dead servo costs, the user's choice.
   EXPECT_THAT(configuration_lines(logs_), ElementsAre(HasSubstr("io timeout 2 ms")));
   EXPECT_THAT(raise_infos(logs_), IsEmpty());
   EXPECT_THAT(logs_.messages(RCUTILS_LOG_SEVERITY_FATAL), IsEmpty());
 }
 
-// 2.82's first rung: per_servo asks no question of the floor at all, because a single FeedBack
-// waits for one 21-byte reply and survives every setting the range still allows.
+// per_servo is never checked against the floor: one FeedBack waits for one 21-byte reply and
+// works at every setting the range allows.
 TEST_F(WaveshareServosLoad, feedback_mode_per_servo_is_never_judged_against_the_sync_read_floor)
 {
   std::string declared = hardware_param("io_timeout_ms", "2");
@@ -973,9 +923,7 @@ TEST_F(WaveshareServosLoad, feedback_mode_per_servo_is_never_judged_against_the_
   EXPECT_THAT(logs_.messages(RCUTILS_LOG_SEVERITY_FATAL), IsEmpty());
 }
 
-// 2.126 / 2.82's last rung. Asking for sync_read and then starving it is the one combination the
-// driver cannot satisfy in any degraded way, so it refuses the description instead of quietly
-// running the transport the user ruled out.
+// sync_read with a user-set value below the floor has no degraded path: the load is refused.
 TEST_F(WaveshareServosLoad, feedback_mode_sync_read_refuses_an_io_timeout_below_the_floor)
 {
   std::string declared = hardware_param("io_timeout_ms", "2");
@@ -994,9 +942,8 @@ TEST_F(WaveshareServosLoad, feedback_mode_sync_read_refuses_an_io_timeout_below_
   EXPECT_FALSE(process_has_serial_port_open());
 }
 
-// 2.126 / 2.82's third rung, and the reason the ladder distinguishes a defaulted value from a
-// user-set one at all: ten joints is where min_io_timeout_ms passes the 5 ms default, and a stock
-// description must not lose the fast path to a number nobody chose.
+// A defaulted value is raised, not demoted: at 10 joints the floor exceeds the 5 ms default,
+// and a stock description must keep sync read.
 TEST_F(WaveshareServosLoad, a_defaulted_io_timeout_is_raised_to_the_floor_instead_of_demoting)
 {
   auto params = resource_manager_params(many_joint_description(10, ""));
@@ -1014,9 +961,8 @@ TEST_F(WaveshareServosLoad, a_defaulted_io_timeout_is_raised_to_the_floor_instea
   EXPECT_THAT(logs_.messages(RCUTILS_LOG_SEVERITY_FATAL), IsEmpty());
 }
 
-// 3.39 with R11's threshold. Above 8 ms the setting is not wrong, it is expensive: the timeout is
-// what one non-answering servo costs in every cycle that polls it, measured at 1.00-1.03x the
-// setting from 2 to 50 ms [P1 Q7], and a 100 Hz period is 10 ms.
+// Above 8 ms the value is expensive, not wrong: a silent servo costs the timeout plus the 2 ms
+// drain every cycle, and 100 Hz leaves 10 ms.
 TEST_F(WaveshareServosLoad, a_timeout_above_eight_milliseconds_warns_about_a_dead_servo)
 {
   auto params = resource_manager_params(
@@ -1025,16 +971,13 @@ TEST_F(WaveshareServosLoad, a_timeout_above_eight_milliseconds_warns_about_a_dea
   ASSERT_TRUE(rm.load_and_initialize_components(params));
 
   EXPECT_THAT(timeout_warnings(logs_), ElementsAre(HasSubstr("a 100 Hz loop has 10 ms")));
-  // It is an advisory about a cost, not a verdict on the configuration (2.85): a slower loop or a
-  // deliberately patient bus is legitimate, and the line must say so.
+  // An advisory about cost, not a verdict: the text must say that a slower loop is legitimate.
   EXPECT_THAT(timeout_warnings(logs_), ElementsAre(HasSubstr("legitimate")));
   EXPECT_THAT(logs_.messages(RCUTILS_LOG_SEVERITY_FATAL), IsEmpty());
 }
 
-// The whole content of R11 is the number 8, and 20 ms is above both it and the max(10, floor) of
-// the superseded 3.8, so the case above cannot tell the two apart. Four joints put the floor at 3,
-// which makes 9 ms the one setting that is above max(8, 3) and below max(10, 3). The 8 ms arm pins
-// the other side of the same boundary: the comparison is strictly above the ceiling, not at it.
+// The ceiling is 8 ms and the check is strictly above it: with a 3 ms floor, 8 is silent and
+// 9 warns.
 TEST_F(WaveshareServosLoad, the_dead_servo_ceiling_is_eight_milliseconds_not_ten)
 {
   auto at_the_ceiling = resource_manager_params(
@@ -1054,10 +997,8 @@ TEST_F(WaveshareServosLoad, the_dead_servo_ceiling_is_eight_milliseconds_not_ten
   EXPECT_THAT(logs_.messages(RCUTILS_LOG_SEVERITY_FATAL), IsEmpty());
 }
 
-// 2.85's mode guard. The ceiling is what one non-answering servo costs a BURST, which waits for
-// the whole reply stream; the per-servo path waits for one 21-byte reply per joint and only pays
-// the timeout for the joint that is actually silent. A user who has already opted out of the burst
-// is not warned about its cost.
+// No ceiling WARN for per_servo: only a burst waits for the whole reply stream; per-servo
+// reads pay the timeout only for the silent joint.
 TEST_F(WaveshareServosLoad, the_dead_servo_ceiling_is_never_raised_against_the_per_servo_path)
 {
   std::string declared = hardware_param("io_timeout_ms", "20");
@@ -1070,11 +1011,8 @@ TEST_F(WaveshareServosLoad, the_dead_servo_ceiling_is_never_raised_against_the_p
   EXPECT_THAT(logs_.messages(RCUTILS_LOG_SEVERITY_FATAL), IsEmpty());
 }
 
-// 2.80: the floor's argument is the CHUNK size, min(joints, sync_read_max_ids), because an id list
-// longer than 30 is split and no single burst ever waits for more than 30 replies. Forty joints is
-// the only shape that separates the clamp from the raw joint count -- min_io_timeout_ms(30) is
-// 12 ms where min_io_timeout_ms(40) would be 16 -- and both the number and the noun in the INFO
-// come from it.
+// The floor uses the chunk size min(joints, 30), because longer id lists are split.
+// 40 joints tells them apart: floor(30) = 12 ms, floor(40) would be 16.
 TEST_F(WaveshareServosLoad, the_sync_read_floor_is_measured_against_one_chunk_not_every_joint)
 {
   auto params = resource_manager_params(many_joint_description(40, ""));
@@ -1084,18 +1022,14 @@ TEST_F(WaveshareServosLoad, the_sync_read_floor_is_measured_against_one_chunk_no
   EXPECT_THAT(
     raise_infos(logs_),
     ElementsAre("io_timeout_ms raised from 5 to 12 ms for a sync read of 30 servos"));
-  // The raise lands exactly on max(8, floor), so the ceiling of R11 stays quiet: obeying the floor
-  // is never something to be scolded for.
+  // The raise lands on the floor, which is also the ceiling max(8, floor), so no ceiling WARN.
   EXPECT_THAT(timeout_warnings(logs_), IsEmpty());
   EXPECT_THAT(configuration_lines(logs_), ElementsAre(HasSubstr("io timeout 12 ms")));
   EXPECT_THAT(logs_.messages(RCUTILS_LOG_SEVERITY_FATAL), IsEmpty());
 }
 
-// The ladder's rungs are ordered, and this is the order: who chose the value is asked before which
-// transport was asked for, so a number nobody wrote is raised even under 'sync_read'. Reversing
-// the two would refuse a stock ten-joint description that pins the fast path -- the exact
-// combination 2.82 exists to keep working -- and only a value the user actually wrote can reach
-// the FATAL rung.
+// Who set the value is checked before the mode: a defaulted value is raised even under
+// 'sync_read'; only a user-written value can reach the FATAL.
 TEST_F(WaveshareServosLoad, a_defaulted_timeout_is_raised_even_when_sync_read_is_pinned)
 {
   auto params = resource_manager_params(
@@ -1111,8 +1045,7 @@ TEST_F(WaveshareServosLoad, a_defaulted_timeout_is_raised_even_when_sync_read_is
   EXPECT_THAT(logs_.messages(RCUTILS_LOG_SEVERITY_FATAL), IsEmpty());
 }
 
-// R11: the ceiling is max(8, floor), never a flat 8, so a bus big enough to need more than 8 ms
-// can obey the floor without being scolded for it. Twenty joints put the floor at 9 ms.
+// The ceiling is max(8, floor), not a flat 8: at 20 joints the floor is 9 ms, and 9 is silent.
 TEST_F(WaveshareServosLoad, the_two_timeout_warnings_never_contradict_each_other)
 {
   auto params = resource_manager_params(
@@ -1232,21 +1165,19 @@ INSTANTIATE_TEST_SUITE_P(
   [](const ::testing::TestParamInfo<Rejection> & info) {return info.param.name;});
 
 // ---------------------------------------------------------------------------------------------
-// Item 2: the <joint><param> block -- id, type inference, offset, inverted, max_speed, max_accel
-// and unwrap (PHASE2_SPEC 5). Every one of the seven is optional except id, so the descriptions
-// that loaded before this item still load.
+// The <joint><param> block: id (required), type, offset, inverted, max_speed, max_accel, unwrap.
 
 namespace
 {
 
-// the summary line PHASE2_SPEC 5.2 asks for, once per successful on_init
+// the joint-type summary line, once per successful on_init
 std::string joint_summary(size_t joints, size_t position, size_t velocity)
 {
   return "parsed " + std::to_string(joints) + " joints: " + std::to_string(position) +
          " position (mode 0), " + std::to_string(velocity) + " velocity (mode 1)";
 }
 
-// the PHASE2_SPEC 5.5 line, logged once per joint that reports a multi-turn position
+// logged once per joint that reports a multi-turn position
 std::string unwrap_line(const std::string & joint)
 {
   return "joint '" + joint + "' reports an unwrapped, multi-turn position";
@@ -1293,9 +1224,8 @@ TEST_F(WaveshareServosJointParams, an_explicit_type_matching_the_command_interfa
   EXPECT_FALSE(process_has_serial_port_open());
 }
 
-// The velocity command interface of a position joint is only a pacing hint (the goal is always the
-// position), and the example xacro, the bench description and example_controllers.yaml all rely on
-// a position joint declaring both.
+// A position joint may also declare a velocity command (a pacing hint); the example xacro,
+// the bench description and example_controllers.yaml rely on it.
 TEST_F(WaveshareServosJointParams, a_position_joint_may_declare_both_command_interfaces)
 {
   auto params = resource_manager_params(example_description());
@@ -1308,13 +1238,8 @@ TEST_F(WaveshareServosJointParams, a_position_joint_may_declare_both_command_int
   EXPECT_THAT(logs_.messages(RCUTILS_LOG_SEVERITY_FATAL), IsEmpty());
 }
 
-// Exactly 'true'/'false', case-insensitively, and absent is 'false'.
-//
-// joint1's limits are deliberately NOT symmetric about its offset, so this case is load-bearing
-// for the sign and not only for the spelling: with offset 0 and limits [-pi/2, 0] the window is
-// ticks [0, 1024] when 'true' reached JointConfig::sign and ticks [-1024, 0] when it did not, and
-// the second is a FATAL. joint2 keeps the example limits, which are symmetric, because what it
-// pins is the 'False' spelling parsing at all.
+// 'true'/'false' in any case; absent is 'false'. joint1's limits are not symmetric, so a lost
+// sign maps them to ticks [-1024, 0] and fails the load.
 TEST_F(WaveshareServosJointParams, inverted_true_and_false_both_load)
 {
   std::vector<Joint> joints = example_joints();
@@ -1328,11 +1253,8 @@ TEST_F(WaveshareServosJointParams, inverted_true_and_false_both_load)
   EXPECT_FALSE(process_has_serial_port_open());
 }
 
-// The other direction of the same pin: one description, one parameter changed, opposite verdicts.
-// `inverted` is the parameter that decides which way the servo turns, and the only load-time
-// observable of the sign it produces is the tick window the position limits map to (the driver-
-// level proof is the pty chunk's inverted_flips_the_commanded_position_and_the_wheel_speed), so
-// an asymmetric window is what keeps a wrong-signed or dropped assignment red here.
+// Same check, other direction: the tick window of asymmetric limits is the only load-time sign
+// of `inverted` (test_lifecycle_over_pty.cpp tests the motion).
 TEST_F(WaveshareServosJointParams, inverted_flips_the_tick_mapping_of_the_position_limits)
 {
   std::vector<Joint> joints = example_joints();
@@ -1355,7 +1277,7 @@ TEST_F(WaveshareServosJointParams, inverted_flips_the_tick_mapping_of_the_positi
 }
 
 // The check is on the tick the limit maps to, not on a strict inequality in radians: tick 0 and
-// tick encoder_steps - 1 are both reachable, and the bench A/B description sits on tick 0.
+// tick encoder_steps - 1 are both reachable, and the example joint1's lower limit is tick 0.
 TEST_F(WaveshareServosJointParams, an_offset_at_the_edge_of_the_servo_range_is_accepted)
 {
   std::vector<Joint> joints = example_joints();
@@ -1476,10 +1398,8 @@ TEST_F(WaveshareServosJointParams, max_accel_above_the_register_is_capped_with_a
   EXPECT_FALSE(process_has_serial_port_open());
 }
 
-// Both conversions round a double into an integer count, and a finite but astronomically large
-// limit lands outside long's range, where std::lround is unspecified (LONG_MIN on this target).
-// Such a value is "too large for the register", never "smaller than one count", so the cap WARN is
-// the outcome and the FATAL below it must not fire.
+// Past long's range std::lround is unspecified (LONG_MIN here); such a value is too large,
+// never "less than one count", so the cap WARN fires, not the FATAL.
 TEST_F(WaveshareServosJointParams, limits_past_the_range_of_a_long_are_capped_not_called_too_small)
 {
   std::vector<Joint> joints = example_joints();
@@ -1502,10 +1422,8 @@ TEST_F(WaveshareServosJointParams, limits_past_the_range_of_a_long_are_capped_no
   EXPECT_FALSE(process_has_serial_port_open());
 }
 
-// The <hardware> block already warns about a <param> name it does not know; a typo inside a
-// <joint> block is the worse of the two, because `invert` instead of `inverted` is a servo that
-// turns the wrong way with no diagnostic at all. Warn and ignore, never reject: a description may
-// legitimately carry documentation params.
+// An unknown <joint> param warns and is ignored, never rejected: `invert` for `inverted` must
+// be visible, and documentation params are legal.
 TEST_F(WaveshareServosJointParams, an_unknown_joint_param_warns_and_still_loads)
 {
   std::vector<Joint> joints = example_joints();
@@ -1540,9 +1458,8 @@ TEST_F(WaveshareServosJointParams, unwrap_defaults_to_on_for_vel_joints_only)
 
 TEST_F(WaveshareServosJointParams, unwrap_false_turns_a_vel_joint_back_to_wrapping)
 {
-  // One capture for both sub-cases: LogCapture is not reentrant (a second one would chain the
-  // handler to itself and recurse until the stack runs out), and neither sub-case may log the
-  // line, so there is nothing to clear between them.
+  // One capture for both sub-cases (LogCapture is not reentrant); neither may log the line,
+  // so nothing needs clearing between them.
   for (const std::string declared : {"false", "False"}) {
     SCOPED_TRACE(declared);
     std::vector<Joint> joints = example_joints();
@@ -1556,8 +1473,7 @@ TEST_F(WaveshareServosJointParams, unwrap_false_turns_a_vel_joint_back_to_wrappi
 }
 
 // ---------------------------------------------------------------------------------------------
-// Items 3 and 7: free-form state interfaces (PHASE2_SPEC 7.2, 7.3). Any subset of the nine, in any
-// order, per joint; the empty set is legal; `torque` still works and still says kg cm (D2).
+// Free-form state interfaces: any subset of the nine (or none), any order; `torque` is kg cm.
 
 namespace
 {
@@ -1576,7 +1492,7 @@ std::vector<std::string> states_named(const std::vector<std::string> & names)
   return fragments;
 }
 
-// the PHASE2_SPEC 3.4 deprecation WARN, once per joint that declares the alias
+// the deprecation WARN, once per joint that declares `torque`
 std::string torque_deprecation(const std::string & joint)
 {
   return "joint '" + joint + "' declares the deprecated state interface 'torque' (kg cm); it keeps "
@@ -1660,8 +1576,8 @@ TEST_F(WaveshareServosStateInterfaces, all_supported_state_interfaces_can_be_dec
     EXPECT_THAT(rm.state_interface_keys(), Contains(key));
     EXPECT_EQ(rm.get_state_interface_data_type(key), "double") << key;
   }
-  // nothing has been configured, so every one of the nine is still NaN -- `status` included, which
-  // is the value a consumer has to guard with std::isfinite (PHASE2_SPEC 3.5)
+  // nothing is configured, so all nine are NaN, `status` included (consumers guard it with
+  // std::isfinite)
   InitializedSystem initialized(urdf);
   ASSERT_EQ(initialized.state_id(), State::PRIMARY_STATE_UNCONFIGURED);
   for (const auto & handle : initialized.system().export_state_interfaces()) {
@@ -1673,10 +1589,8 @@ TEST_F(WaveshareServosStateInterfaces, all_supported_state_interfaces_can_be_dec
   EXPECT_FALSE(process_has_serial_port_open());
 }
 
-// The export order is what `ros2 control list_hardware_components -v` prints and what a controller
-// claiming every interface (/dynamic_joint_states) sees, so it stays the description's order even
-// when a joint declares three interfaces, another two, a third none and a fourth the whole
-// set it was given.
+// The export order stays the description order for any subset: three, two, none and the
+// example's four state interfaces on the four joints.
 TEST_F(
   WaveshareServosStateInterfaces, state_interfaces_are_exported_in_description_order_for_any_subset)
 {
@@ -1759,7 +1673,7 @@ TEST_F(WaveshareServosStateInterfaces, deprecation_warning_uses_the_component_lo
 }
 
 // ---------------------------------------------------------------------------------------------
-// Jazzy API migration (Phase 1). These fail on the pre-Jazzy driver and pass once it is migrated.
+// Jazzy API: framework-built interface handles and the component logger.
 
 class WaveshareServosJazzyApi : public ::testing::Test
 {
@@ -1767,9 +1681,8 @@ protected:
   LogCapture logs_;
 };
 
-// Phase 1 item 2: the interfaces are the framework's handles built from the URDF, not handles
-// over the driver's own arrays. Only framework handles honor <param name="initial_value">; the
-// legacy export_state_interfaces() path leaves the value at the driver's NaN.
+// The interfaces are framework handles built from the URDF, so <param name="initial_value">
+// applies; without it the value is NaN.
 TEST_F(WaveshareServosJazzyApi, exported_state_interface_honors_initial_value)
 {
   std::vector<Joint> joints = bench_joints();
@@ -1792,9 +1705,8 @@ TEST_F(WaveshareServosJazzyApi, exported_state_interface_honors_initial_value)
   EXPECT_FALSE(process_has_serial_port_open());
 }
 
-// Phase 1 item 3: the driver logs through get_logger(), the logger the ResourceManager gives the
-// component ("<resource manager logger>.hardware_component.system.<ros2_control name>"), and no
-// longer through rclcpp::get_logger("waveshare_servos").
+// The driver logs through get_logger():
+// "<resource manager logger>.hardware_component.system.<ros2_control name>".
 TEST_F(WaveshareServosJazzyApi, on_init_logs_through_the_component_logger)
 {
   const std::string component_logger =

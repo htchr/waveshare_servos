@@ -1,23 +1,7 @@
 """
 package.xml and CHANGELOG.rst describe one release, and no release file points outside the repo.
 
-Four things are checked here, none of which any other test in the package can see:
-  - package.xml is a valid format-3 manifest, and each <license> names a license file that is
-    inside the package and holds the expected text (its sha256 is pinned below);
-  - CHANGELOG.rst exists, parses, is warning-free reStructuredText with no comment (a docutils
-    comment node anywhere, a list item included), its version sections are dated, the versions
-    strictly descend in file order and no date is later than the one above it (a same-day patch
-    release passes), and its highest version is the one package.xml declares;
-  - the files a clone reads first (README.md, CHANGELOG.rst, THIRD_PARTY.md, package.xml,
-    CMakeLists.txt, the container files and the example files) name no development document that
-    is not in the repository;
-  - the release documents carry no placeholder.
-
-No fixture reads a file: each case first asserts that the file it needs exists, so a missing
-document is a failed case, never an error at setup; a case that reads several files collects every
-problem into one list and asserts once, so its message shows every reason together. The pattern
-self-test uses synthetic strings only. No motors, no port, no ROS graph, no git. The test reads
-the SOURCE tree through its own __file__.
+Checks the manifest, the license digests, the CHANGELOG order and dates, pointers, placeholders.
 """
 
 import datetime
@@ -87,7 +71,7 @@ def pointer_pattern():
 
 
 def release_files():
-    """Return the package-relative paths R7 reads: the fixed list plus the example files."""
+    """Return the package-relative paths to check: the fixed list plus the example files."""
     walked = sorted(
         path.relative_to(PKG_ROOT).as_posix()
         for directory in EXAMPLE_DIRS for path in (PKG_ROOT / directory).rglob('*')

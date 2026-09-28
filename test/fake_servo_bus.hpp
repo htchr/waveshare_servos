@@ -1,46 +1,5 @@
-// A fake SMS/STS servo bus on a pseudo terminal (PHASE2_SPEC 10.1).
-//
-// This is a PORT of phase1_evidence/harness/fix_harness/bus.hpp, which already models a servo as a
-// 256-byte register file with `absent` / `silent_feedback` flags (bus.hpp:39-48) and is already
-// debugged against the vendored packet code. What is new here is the per-servo transaction
-// counters, the status byte, the sync-write record capture and the RAII responder thread; what is
-// deliberately dropped is the Phase 1 harness's motion model. Nothing moves on its own: a register
-// changes only when a test changes it or when a packet writes it, so "the servo goes silent on
-// cycle N" is the line `set_silent_feedback(3, true)` between two driver calls and the whole of
-// PHASE2_SPEC 10.4 and 10.5 replays byte for byte on every machine.
-//
-// Packet facts the responder satisfies, all from the vendored sources:
-//   - request  ff ff ID msgLen Inst MemAddr params... ~chk, total msgLen + 4, with
-//     chk = (u8)~(ID + msgLen + Inst + MemAddr + sum(params))            (src/SCS.cpp:62-90)
-//   - reply    ff ff ID n+2 Status params(n) ~chk, total n + 6; SCS::Read() reads exactly nLen+6
-//     bytes, so a wrong total blocks until the timeout                   (src/SCS.cpp:182-185)
-//   - Ping checks bBuf[2] == ID and bBuf[3] == 2                         (src/SCS.cpp:248,251)
-//   - Ack runs for EVERY non-broadcast write, because Level defaults to 1 (src/SCS.cpp:14,268):
-//     EnableTorque, Mode, unLockEprom, LockEprom and the driver's own register-41 write each burn
-//     a full IOTimeOut when they are not acked. That last one used to be SyncWriteSpe's, made
-//     inside every write() cycle; Phase 3 item 1 took it off the per-cycle path and left it at the
-//     four edges of PHASE3 1.24, and SyncWriteSpe is no longer called from anywhere
-//   - a syncWrite is a broadcast to 0xfe and is never acked             (src/SCS.cpp:132,268)
-//   - byte order is little endian (End == 0, src/SMS_STS.cpp:12); the feedback block is registers
-//     56..70 = 15 bytes, so a feedback reply is 21 bytes with len 0x11
-//
-// Threading: one responder thread owns the master side of the pty. Every register, flag and
-// counter lives behind `mutex_`, and the setters take it, so a test may call them between two
-// driver calls without a race. Never hold a `FakeServo &` from servo() across a driver call --
-// use snapshot().
-//
-// What the Phase 6 tools need on top of that (PHASE6_SPEC D.1): a log of every request frame and
-// a raw byte count (the proof of "sent nothing"), an EEPROM shadow with the three lock policies
-// and a power cycle, an id write that moves the servo, the offset model behind a 128 write to
-// register 40, and the failure knobs of a bus with two servos on one id, a slow EEPROM commit, a
-// firmware that does not ack. Every knob defaults to off, and every side effect fires only on a
-// write the driver never makes (register 5, 128 to register 40, 31-32 with the offset model on),
-// so the Phase 2-5 suites see exactly the fake they were written against.
-//
-// What factory_reset needs on top of that (factory_reset_evidence/FACTORY_RESET_SPEC.md, section
-// 1 is the bench measurement it models): the RESET instruction, a per-servo factory table, and a
-// baud model in which a servo hears only the line rate its register 6 names. The driver never
-// sends a RESET and the baud model is off by default, so every earlier suite is untouched again.
+// A fake SMS/STS servo bus on a pseudo terminal, for tests without motors. Frames follow
+// src/SCS.cpp. See docs/development.md, "Fake servo bus".
 
 #ifndef FAKE_SERVO_BUS_HPP_
 #define FAKE_SERVO_BUS_HPP_
@@ -76,8 +35,8 @@ constexpr uint8_t kInstPing = 0x01;
 constexpr uint8_t kInstRead = 0x02;
 constexpr uint8_t kInstWrite = 0x03;
 constexpr uint8_t kInstSyncWrite = 0x83;
-constexpr uint8_t kInstSyncRead = 0x82;   // include/INST.h:23 (PHASE3 4.H1)
-// Not in include/INST.h: context/motor_reset_command_email.png and the protocol manual's 1.3.7.
+constexpr uint8_t kInstSyncRead = 0x82;   // include/INST.h:23
+// Not in include/INST.h: from the vendor protocol manual, section 1.3.7.
 constexpr uint8_t kInstReset = 0x06;
 constexpr uint8_t kBroadcastId = 0xfe;
 
@@ -97,7 +56,7 @@ constexpr uint8_t kRegPresentCurrent = 69;
 // SMS_STS::FeedBack() reads registers 56..70 in one transaction (src/SMS_STS.cpp:123).
 constexpr uint8_t kFeedbackLength = 15;
 
-// The registers the Phase 6 tools name (PHASE6_SPEC D.1; context/sts3215_memory_table.xlsx).
+// The registers the tools name (from the STS3215 memory table).
 constexpr uint8_t kRegModelL = 3;          // "main and sub version": a little-endian word at 3-4
 constexpr uint8_t kRegId = 5;
 constexpr uint8_t kRegBaud = 6;
@@ -108,10 +67,8 @@ constexpr uint8_t kEepromLast = 39;        // EEPROM is 0..39, SRAM starts at 40
 // Register 40 = 128: "current position correction is 2048" (SMS_STS::CalibrationOfs).
 constexpr uint8_t kCalibrateMidpoint = 128;
 
-// What a WRITE to EEPROM (0..39) does while register 55 reads 1. The memory table says the write
-// is applied and lost at power-off (row 50), which is `volatile_when_locked` and the policy the
-// tool tests run under; `drop_when_locked` is a firmware that refuses it outright. The default,
-// `apply_always`, is the fake every earlier suite was written against: it ignores the lock.
+// What a WRITE to EEPROM (0..39) does while register 55 is 1: `volatile_when_locked` is the
+// memory-table rule (applied, lost at power-off); `apply_always`, the default, ignores the lock.
 enum class EepromPolicy
 {
   apply_always,
@@ -143,24 +100,20 @@ enum class TwinReply
   doubled_reads
 };
 
-// One servo: a 256-byte register file, the two failure flags of bus.hpp:46-47, the status byte
-// every reply carries, and the transaction counters PHASE2_SPEC 10.4 asserts against.
+// One servo: a 256-byte register file, two failure flags, the status byte every reply carries,
+// and the transaction counters that the tests check.
 struct FakeServo
 {
   std::array<uint8_t, 256> mem{};
   uint8_t status = 0;             // goes into the reply's error byte (bBuf[4], src/SCS.cpp:201)
 
-  // The two flags model different failures and Phase 2 needs both: `absent` is "no servo on the
-  // bus" (the configure-time gate, PHASE2_SPEC 6) and `silent_feedback` is "still on the bus, still
-  // answers pings and still acks writes, but never answers the feedback read" (the runtime drop,
-  // PHASE2_SPEC 10.4). One `answers` flag cannot express the second, which is the one the re-ping
-  // on activate depends on.
+  // absent: no servo on the bus. silent_feedback: answers pings and acks writes but never the
+  // feedback read (a drop at run time, which the re-ping on activate must see).
   bool absent = false;
   bool silent_feedback = false;
 
-  // every request this servo was addressed by, INCLUDING its slot in a broadcast sync read: a
-  // sync read demands a feedback block of this servo exactly as an addressed read does, and about
-  // twenty existing assertions are written in those terms (PHASE3 4.H2, 4.H11)
+  // every request addressed to this servo, including its slot in a broadcast sync read (both
+  // ask for its feedback block)
   int requests = 0;
   int pings = 0;                  // INST_PING requests seen
   int reads = 0;                  // INST_READ requests seen, feedback block or not
@@ -171,32 +124,26 @@ struct FakeServo
   // one entry per broadcast sync-write record addressed to this servo: {MemAddr, record bytes}
   std::vector<std::pair<uint8_t, std::vector<uint8_t>>> sync_writes;
 
-  // This id appeared in an INST_SYNC_READ id list, answered or not. It exists because every other
-  // counter below is bumped AFTER the absent check, so none of them can tell "the driver did not
-  // name it" from "it was named and stayed silent" -- and that distinction is the whole of the
-  // driver case that proves an absent servo never enters the read group (PHASE3 3 section H).
+  // Times this id was in an INST_SYNC_READ id list, answered or not. Counted before the absent
+  // check, so it shows whether the driver left an absent servo out of the list.
   int sync_read_named = 0;
   int sync_reads = 0;             // INST_SYNC_READ requests whose id list names this servo
-  // one entry per sync-read request naming this servo: {MemAddr, nLen} (PHASE3 4.H2)
+  // one entry per sync-read request naming this servo: {MemAddr, nLen}
   std::vector<std::pair<uint8_t, uint8_t>> sync_read_requests;
 
-  // The four ways one servo's REPLY to a sync read can be wrong while the bus itself is healthy
-  // (PHASE3 2.93). Each is a separate failure the wrapper's frame gate must separate: a frame the
-  // checksum rejects, a frame carrying somebody else's id in this slot, a frame whose length byte
-  // disagrees with its payload, and a frame that arrives after the transaction gave up. None of
-  // them touches bad_checksums(), which counts inbound REQUEST frames (PHASE3 2.94).
+  // Four faults in this servo's sync-read reply: bad checksum, wrong id, wrong length byte, late.
+  // None changes bad_checksums(), which counts request frames only.
   bool reply_checksum_corrupt = false;
   uint8_t reply_id_override = 0;  // 0 = none; otherwise the id this servo's frame claims
   int reply_length_delta = 0;     // added to the length byte, checksum repaired, same wire length
   int reply_delay_polls = 0;      // held back this many 1 ms poll windows
 
-  // Phase 6 (PHASE6_SPEC D.1). What survives a power cycle: mem[0..39] as it was last committed
-  // under the EEPROM policy. add_servo() and the test-side setters keep it in step with mem.
+  // What survives a power cycle: mem[0..39] as last committed under the EEPROM policy.
+  // add_servo() and the test-side setters keep it in step with mem.
   std::array<uint8_t, kEepromLast + 1> eeprom{};
   int calibrations = 0;           // 128 writes to register 40 the offset model acted on
 
-  // The Phase 6 knobs, per servo and kept HERE rather than beside the bus-level ones, so that an
-  // id write carries them to the new key together with the registers and the counters.
+  // Tool-test knobs, kept per servo so that an id write moves them with the registers.
   IdWriteAck id_write_ack = IdWriteAck::old_id;
   bool offset_model = false;
   int physical = 0;               // the offset model's shaft angle, ticks; present derives from it
@@ -210,16 +157,15 @@ struct FakeServo
   std::array<bool, 256> ignore_write{};   // acked, and that byte is not applied
   bool vanish_after_id_write = false;
   unsigned eeprom_commit_ms = 0;
-  // Until then the servo is committing EEPROM: every request to it is ignored (D.1 #13).
+  // Until then the servo is committing EEPROM: every request to it is ignored.
   std::chrono::steady_clock::time_point busy_until{};
   // The outbox ticket of the ack that waits for that commit, while it may still be queued; 0 =
   // none. A request that finds the commit over and the ack still queued gets the ack (answer()).
   uint64_t commit_ack = 0;
   int pings_to_drop = 0;          // the next this-many pings are ignored
 
-  // factory_reset (FACTORY_RESET_SPEC 1, 2). What a RESET puts back into registers 6..39: the id
-  // (5) is kept, as measured, and 0..4 are the read-only version bytes, so the table's entries
-  // for 0..5 are never used. All zeros unless a test sets them.
+  // What a RESET writes to registers 6..39 (the id in 5 is kept; 0..4 are read-only), so
+  // entries 0..5 are unused. All zeros unless a test sets them.
   std::array<uint8_t, kEepromLast + 1> factory{};
   bool reset_supported = true;    // false: a RESET is ignored and never acked
   std::array<bool, kEepromLast + 1> reset_skips{};   // registers a RESET leaves as they are
@@ -278,11 +224,8 @@ inline int sign_magnitude_decode(uint16_t raw, int bit = 15)
   return static_cast<int>(raw);
 }
 
-// The order the replies to one INST_SYNC_READ come back in. The hardware answers in request
-// order, deterministically -- probe 1 Q5 measured it over three different id orders, five
-// transactions each -- and the wrapper's forward-only slot match depends on that; `reversed` is
-// the negative control that proves a mis-ordered burst is refused rather than mis-attributed
-// (PHASE3 4.H5).
+// Reply order for one INST_SYNC_READ. Real servos answer in id-list order (measured);
+// `reversed` checks that ServoBus never puts a frame in another servo's slot.
 enum class SyncReadReplyOrder
 {
   request,
@@ -302,16 +245,13 @@ public:
       throw std::runtime_error(std::string("ttyname failed: ") + std::strerror(errno));
     }
     port_ = name;
-    // Close-on-exec on both ends (PHASE6_SPEC D.1 #3): the CLI tests spawn the real tools on this
-    // bus, and a child that inherited either descriptor would keep the pty open behind the test.
+    // Close-on-exec on both ends: the CLI tests spawn the real tools, and a child that inherits
+    // a descriptor keeps the pty open.
     if (::fcntl(master_, F_SETFD, FD_CLOEXEC) == -1 || ::fcntl(slave_, F_SETFD, FD_CLOEXEC) == -1) {
       throw std::runtime_error(std::string("fcntl(FD_CLOEXEC) failed: ") + std::strerror(errno));
     }
-    // The slave descriptor stays open for the whole life of the bus. Closing it makes the master's
-    // poll() report POLLHUP -- which is reported regardless of the events mask -- for every
-    // interval in which no slave is open, so the poll timeout would never apply and the responder
-    // would spin a core. Those intervals are real: construction until on_configure, and again
-    // around every cleanup and shutdown case.
+    // Keep the slave open for the life of the bus: with no slave open, poll() on the master
+    // returns POLLHUP at once and the responder would spin a core.
     thread_ = std::thread(&FakeBus::run, this);
   }
 
@@ -342,8 +282,8 @@ public:
     const std::lock_guard<std::mutex> lock(mutex_);
     FakeServo servo;
     seed(&servo, kRegMode, mode);
-    // A servo's register 5 IS its id; the tools read it back and refuse a servo whose register
-    // disagrees with the id it answered at (PHASE6_SPEC D.1 #2).
+    // Register 5 is the id. The tools read it back and refuse a servo whose register 5 differs
+    // from the id it answered at.
     seed(&servo, kRegId, id);
     servos_[id] = servo;
   }
@@ -427,13 +367,9 @@ public:
     return sign_magnitude_decode(raw, bit);
   }
 
-  // INST_SYNC_READ frames seen, whatever id list they carried, and the newest list in request
-  // order. Unlike bad_checksums(), which is a lock-free atomic, both read state the responder
-  // thread writes, so both take mutex_. The id list is what proves "the dropped servo left the
-  // list" and "the list is the present servos in URDF order"; a count alone cannot (PHASE3 4.H3).
-  //
-  // Deliberate near-collision with FakeServo::sync_read_requests: the bus-level one counts frames,
-  // the per-servo one records {address, length} pairs. They never appear in the same expression.
+  // INST_SYNC_READ frames seen (any id list) and the newest id list, both under mutex_. The
+  // list shows which servos the driver asked for; a count cannot. Not the same as
+  // FakeServo::sync_read_requests, which holds {address, length} pairs.
   uint64_t sync_read_requests() const
   {
     const std::lock_guard<std::mutex> lock(mutex_);
@@ -446,9 +382,8 @@ public:
     return last_sync_read_ids_;
   }
 
-  // Firmware that parses 0x82 and answers nothing: the request is still counted, bus-level and per
-  // servo, no reply is emitted, and the caller pays one io_timeout_ms. This is the knob the
-  // per-servo FeedBack() fallback is untestable without (PHASE3 4.H4).
+  // Firmware that parses 0x82 and answers nothing: the request is counted, no reply goes out,
+  // and the caller waits one io_timeout_ms. Tests the per-servo FeedBack() fallback.
   void set_sync_read_supported(bool supported)
   {
     const std::lock_guard<std::mutex> lock(mutex_);
@@ -461,17 +396,15 @@ public:
     reply_order_ = order;
   }
 
-  // Drops `bytes` off the tail of the burst AFTER it is assembled, modelling a reply cut mid
-  // frame. Distinct from an absent servo, which loses whole frames, and from a bad checksum, where
-  // the frame is present and its contents wrong (PHASE3 4.H6).
+  // Cuts `bytes` off the end of the assembled burst (a reply cut mid-frame): not an absent
+  // servo (whole frames lost) and not a bad checksum (frame present, content wrong).
   void set_sync_read_truncate_bytes(size_t bytes)
   {
     const std::lock_guard<std::mutex> lock(mutex_);
     sync_read_truncate_bytes_ = bytes;
   }
 
-  // One id at a time, 0 for none: the bus-level spelling of set_reply_checksum_corrupt, because
-  // the burst-level cases name the servo they corrupt and nothing else (PHASE3 4.H7).
+  // Bus-level form of set_reply_checksum_corrupt: one id at a time, 0 for none.
   void set_sync_read_bad_checksum(uint8_t id)
   {
     const std::lock_guard<std::mutex> lock(mutex_);
@@ -480,9 +413,8 @@ public:
     }
   }
 
-  // Delays the WHOLE burst. Implemented with an outbox and never with a sleep: answer() runs with
-  // mutex_ held, so sleeping there would block every setter and stall wait_quiet() (PHASE3 4.H8).
-  // At 0 the burst is written inline exactly as it was, so every existing case is unchanged.
+  // Delays the whole burst through the outbox, never a sleep: answer() holds mutex_.
+  // At 0 the burst is written at once.
   void set_sync_read_delay_ms(unsigned ms)
   {
     const std::lock_guard<std::mutex> lock(mutex_);
@@ -507,9 +439,8 @@ public:
     servos_.at(id).reply_length_delta = delta;
   }
 
-  // Holds back ONE servo's frame while the rest of the burst goes out on time -- the late reply
-  // that arrives during the next transaction's read window, which is the contamination probe 3
-  // Q4/Q6 measured and the whole reason the error path drains (PHASE3 2.93, 2.115).
+  // Holds back one servo's frame so it arrives in the next transaction's read window: the
+  // measured contamination that the ServoBus error-path drain exists for.
   void set_reply_delay_polls(uint8_t id, int polls)
   {
     const std::lock_guard<std::mutex> lock(mutex_);
@@ -525,20 +456,9 @@ public:
   // PtyFixture::TearDown rather than left to surface as a stale or missing record downstream.
   uint64_t quiet_timeouts() const {return quiet_timeouts_.load();}
 
-  // Returns once the responder has seen the bus fall silent, so a packet that is still in flight
-  // cannot be missed. Every transaction the driver makes is synchronous -- it waits for the reply
-  // or for its timeout -- with one exception: a sync write is a broadcast and is never acked, so
-  // when write() returns those bytes may still be in the kernel's queue. Decoding sync_writes
-  // right then is a race, and it loses exactly the last record.
-  //
-  // The wait is on the responder thread, not on the clock: it counts poll() calls that TIMED OUT
-  // with nothing queued and nothing half-parsed. A timeout proves the queue was empty for that
-  // whole window, and waiting for TWO of them proves the second window began after this call did,
-  // hence after the bytes were written -- had they still been queued, that poll would have
-  // returned POLLIN instead of timing out. The deadline is a safety net for a machine that has
-  // descheduled the responder for a second; it never shortens a successful wait. Giving up is
-  // counted, never swallowed: quiet_timeouts() is what tells the next reader that a downstream
-  // "last_speed(4) = INT_MIN" is a lost race and not a driver bug.
+  // Returns when the responder has seen two idle poll windows, so a sync write (a broadcast
+  // with no ack) has arrived before the test decodes it. Gives up after 2 s and counts that in
+  // quiet_timeouts(). See docs/development.md, "Fake servo bus".
   void wait_quiet() const
   {
     const uint64_t target = idle_polls_.load() + 2;
@@ -552,7 +472,7 @@ public:
     }
   }
 
-  // ---- Phase 6 (PHASE6_SPEC D.1) ----
+  // ---- Tool tests: frame log, EEPROM model, id writes, failure knobs ----
 
   // For the close-on-exec self-test only; nothing else may touch the pty behind the responder.
   int master_fd() const {return master_;}
@@ -610,8 +530,8 @@ public:
     return list;
   }
 
-  // Every raw byte read off the master, counted before consume() can drop garbage or a
-  // bad-checksum frame: "sent nothing" is this being 0, never an empty frame log (D.1 #4).
+  // Every raw byte read off the master, counted before consume() drops garbage or a bad frame:
+  // "sent nothing" is this at 0, never an empty frame log.
   uint64_t bytes_received() const {return bytes_received_.load();}
 
   // id writes that would have put two servos on one key and were refused
@@ -665,7 +585,7 @@ public:
   }
 
   // Off: register 40 = 128 is stored like any byte ("calibration unsupported"). On: the servo
-  // keeps a shaft angle, present = wrap4096(physical - offset), and 128 re-centres it (D.1 #7).
+  // keeps a shaft angle, present = wrap4096(physical - offset), and 128 re-centres it.
   void set_offset_model(uint8_t id, bool on)
   {
     const std::lock_guard<std::mutex> lock(mutex_);
@@ -744,7 +664,7 @@ public:
     servos_.at(id).pings_to_drop = count;
   }
 
-  // ---- factory_reset (FACTORY_RESET_SPEC 2, "Fake bus") ----
+  // ---- factory_reset: RESET, factory table, baud model ----
 
   // The ids every RESET frame was addressed to, in arrival order, answered or not.
   std::vector<uint8_t> resets() const
@@ -802,20 +722,17 @@ public:
     servos_.at(id).reset_skips.at(reg) = skip;
   }
 
-  // A firmware whose RESET does not re-initialise SRAM (M4 and M5 measured that the ST3025's does).
+  // A firmware whose RESET does not re-initialise SRAM (the ST3025's RESET does, measured).
   void set_reset_keeps_sram(uint8_t id, bool keeps)
   {
     const std::lock_guard<std::mutex> lock(mutex_);
     servos_.at(id).reset_keeps_sram = keeps;
   }
 
-  // Off by default. On: a servo hears an addressed request only when the line runs at the rate its
-  // register 6 names (0..7 = 1000000, 500000, 250000, 128000, 115200, 76800, 57600, 38400); any
-  // other request is noise to it and goes unanswered. The line rate is the pty's own termios
-  // speed, which ServoBus sets through the slave. Replies are never filtered: an ack goes out at
-  // the rate its request came at, even when that request moved the servo to another rate
-  // (FACTORY_RESET_SPEC M3). Sync reads and writes are the driver's, which never changes a rate,
-  // and are not modelled.
+  // Off by default. On: a servo answers an addressed request only when the pty line rate is
+  // the rate its register 6 names (0..7 = 1M, 500k, 250k, 128k, 115200, 76800, 57600, 38400).
+  // An ack goes out at its request's rate, even when that request changed register 6.
+  // Sync reads and writes are not filtered.
   void set_baud_model(bool on)
   {
     const std::lock_guard<std::mutex> lock(mutex_);
@@ -830,17 +747,14 @@ private:
   void run()
   {
     while (!stop_.load()) {
-      // At the TOP of the iteration, so all three of the paths below reach it: the poll timeout,
-      // the POLLHUP sleep and the byte-consuming path all continue back to here. Draining only
-      // after consume() would mean a delayed reply reached the wire when the NEXT request arrived,
-      // which is precisely the cycle PHASE3 2.115 must not see it in.
+      // Flush at the top, so every path below reaches it. After consume() only, a delayed reply
+      // would go out with the next request, in the wrong cycle.
       const bool emitted = flush_outbox();
       struct pollfd waiting = {master_, POLLIN, 0};
       const int ready = ::poll(&waiting, 1, kPollTimeoutMs);
       if (ready == 0) {
-        // Nothing queued for a whole poll window. A half-parsed frame is not silence, and neither
-        // is a reply still sitting in the outbox or one written in this very iteration -- either
-        // would let wait_quiet() declare quiet with a reply still to come (PHASE3 4.H8).
+        // Idle only with nothing half-parsed, queued or just sent; else wait_quiet() could
+        // return with a reply still to come.
         if (pending_.empty() && outbox_.empty() && !emitted) {
           idle_polls_.fetch_add(1);
         }
@@ -849,8 +763,8 @@ private:
       if (ready < 0) {
         continue;
       }
-      // With no slave open POLLHUP is reported whatever the events mask asks for, so poll() would
-      // return at once forever. Sleep instead of spinning a core (PHASE2_SPEC 10.1).
+      // With no slave open, poll() reports POLLHUP at once whatever the events mask asks for.
+      // Sleep instead of spinning a core.
       if ((waiting.revents & POLLHUP) != 0 && (waiting.revents & POLLIN) == 0) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
         continue;
@@ -903,8 +817,8 @@ private:
     const uint8_t instruction = frame[4];
     const std::vector<uint8_t> params(frame.begin() + 5, frame.end() - 1);
     const std::lock_guard<std::mutex> lock(mutex_);
-    // Before every return below: the log proves a request was SENT, answered or not, and a ping
-    // to an empty id is exactly what a scan's coverage gate counts (PHASE6_SPEC D.1 #4).
+    // Log before any return: the log proves a request was sent, answered or not, and a scan's
+    // coverage check counts pings to empty ids.
     frames_.push_back(FrameRecord{id, instruction, params});
     if (id == kBroadcastId) {
       if (instruction == kInstSyncWrite) {
@@ -923,16 +837,13 @@ private:
     if (baud_model_ && line_rate() != rate_of_register(s.mem[kRegBaud])) {
       return;
     }
-    // Still committing EEPROM: the request is ignored as though the servo were absent. A
-    // timestamp and never a sleep -- answer() runs with mutex_ held (D.1 #13).
+    // Still committing EEPROM: ignore the request as if absent. A timestamp, not a sleep:
+    // answer() holds mutex_.
     if (std::chrono::steady_clock::now() < s.busy_until) {
       return;
     }
-    // The commit is over but its ack is still queued -- its due time passed while the responder
-    // slept in poll(). A servo sends that ack the moment its commit ends, before it hears anything
-    // else, so the ack goes out now and this request, which found it finishing, goes unheard.
-    // Answering first would put a reply AHEAD of the ack in one read window, an order no servo
-    // produces; the Phase 6 tool tests caught exactly that, at commit times one ping period apart.
+    // The commit ended but its ack is still queued: send the ack now and ignore this request,
+    // as a real servo acks the commit before it hears anything else.
     if (s.commit_ack != 0) {
       const uint64_t ticket = s.commit_ack;
       s.commit_ack = 0;
@@ -992,11 +903,9 @@ private:
     }
   }
 
-  // A RESET, FACTORY_RESET_SPEC 1 (measured on the ST3025): registers 6..39 back to the factory
-  // table, committed to the shadow whatever the lock says -- a flash write of its own, not a WRITE
-  // under the EEPROM policy -- with register 5 kept; then torque off, goal 0 and the lock closed;
-  // then the ack from the addressed id, as late as the commit when a byte changed (25 ms on the
-  // bench, 0.8 ms when nothing did).
+  // RESET (0x06) as measured on the ST3025: registers 6..39 to the factory table, persisted
+  // whatever the lock (id kept); torque off, goal 0, lock closed; the ack waits for the commit
+  // when a byte changed. See docs/tools.md, "factory_reset".
   void answer_reset(uint8_t id, FakeServo & s)
   {
     if (!s.reset_supported) {
@@ -1064,10 +973,8 @@ private:
     }
   }
 
-  // An addressed INST_WRITE, PHASE6_SPEC D.1 #5-#13. The bytes first, each under the EEPROM
-  // policy; then the side effects of the registers the driver never writes (31-32 and 128 at 40
-  // with the offset model on, 5 always); then the ack, from the id the knobs name and as late as
-  // the commit takes. With every knob at its default this is exactly the old loop and send().
+  // An addressed INST_WRITE: the bytes under the EEPROM policy, then the side effects (5, and
+  // 31-32 and 128 at 40 with the offset model on), then the ack. Knobs at default: plain write.
   void answer_write(uint8_t id, FakeServo & s, const std::vector<uint8_t> & params)
   {
     const uint8_t address = params[0];
@@ -1132,7 +1039,7 @@ private:
       rekey(id, now_id);
     }
     if (vanish) {
-      s.absent = true;                // gone under both ids (context/motor_reset_command_email.png)
+      s.absent = true;                // gone under both ids
     }
     if (ack) {
       // Due at the very time point the commit ends, so a request that finds the servo free also
@@ -1241,15 +1148,9 @@ private:
     }
   }
 
-  // ff ff fe (IDN+4) 82 MemAddr nLen ID... ~chk (src/SCS.cpp:297-320), so params is
-  // {MemAddr, nLen, ID...}. consume() needs no change at all: total = 4 + pending_[3] = IDN + 8
-  // and its checksum over frame[2..n-2] is byte for byte the vendored one (PHASE3 4.H9).
-  //
-  // The whole burst is ASSEMBLED before a byte of it is written, because all three burst-level
-  // knobs act on the assembled thing: the frame order is reversed, the tail is cut, one frame is
-  // mis-summed. The replies are ordinary status packets emitted back to back in ID-LIST ORDER --
-  // what the hardware does (probe 1 Q5), and what the wrapper's forward-only slot match depends
-  // on (PHASE3 4.H10).
+  // Request: ff ff fe (IDN+4) 82 MemAddr nLen ID... ~chk (src/SCS.cpp:297-320). Replies:
+  // status packets back to back in id-list order, as real servos send them. The burst is built
+  // first because the burst-level knobs change the whole burst.
   void answer_sync_read(const std::vector<uint8_t> & params)
   {
     if (params.size() < 2) {
@@ -1265,21 +1166,17 @@ private:
       const uint8_t id = params[k];
       const auto it = servos_.find(id);
       if (it != servos_.end()) {
-        // Before the absent check, and the only counter that is: it records that the driver PUT
-        // this id in the list, which every counter below cannot (PHASE3 3 section H amendment).
+        // Before the absent check, the only counter that is: the driver put this id in the list.
         it->second.sync_read_named++;
       }
-      // An unknown or absent servo contributes NO BYTES AT ALL -- not a short frame, not an error
-      // frame. None of the three skips below comes for free: the broadcast branch returns before
-      // answer()'s own servos_.find and requests++ ever run (PHASE3 2.91).
+      // An unknown or absent servo adds no bytes at all. The broadcast branch skips answer()'s
+      // own lookup and requests++, so this loop does both.
       if (it == servos_.end() || it->second.absent) {
         continue;
       }
       FakeServo & s = it->second;
-      // A sync read bumps requests and feedback_reads as well as sync_reads, deliberately: about
-      // twenty existing assertions read "a feedback block was demanded of this servo this cycle",
-      // which is exactly as true of a sync read as of an addressed one, and sync_reads then says
-      // which instruction carried it (PHASE3 4.H11).
+      // A sync read also counts as a request and a feedback read, like an addressed read;
+      // sync_reads tells which instruction carried it.
       s.requests++;
       s.sync_reads++;
       s.sync_read_requests.emplace_back(address, length);
@@ -1290,7 +1187,7 @@ private:
         }
       }
       if (!sync_read_supported_) {
-        continue;                     // parses 0x82, answers nothing (PHASE3 4.H4)
+        continue;                     // parses 0x82, answers nothing
       }
       std::vector<uint8_t> payload;
       payload.reserve(length);
@@ -1300,15 +1197,14 @@ private:
       std::vector<uint8_t> frame = frame_bytes(
         s.reply_id_override != 0 ? s.reply_id_override : id, s.status, payload);
       if (s.reply_length_delta != 0) {
-        // The length byte alone. The frame keeps its size on the wire and its checksum is
-        // repaired, so the only thing under test is the walker's length gate (PHASE3 2.109).
+        // The length byte only: same wire size, checksum repaired, so only the length check in
+        // ServoBus is under test.
         frame[3] = static_cast<uint8_t>(static_cast<int>(frame[3]) + s.reply_length_delta);
         repair_checksum(&frame);
       }
       if (s.reply_checksum_corrupt) {
-        // One DATA byte flipped after the checksum was computed, so the frame is well formed and
-        // mis-summed (PHASE3 4.H7). One bit and not 0xff: a payload byte turned into 0xff could
-        // pair with its neighbour into a false header and cost the walker a second bad frame.
+        // Flip one bit of a data byte after the checksum: well formed, wrong sum. Not 0xff, which
+        // could make a false ff ff header with its neighbour.
         frame[5] = static_cast<uint8_t>(frame[5] ^ 0x01);
       }
       if (s.reply_delay_polls > 0) {
@@ -1322,8 +1218,6 @@ private:
 
     std::vector<uint8_t> burst;
     for (size_t k = 0; k < frames.size(); k++) {
-      // Indexed rather than reversed in place, so the harness needs no <algorithm> it did not
-      // already have (PHASE3 4.H12).
       const std::vector<uint8_t> & frame =
         (reply_order_ == SyncReadReplyOrder::reversed) ? frames[frames.size() - 1 - k] : frames[k];
       burst.insert(burst.end(), frame.begin(), frame.end());
@@ -1353,9 +1247,8 @@ private:
     frame->back() = static_cast<uint8_t>(~sum);
   }
 
-  // Everything in the outbox that has come due, in insertion order. Touched only by the responder
-  // thread -- run() -> consume() -> answer() -> answer_sync_read() is all one thread -- so it
-  // needs no lock of its own (PHASE3 4.H8).
+  // Sends every outbox entry that is due, in insertion order. Responder thread only, so the
+  // outbox needs no lock.
   bool flush_outbox()
   {
     const auto now = std::chrono::steady_clock::now();
@@ -1366,9 +1259,8 @@ private:
         emit(outbox_[i].bytes);
         emitted = true;
       } else if (kept != i) {
-        // Guarded, because kept == i is the ordinary case and self-move-assigning a std::vector
-        // leaves it valid but unspecified -- in practice empty, which silently turned a held-back
-        // 84-byte burst into nothing at all the first time this was written.
+        // Guarded: self-move-assigning a std::vector leaves it unspecified (in practice empty),
+        // which would lose a held-back reply.
         outbox_[kept++] = std::move(outbox_[i]);
       } else {
         kept++;
@@ -1392,11 +1284,8 @@ private:
     return false;
   }
 
-  // The framing send() has always done: ff ff ID (nLen+2) Err data ~chk, nLen + 6 bytes
-  // (src/SCS.cpp:182-185). Split out of send() so a sync-read burst can be assembled before it is
-  // written, while the reply framing is still written down exactly once in the harness: send() is
-  // byte for byte what it was, and every existing case is untouched (PHASE3 4.H10). Phase 6
-  // renamed send() to reply(), which with every knob at its default still is.
+  // Reply framing: ff ff ID (nLen+2) Err data ~chk, nLen + 6 bytes (src/SCS.cpp:182-185).
+  // Separate so that a sync-read burst can be built before it is written.
   static std::vector<uint8_t> frame_bytes(
     uint8_t id, uint8_t error, const std::vector<uint8_t> & payload)
   {
@@ -1423,12 +1312,9 @@ private:
     }
   }
 
-  // Every addressed reply -- a ping's, a READ's, a write's ack -- from `from`, carrying the
-  // servo's status byte. The Phase 6 knobs act here (PHASE6_SPEC D.1 #8, #13, #14): the
-  // sync-read faults when they are switched on for addressed replies, the twin, and the delay of
-  // an ack that waits for its EEPROM commit, which goes through the outbox and never a sleep.
-  // `due` is that commit's end ({} = send now); `write_ack` marks a write's ack. Returns the outbox
-  // ticket of a queued reply, or 0. A twin limited to n replies counts down here.
+  // Every addressed reply (ping, READ, write ack) from `from`, with the servo's status byte.
+  // Applies the addressed faults (when on), the twin, and the commit delay of an ack.
+  // `due` = commit end ({} = now). Returns the outbox ticket of a queued reply, or 0.
   uint64_t reply(
     FakeServo & s, uint8_t from, const std::vector<uint8_t> & payload, bool read_reply,
     std::chrono::steady_clock::time_point due = {}, bool write_ack = false)
@@ -1475,15 +1361,15 @@ private:
   std::string port_;
   mutable std::mutex mutex_;
   std::map<uint8_t, FakeServo> servos_;
-  // INST_SYNC_READ frames seen and the newest one's id list, both under mutex_ (PHASE3 4.H3)
+  // INST_SYNC_READ frames seen and the newest one's id list, both under mutex_
   uint64_t sync_read_requests_ = 0;
   std::vector<uint8_t> last_sync_read_ids_;
-  // the burst-level sync-read knobs, all under mutex_ (PHASE3 4.H4-4.H8)
+  // the burst-level sync-read knobs, all under mutex_
   bool sync_read_supported_ = true;
   SyncReadReplyOrder reply_order_ = SyncReadReplyOrder::request;
   size_t sync_read_truncate_bytes_ = 0;
   unsigned sync_read_delay_ms_ = 0;
-  // the Phase 6 bus-level state, all under mutex_ (PHASE6_SPEC D.1)
+  // the bus-level state for the tool tests, all under mutex_
   std::vector<FrameRecord> frames_;
   uint64_t id_collisions_ = 0;
   EepromPolicy eeprom_policy_ = EepromPolicy::apply_always;
@@ -1492,9 +1378,8 @@ private:
   bool baud_model_ = false;           // factory_reset, under mutex_ like the rest
   // touched only by the responder thread
   std::deque<uint8_t> pending_;
-  // Replies held back until their time comes. An outbox and not a sleep, because answer() runs
-  // with mutex_ held (PHASE3 4.H8, 2.93). `ticket` names a commit's ack (0 for every other entry)
-  // so answer() can send that one early; tickets count up from 1 and are never reused.
+  // Replies held until due (an outbox, not a sleep: answer() holds mutex_). `ticket` marks a
+  // commit ack (else 0) so answer() can send it early; tickets start at 1.
   struct Outgoing
   {
     std::chrono::steady_clock::time_point due;

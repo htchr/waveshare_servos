@@ -1,16 +1,5 @@
-// Unit tests for src/param_parsing.hpp -- the validated <param> getters shared by the hardware
-// parameters (PHASE2_SPEC 4.1) and the joint parameters (PHASE2_SPEC 5).
-//
-// No ROS objects, no URDF, no bus, no motors: HardwareInfo::hardware_parameters and
-// ComponentInfo::parameters are the same type, std::unordered_map<std::string, std::string>
-// (hardware_info.hpp:391 and :111), so every case injects the map directly. The target still links
-// hardware_interface, because hardware_interface::stod and ::parse_bool are exported functions in
-// libhardware_interface.so, not header-only.
-//
-// Two rules are worth naming, because they are why several of these cases exist:
-// - a failed getter leaves the caller's value alone, so a bad <param> can never half-apply;
-// - get_double's exclusive minimum is literally `v > min`, with no 1e-9 sentinel, so the message
-//   and the predicate cannot drift apart.
+// Unit tests for src/param_parsing.hpp: no URDF, bus or motors. A failed getter must leave the
+// caller's value unchanged. See docs/configuration.md, "Parameter values".
 
 #include <gmock/gmock.h>
 
@@ -50,9 +39,7 @@ TEST(ParamParsing, missing_parameter_reports_defaulted_and_keeps_the_default)
 {
   const ParameterMap absent;
 
-  // The four getters share one rule: an absent key reports kDefaulted and does not touch the
-  // value, so the caller's compiled-in default survives. The defaults below come from
-  // waveshare_servos::defaults, the single source PHASE2_SPEC 4.1 requires.
+  // An absent key returns kDefaulted and keeps the default from waveshare_servos::defaults.
   std::string port = kPort;
   EXPECT_EQ(get_string(absent, "port", port), Status::kDefaulted);
   EXPECT_EQ(port, "/dev/ttyACM0");
@@ -118,8 +105,7 @@ TEST(ParamParsing, whitespace_only_parameter_reports_empty)
   EXPECT_EQ(
     get_double(p, "current_per_count_a", 0.0, 1.0, true, current_per_count_a), Status::kEmpty);
 
-  // Stripping is not only an emptiness test: a padded value parses, and raw() reports the stripped
-  // text, which is what the FATAL messages of PHASE2_SPEC 4.4 quote back.
+  // A padded value parses, and raw() returns the stripped text that the FATAL messages quote.
   int64_t io_timeout_ms = 0;
   EXPECT_EQ(get_int(p, "io_timeout_ms", 2, 1000, io_timeout_ms), Status::kOk);
   EXPECT_EQ(io_timeout_ms, 20);
@@ -215,7 +201,7 @@ TEST(ParamParsing, double_above_max_reports_out_of_range)
   EXPECT_EQ(get_double(p, "a", 0.0, 1.0, true, above), Status::kOutOfRange);
   EXPECT_EQ(above, 0.006);
 
-  // The maximum itself is inclusive on every hardware parameter of PHASE2_SPEC 4.1.
+  // The maximum is inclusive for every hardware parameter.
   double at_max = 0.006;
   EXPECT_EQ(get_double(p, "b", 0.0, 1.0, true, at_max), Status::kOk);
   EXPECT_EQ(at_max, 1.0);
@@ -318,9 +304,8 @@ TEST(ParamParsing, integer_below_min_reports_out_of_range)
   EXPECT_EQ(get_int(p, "io_timeout_ms", 2, 1000, io_timeout_ms), Status::kOutOfRange);
   EXPECT_EQ(io_timeout_ms, 20);
 
-  // 1 is the boundary PHASE3 R8 moved: legal through Phase 2, out of range from now on. The bounds
-  // here are the case's own, so this pins get_int's inclusivity, not the driver's choice of floor
-  // -- src/waveshare_servos.cpp is what makes that right, and test_load_waveshare_servos pins it.
+  // Pins get_int's inclusive bounds only; test_load_waveshare_servos pins the driver's 2 ms
+  // io_timeout_ms floor.
   const ParameterMap one{{"io_timeout_ms", "1"}};
   int64_t one_ms = 20;
   EXPECT_EQ(get_int(one, "io_timeout_ms", 2, 1000, one_ms), Status::kOutOfRange);
@@ -332,8 +317,7 @@ TEST(ParamParsing, integer_below_min_reports_out_of_range)
   EXPECT_EQ(get_int(p, "ping_attempts", 1, 10, ping_attempts), Status::kOutOfRange);
   EXPECT_EQ(ping_attempts, 3);
 
-  // A negative baudrate is well formed, so it passes the INT64_MIN..INT64_MAX well-formedness call
-  // of PHASE2_SPEC 4.3 and is rejected by the mapped-set check instead, not here.
+  // A negative baudrate is well formed here; the driver's mapped-baudrate check rejects it later.
   int64_t baudrate = 1000000;
   EXPECT_EQ(get_int(p, "baudrate", INT64_MIN, INT64_MAX, baudrate), Status::kOk);
   EXPECT_EQ(baudrate, -1000000);
@@ -364,8 +348,8 @@ TEST(ParamParsing, bool_accepts_true_and_false_in_any_case)
 
 TEST(ParamParsing, bool_rejects_one_and_zero)
 {
-  // hardware_interface::parse_bool accepts exactly "true"/"false" (lexical_casts.hpp:108). XML
-  // habits like 1/0 and yes/no are malformed here, and PHASE2_SPEC 4.4 says so out loud.
+  // hardware_interface::parse_bool accepts only true and false (any case): 1/0, yes/no and on/off
+  // are malformed.
   const ParameterMap p{
     {"a", "1"}, {"b", "0"}, {"c", "yes"}, {"d", "no"}, {"e", "on"}, {"f", "off"}};
 
@@ -381,8 +365,8 @@ TEST(ParamParsing, message_wording_for_each_status)
   const std::string subject = "hardware parameter 'io_timeout_ms'";
   const std::string expected = "an integer between 2 and 1000 (milliseconds)";
 
-  // kDefaulted exists for required parameters only (id, PHASE2_SPEC 5.1); no hardware parameter
-  // reaches it, which is exactly why it is pinned here.
+  // kDefaulted is an error only for a required parameter (the joint id); no hardware parameter
+  // reaches it, so this case pins its wording.
   EXPECT_EQ(
     message(Status::kDefaulted, subject, "", expected),
     "hardware parameter 'io_timeout_ms' is missing; expected an integer between 2 and 1000 "

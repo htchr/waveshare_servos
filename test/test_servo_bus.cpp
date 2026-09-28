@@ -1,18 +1,5 @@
-// Tests for include/servo_bus.hpp + src/servo_bus.cpp (PHASE2_SPEC 9).
-//
-// Every case runs over an openpty() pair, so the vendored packet code runs unchanged and nothing
-// here needs a servo, a USB adapter or /dev/ttyACM0. The fixture opens the pair, closes the slave
-// descriptor it was handed -- ServoBus opens the path itself, exactly as it would a real tty --
-// and keeps the master, which is the fake servo's side of the wire.
-//
-// Two things in here are load-bearing rather than decorative:
-//   - the responder is an RAII member, so an ASSERT_* that unwinds out of a test body still joins
-//     the thread before the master descriptor is closed. Joining "at the end of the test body" is
-//     a crash recipe: ~std::thread on a joinable thread calls std::terminate() and takes every
-//     other case in the binary with it.
-//   - close_releases_the_port_for_a_later_open is a regression test for the explicit TIOCNXCL in
-//     ServoBus::close(). Without it, a port this fixture still references through the master stays
-//     marked exclusive and the second open() fails with EBUSY in this very process.
+// ServoBus tests over an openpty() pair: no servo or adapter needed.
+// See docs/development.md, "Fake servo bus".
 
 #include <gmock/gmock.h>
 
@@ -69,10 +56,7 @@ constexpr int kBaudrate = 1000000;
 constexpr uint32_t kIoTimeoutMs = 20;
 constexpr uint8_t kServoId = 1;
 
-// The refusal a second ServoBus meets on a port this process already holds. It is always refused;
-// only the reason differs. An unprivileged process cannot even open the device, because the first
-// bus set TIOCEXCL, so it fails at the lock descriptor with EBUSY. Root is allowed past TIOCEXCL
-// by the kernel, gets its descriptor, and then loses the advisory lock instead.
+// A second open is always refused: EBUSY (TIOCEXCL), or EWOULDBLOCK (flock) when run as root.
 ::testing::Matcher<BusStatus> refused_second_open()
 {
   return ::geteuid() == 0 ? ::testing::Eq(BusStatus::LOCK_FAILED) :
@@ -144,32 +128,14 @@ private:
   int fd_ = -1;
 };
 
-// Reaches the vendored buffer itself rather than the wrapper's constant that claims to describe
-// it. txBuf is protected in SCSerial, so a derived type may name it through its own `this` -- a
-// non-static member function, to stay clear of the [class.protected] access rule.
+// Reads sizeof(txBuf) of the vendored array itself, not the wrapper's constant.
 struct TxBufProbe : ServoBus
 {
   size_t bytes() const {return sizeof(txBuf);}
 };
 
-// PHASE3 1.30, seam 1. Captures the frames a ServoBus builds without letting a byte reach a port,
-// by overriding both writeSCS overloads, wFlushSCS, rFlushSCS and readSCS. This is the seam probe 2
-// used to prove byte identity against SMS_STS::SyncWritePosEx (probe/out_p2_offline.txt),
-// reproduced here so the proof lives in the suite instead of in a scratchpad.
-//
-// Two things are load-bearing rather than tidy:
-//   - `fd` must be a valid descriptor, because ServoBus::is_open() is `fd != -1` and
-//     write_goal_positions refuses a closed bus (PHASE3 1.17). /dev/null is the harmless one: the
-//     writeSCS overrides mean nothing is ever written to it, and ~ServoBus closes it.
-//   - readSCS must be overridden even though this seam never reads. SyncWriteSpe's per-servo
-//     genWrite calls Ack(), which calls readSCS(), which does FD_SET(fd, ...)
-//     (src/SCSerial.cpp:144) -- and with a -1 there glibc's _FORTIFY_SOURCE check aborts the whole
-//     test binary. Returning 0 makes every Ack fail fast, which is what gives the five-frame
-//     count of the SyncWriteSpe A/B.
-//
-// Because nothing here touches the genuine txBuf, this seam is also the only safe place to watch
-// an UNCHUNKED implementation build an oversized frame: SCSerial::writeSCS has no bounds check
-// (src/SCSerial.cpp:179-191), so the same experiment against the real buffer is UB, not a test.
+// Capture seam: records each frame a ServoBus builds; no byte reaches a port. fd is /dev/null
+// (is_open() must pass), and readSCS returns 0, so each Ack() fails at once.
 struct PacketCapture : ServoBus
 {
   PacketCapture() {fd = ::open("/dev/null", O_RDWR | O_CLOEXEC);}
@@ -197,10 +163,7 @@ protected:
   int readSCS(unsigned char *, int) override {return 0;}    // see above: never touch the fd
 };
 
-// PHASE3 1.30, seam 2. Reads the GENUINE txBufLen the vendored writeSCS produced, by overriding
-// only wFlushSCS -- the one place txBufLen is zeroed (src/SCSerial.cpp:218). Runs over the pty
-// fixture, so the base wFlushSCS still sends the bytes and the chunk boundaries are asserted
-// against the real buffer rather than against the spec's own arithmetic.
+// Records the real txBufLen at each flush (the one place it is zeroed), then sends as usual.
 struct TxBufLenProbe : ServoBus
 {
   std::vector<int> lengths;
@@ -213,15 +176,8 @@ protected:
   }
 };
 
-// The tie 1.8's "Decision: use the vendored SCS::Host2SCS" asks for, made where it can be made.
-// ServoBus::position_record and ServoBus::speed_record are static (PHASE3 0.3, R1, so 4.T4-4.T7
-// can call them with no object at all) and SCS::Host2SCS is a non-static protected member, so the
-// builders cannot delegate to it; duplicating the split in the chunk loop just so the loop could
-// would leave two implementations of the record layout. Instead the wrapper keeps one
-// implementation and this seam pins it against the library's, byte for byte. Host2SCS is the
-// single place the `End` flag decides byte order (src/SCS.cpp:34-43) and SMS_STS::SMS_STS() sets
-// End = 0 (src/SMS_STS.cpp:12), so an upstream flip fails here instead of silently reversing
-// every goal word on the wire.
+// Exposes the protected SCS::Host2SCS, so a test pins the static record builders to its byte
+// order (End = 0: low byte first).
 struct EndiannessProbe : ServoBus
 {
   std::array<uint8_t, 2> split(uint16_t value)
@@ -232,10 +188,7 @@ struct EndiannessProbe : ServoBus
   }
 };
 
-// One sync-write frame, taken apart the way a servo would: ff ff fe mesLen 83 addr nLen
-// {id data(nLen)}... ~chk (src/SCS.cpp:124-151). `well_formed` is false unless the header, the
-// length byte, the record stride and the checksum all agree, so a chunking case can verify each
-// frame independently instead of trusting the builder that produced it.
+// One sync-write frame, parsed on its own: ff ff fe mesLen 83 addr nLen {id data}... ~chk.
 struct ParsedSyncWrite
 {
   bool well_formed = false;
@@ -260,9 +213,7 @@ ParsedSyncWrite parse_sync_write(const std::vector<uint8_t> & frame)
     return parsed;
   }
   const size_t records = (frame.size() - 8) / stride;
-  // mesLen counts the instruction byte through the checksum (src/SCS.cpp:127), and it is a u8 that
-  // wraps at 32 position / 84 speed records -- one step past the txBuf overflow, which is why the
-  // chunker never has to reason about it.
+  // mesLen (a u8) wraps only at 32 position / 84 speed records, past the txBuf limit.
   if (frame[3] != static_cast<uint8_t>(stride * records + 4)) {
     return parsed;
   }
@@ -291,9 +242,8 @@ std::chrono::milliseconds time_one_ping(ServoBus * bus, uint8_t id)
     std::chrono::steady_clock::now() - started);
 }
 
-// A fake servo living on the master side of the pty: a 256-byte register file answering PING,
-// READ and WRITE the way the vendored packet layer expects. The thread is stopped and joined by
-// the destructor, so unwinding out of a test body can never leave it running.
+// Fake servo on the pty master: a 256-byte register file that answers PING, READ and WRITE.
+// The destructor stops and joins the thread.
 class FakeResponder
 {
 public:
@@ -325,9 +275,7 @@ private:
       if (ready <= 0) {
         continue;
       }
-      // Between the fixture closing the slave and ServoBus opening the path there is no slave
-      // open, and POLLHUP is then reported regardless of the events mask -- poll() would return
-      // at once forever and spin a core. Sleep instead.
+      // With no slave open, poll() reports POLLHUP at once every time: sleep, do not spin.
       if ((waiting.revents & POLLHUP) != 0 && (waiting.revents & POLLIN) == 0) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
         continue;
@@ -477,13 +425,8 @@ protected:
     return seen;
   }
 
-  // Everything queued on the master right now, discarded, counted and never waited for. A pty
-  // holds only a few kilobytes, and SCSerial::wFlushSCS answers a full one by spinning on EAGAIN
-  // up to 1000 times and then giving up silently (src/SCSerial.cpp:205-218) -- so a case that
-  // writes more than a pty-full has stopped testing whatever it meant to test and started testing
-  // that retry loop (the drain note of PHASE3 1.30). Calling this between writes is what keeps the
-  // queue empty. A pty write is synchronous into the master's queue, so a poll of 0 ms is enough:
-  // by the time write_goal_*() has returned, the bytes are already readable here.
+  // Discards what is queued on the master now. Call it between large writes: on a full pty,
+  // wFlushSCS gives up after 1000 EAGAIN retries and drops the frame silently.
   size_t drain_master()
   {
     size_t drained = 0;
@@ -508,10 +451,7 @@ protected:
   std::optional<FakeResponder> responder_;
 };
 
-// PHASE3 1.30, seam 3: the cases that need a register file rather than a byte stream. FakeBus owns
-// its own openpty() pair and publishes the slave path, so it must NOT be mixed with ServoBusPty,
-// which owns a different pair and a one-id FakeResponder that neither applies writes to its
-// registers nor records broadcasts.
+// Cases that need a register file. FakeBus has its own pty pair: do not mix it with ServoBusPty.
 class ServoBusFakeBus : public ::testing::Test
 {
 protected:
@@ -589,8 +529,7 @@ TEST_F(ServoBusPty, set_io_timeout_ms_refuses_zero_and_keeps_the_previous_value)
   ASSERT_TRUE(static_cast<bool>(bus_.open(port_, kBaudrate, kIoTimeoutMs)));
   EXPECT_FALSE(bus_.set_io_timeout_ms(0));
   EXPECT_EQ(bus_.io_timeout_ms(), kIoTimeoutMs);
-  // 7 and not 5: 5 is the driver's default since PHASE3 5.19, and a probe value that can coincide
-  // with a default would let a set_io_timeout_ms() that does nothing at all pass this case.
+  // 7, not 5: 5 ms is the driver default, and a setter that does nothing must not pass.
   EXPECT_TRUE(bus_.set_io_timeout_ms(7));
   EXPECT_EQ(bus_.io_timeout_ms(), 7u);
 }
@@ -622,11 +561,7 @@ TEST_F(ServoBusPty, a_second_bus_on_the_same_port_is_refused)
 
 TEST_F(ServoBusPty, an_advisory_lock_held_by_another_descriptor_refuses_the_open)
 {
-  // The only case that puts the advisory lock on trial by itself. a_second_bus_is_refused never
-  // reaches step 3 unless it runs as root, because the first bus's TIOCEXCL already refuses the
-  // lock descriptor; here nobody has set TIOCEXCL, so steps 1-2 pass and flock is the one thing
-  // that can say no. Without it, deleting the flock from open() breaks no test at all -- and the
-  // lock is the half of the exclusivity that a root process cannot walk past.
+  // Tests the flock alone (no TIOCEXCL here): it is the lock that root cannot bypass.
   const int other = ::open(port_.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
   ASSERT_NE(other, -1) << std::strerror(errno);
   const FdCloser closer(other);
@@ -755,9 +690,8 @@ TEST_F(ServoBusPty, the_vendored_packet_layer_round_trips_over_the_pty)
 
 TEST_F(ServoBusPty, a_silent_bus_costs_one_io_timeout)
 {
-  // No responder: nothing on this bus ever answers, so every transaction costs exactly one
-  // select() timeout. That is the whole reason io_timeout_ms exists -- the library's stock 100 ms
-  // held the Phase 1 control loop down to about 1.1 Hz.
+  // Nothing answers, so each transaction costs one io timeout.
+  // See docs/bus-timing.md, "Transaction timeout".
   ASSERT_TRUE(static_cast<bool>(bus_.open(port_, kBaudrate, 25)));
   const auto brief = time_one_ping(&bus_, 9);
   EXPECT_EQ(bus_.Ping(9), -1);
@@ -772,10 +706,7 @@ TEST_F(ServoBusPty, a_silent_bus_costs_one_io_timeout)
 
 TEST_F(ServoBusPty, begin_leaves_nothing_unflushed_on_stdout)
 {
-  // SCSerial::begin() printf()s "serial speed <rate>" and never flushes. Under ctest stdout is a
-  // pipe, so it is fully buffered and that line would surface much later, interleaved into
-  // whatever the process printed next -- or not at all, if the process is replaced by exec.
-  // open() flushes unconditionally; this pins that.
+  // SCSerial::begin() prints "serial speed <rate>" with no flush; open() must flush stdout.
   int pipe_fds[2] = {-1, -1};
   ASSERT_EQ(::pipe(pipe_fds), 0) << std::strerror(errno);
   std::fflush(stdout);
@@ -823,11 +754,8 @@ TEST_F(ServoBusPty, port_holder_pids_finds_this_process)
 
 TEST(ServoBus, the_vendored_transmit_buffer_is_255_bytes)
 {
-  // SCSerial::writeSCS() writes into txBuf with no bound check at all (src/SCSerial.cpp:178-190),
-  // so its size is a safety property of every packet this driver builds. The real tripwire is the
-  // static_assert in the out-of-line constructor, which an upstream refresh would break at compile
-  // time; this reads the vendored array itself, so a resize upstream fails the case rather than
-  // only a hand edit of the wrapper's constant.
+  // writeSCS has no bounds check, so txBuf's size bounds every packet. This reads the vendored
+  // array itself; the constructor's static_assert checks the same at compile time.
   TxBufProbe probe;
   EXPECT_EQ(probe.bytes(), ServoBus::tx_buffer_bytes);
   EXPECT_EQ(ServoBus::tx_buffer_bytes, size_t{255});
@@ -845,16 +773,11 @@ TEST(ServoBus, only_the_seven_mapped_baud_rates_are_supported)
   }
 }
 
-// ---------------------------------------------------------------------------------------------
-// PHASE3 C1 stage A: the pure record builders and the chunk constants. No port, no frame, no
-// vendored builder -- just the bytes a record is made of (PHASE3 1.8-1.10, 1.12-1.13).
-// ---------------------------------------------------------------------------------------------
+// ---- Record builders and chunk constants: bytes only, no port and no frame ----
 
 TEST(ServoBus, position_record_is_the_seven_bytes_sync_write_pos_ex_would_have_built)
 {
-  // PHASE3 4.T4. The record is based at register 41, so it covers ACC, the goal position word,
-  // the always-zero GOAL_TIME word (src/SMS_STS.cpp:75) and the goal speed. Measured against the
-  // library on the capture seam: probe/out_p2_offline.txt Q3a.
+  // 7-byte record at register 41: ACC, goal position, goal time (always 0), goal speed.
   EXPECT_EQ(
     ServoBus::position_record(30, 1000, 500),
     (std::array<uint8_t, 7>{0x1e, 0xe8, 0x03, 0x00, 0x00, 0xf4, 0x01}));
@@ -867,16 +790,13 @@ TEST(ServoBus, position_record_is_the_seven_bytes_sync_write_pos_ex_would_have_b
 
 TEST(ServoBus, a_negative_goal_is_sign_magnitude_not_twos_complement)
 {
-  // PHASE3 4.T5. -100 is magnitude 100 (0x0064) with bit 15 set, little endian: `64 80`. Never
-  // `9c ff` (two's complement) and never `9c 80` (two's complement with the sign bit bolted on).
+  // -100 is 64 80 (sign-magnitude): never 9c ff (two's complement) or 9c 80.
   const std::array<uint8_t, 7> record = ServoBus::position_record(7, -100, 1);
   EXPECT_EQ(record, (std::array<uint8_t, 7>{0x07, 0x64, 0x80, 0x00, 0x00, 0x01, 0x00}));
   EXPECT_EQ(record[1], 0x64);
   EXPECT_EQ(record[2], 0x80);
 
-  // -32767 is representable; -32768 is not reachable from the driver, because send_commands
-  // clamps goal_steps to [-32767, 32767] before the cast (src/waveshare_servos.cpp:1481). That
-  // clamp is load-bearing: the library negates in s16 (src/SMS_STS.cpp:59), which overflows there.
+  // -32767 is the lowest goal: send_commands clamps to +/-32767 (the library overflows at -32768).
   EXPECT_EQ(
     ServoBus::position_record(0, -32767, 1),
     (std::array<uint8_t, 7>{0x00, 0xff, 0xff, 0x00, 0x00, 0x01, 0x00}));
@@ -884,28 +804,20 @@ TEST(ServoBus, a_negative_goal_is_sign_magnitude_not_twos_complement)
 
 TEST(ServoBus, an_acceleration_of_zero_is_written_as_zero)
 {
-  // PHASE3 4.T6 / 1.23. `max_accel="0"` is the documented no-ramp opt-out
-  // (src/waveshare_servos.cpp:636-638) and SyncWritePosEx tests the ACC *pointer*, not the value
-  // (src/SMS_STS.cpp:69), so 0 goes out as 0 today. A builder that reads 0 as "unset" and
-  // substitutes a default would invert the parameter; this is the only guard on that.
+  // max_accel="0" means no ramp: ACC 0 must go out as 0, never be replaced by a default.
   EXPECT_EQ(ServoBus::position_record(0, 2048, 100)[0], 0);
 }
 
 TEST(ServoBus, speed_record_is_sign_magnitude_and_zero_carries_no_sign_bit)
 {
-  // PHASE3 4.T7 / 1.9. Measured: probe/out_p2_offline.txt Q3b.
   EXPECT_EQ(ServoBus::speed_record(700), (std::array<uint8_t, 2>{0xbc, 0x02}));
   EXPECT_EQ(ServoBus::speed_record(-700), (std::array<uint8_t, 2>{0xbc, 0x82}));
-  // Zero is the STOP command every deactivation depends on (src/waveshare_servos.cpp:1278-1281),
-  // so it must never acquire the position path's `>= 1` goal-speed floor, nor a sign bit.
+  // Zero is the stop command every deactivation uses: no `>= 1` speed floor and no sign bit.
   EXPECT_EQ(ServoBus::speed_record(0), (std::array<uint8_t, 2>{0x00, 0x00}));
 }
 
 TEST(ServoBus, the_record_builders_split_a_word_the_way_the_vendored_library_does)
 {
-  // PHASE3 1.8-1.9. The wrapper's records must follow the library's endianness convention rather
-  // than reproduce it by coincidence; since the static builders cannot call the protected
-  // Host2SCS, this is where the two are held together. See the comment on EndiannessProbe.
   EndiannessProbe probe;
   for (const int16_t value : {0, 1, -1, 100, -100, 1000, -1000, 4095, -4095, 32767, -32767}) {
     const std::array<uint8_t, 2> library = probe.split(sign_magnitude_encode(value));
@@ -923,24 +835,19 @@ TEST(ServoBus, the_record_builders_split_a_word_the_way_the_vendored_library_doe
 
 TEST(ServoBus, max_records_per_packet_matches_the_two_hundred_and_fifty_five_byte_buffer)
 {
-  // PHASE3 4.T8 / R18. The helper IS the arithmetic the two shipped constants are defined from,
-  // so the literals here are the only independent entry: they are what catches the derivation
-  // itself going wrong (drop the `+ 1` for the id byte and 30 becomes 35).
+  // The literals check the derivation itself: without the id byte's + 1, 30 becomes 35.
   EXPECT_EQ(ServoBus::max_records_per_packet(ServoBus::goal_position_record_bytes), size_t{30});
   EXPECT_EQ(ServoBus::max_records_per_packet(ServoBus::goal_speed_record_bytes), size_t{82});
   EXPECT_EQ(ServoBus::max_goal_positions_per_packet, size_t{30});
   EXPECT_EQ(ServoBus::max_goal_speeds_per_packet, size_t{82});
-  // The overflow is asserted, never executed: SCSerial::writeSCS is a bare txBuf[txBufLen++]
-  // with no bounds check (src/SCSerial.cpp:179-191), so building a 31-record packet against the
-  // real buffer is undefined behaviour, not a measurement (probe/out_p2_offline.txt Q4).
+  // Asserted, never built: 31 or 83 records overrun txBuf, and writeSCS has no bounds check.
   EXPECT_GT(size_t{8 + 31 * 8}, ServoBus::tx_buffer_bytes);
   EXPECT_GT(size_t{8 + 83 * 3}, ServoBus::tx_buffer_bytes);
 }
 
 TEST(ServoBus, the_chunk_limits_are_the_largest_packets_that_fit_the_transmit_buffer)
 {
-  // PHASE3 1.31.1, double entry: the measured literals on one side, the shipped constants on the
-  // other, so a hand edit of either constant fails here as well as at the static_asserts of 1.13.
+  // Double entry: literal frame sizes and the shipped constants, so an edit of either fails.
   EXPECT_EQ(size_t{248}, 8 + 30 * 8);
   EXPECT_EQ(size_t{256}, 8 + 31 * 8);
   EXPECT_EQ(size_t{254}, 8 + 82 * 3);
@@ -968,8 +875,7 @@ TEST(ServoBus, the_chunk_limits_are_the_largest_packets_that_fit_the_transmit_bu
 
 TEST(ServoBus, sign_magnitude_encode_puts_the_direction_in_bit_15)
 {
-  // PHASE3 1.10 / 1.31.2. Bit 15 is the direction flag and bits 0..14 the magnitude
-  // (src/SMS_STS.cpp:58-61): goal -100 goes out as `64 80`, not `9c ff`.
+  // Bit 15 is the direction, bits 0..14 the magnitude: -100 is 0x8064 (64 80 on the wire).
   EXPECT_EQ(sign_magnitude_encode(0), 0x0000);
   EXPECT_EQ(sign_magnitude_encode(1), 0x0001);
   EXPECT_EQ(sign_magnitude_encode(-1), 0x8001);
@@ -979,17 +885,13 @@ TEST(ServoBus, sign_magnitude_encode_puts_the_direction_in_bit_15)
   EXPECT_EQ(sign_magnitude_encode(-4095), 0x8fff);
   EXPECT_EQ(sign_magnitude_encode(32767), 0x7fff);
   EXPECT_EQ(sign_magnitude_encode(-32767), 0xffff);
-  // -32768 saturates to magnitude 32767, so it shares -32767's encoding. The library instead
-  // negates in s16 there (src/SMS_STS.cpp:59), which is signed overflow; this version is defined
-  // over the whole int16_t domain, and the driver's clamp (src/waveshare_servos.cpp:1481) keeps
-  // the input unreachable either way.
+  // -32768 saturates to 0xffff, like -32767. The library's s16 negation overflows there.
   EXPECT_EQ(sign_magnitude_encode(-32768), 0xffff);
 }
 
 TEST(ServoBus, every_write_status_has_a_name)
 {
-  // PHASE3 1.31.17, mirroring the discipline the BusStatus names already follow: a status with no
-  // name reaches a log line as an empty string.
+  // A status with no name would reach a log line as an empty string.
   const std::vector<WriteStatus> all = {
     WriteStatus::OK, WriteStatus::NOT_OPEN, WriteStatus::INVALID_ID};
   std::vector<std::string> names;
@@ -1002,16 +904,11 @@ TEST(ServoBus, every_write_status_has_a_name)
   EXPECT_EQ(std::unique(names.begin(), names.end()), names.end()) << "two statuses share a name";
 }
 
-// ---------------------------------------------------------------------------------------------
-// PHASE3 C1 stage B: whole frames and chunking, over the capture seam of 1.30. The vendored
-// SCS::syncWrite still assembles every frame -- header, mesLen, broadcast id and checksum are its
-// code -- so these cases are about the record bytes, the chunk boundaries and the refusals.
-// ---------------------------------------------------------------------------------------------
+// ---- Whole frames and chunking over PacketCapture; SCS::syncWrite builds the frames ----
 
 TEST(ServoBus, the_position_packet_is_byte_identical_to_sync_write_pos_ex)
 {
-  // PHASE3 4.T16 / F1. The measured 40 bytes of packets.md section 2.1, re-derived here: mesLen
-  // 0x24 = (7+1)*4+4, register 41 = 0x29, record width 7, checksum 0x78.
+  // Golden frame: mesLen 0x24 = (7 + 1) * 4 + 4, address 0x29 (41), checksum 0x78.
   const std::vector<uint8_t> golden = {
     0xff, 0xff, 0xfe, 0x24, 0x83, 0x29, 0x07,
     0x01, 0x1e, 0xe8, 0x03, 0x00, 0x00, 0xf4, 0x01,
@@ -1045,9 +942,7 @@ TEST(ServoBus, the_position_packet_is_byte_identical_to_sync_write_pos_ex)
 
 TEST(ServoBus, write_goal_positions_emits_the_bytes_syncwriteposex_emits)
 {
-  // PHASE3 1.31.3 / 1.3. The eight input classes probe 2 compared, 23 of 23 matching
-  // (probe/out_p2_offline.txt Q3a). A golden frame alone would pass if both paths drifted the same
-  // way, and an A/B alone would pass if both were wrong; the suite carries both.
+  // A/B against SyncWritePosEx over eight input classes; the golden frames catch a shared drift.
   struct Class
   {
     const char * name;
@@ -1097,9 +992,7 @@ TEST(ServoBus, write_goal_positions_emits_the_bytes_syncwriteposex_emits)
 
 TEST(ServoBus, a_position_packet_matches_its_golden_bytes)
 {
-  // PHASE3 1.31.4. probe/out_p2_offline.txt Q3a "n=1 negative", checksum re-derived by hand:
-  // 0xfe+0x0c+0x83+0x29+0x07+0x01+0x07+0xd2+0x84+0x00+0x00+0x09+0x03 = 0x327, low byte 0x27,
-  // ~0x27 = 0xd8.
+  // Golden n = 1 frame (goal -1234, speed 777, ACC 7): sum 0x327, so checksum ~0x27 = 0xd8.
   PacketCapture capture;
   ASSERT_TRUE(capture.is_open());
   EXPECT_TRUE(static_cast<bool>(capture.write_goal_positions({GoalPosition{1, -1234, 777, 7}})));
@@ -1113,9 +1006,8 @@ TEST(ServoBus, a_position_packet_matches_its_golden_bytes)
 
 TEST(ServoBus, the_speed_packet_is_byte_identical_to_the_sync_stage_of_sync_write_spe)
 {
-  // PHASE3 4.T17 / 1.31.5 / 1.31.7 / F2, and the whole of Phase 3 item 1 in one assertion: the
-  // sync frame is unchanged and the four per-servo ACC round trips are gone. Measured sync stage:
-  // probe/out_p2_offline.txt Q3b "ACC 0", checksum 0xd4.
+  // Same sync frame as SyncWriteSpe, without its per-servo ACC writes: one frame, not five.
+  // See docs/design.md, "Wheel acceleration".
   PacketCapture wrapper;
   ASSERT_TRUE(wrapper.is_open());
   EXPECT_TRUE(
@@ -1143,10 +1035,7 @@ TEST(ServoBus, the_speed_packet_is_byte_identical_to_the_sync_stage_of_sync_writ
 
 TEST(ServoBus, write_goal_speeds_emits_the_sync_stage_syncwritespe_emits)
 {
-  // PHASE3 1.31.5 / 1.3, the speed path's counterpart to the eight position classes: the same
-  // seven inputs probe 2 compared, 7 of 7 matching (probe/out_p2_offline.txt Q3b). Only the
-  // INST_SYNC_WRITE frame is compared -- the library's other n frames are its per-servo ACC
-  // writes, and that they are gone is what the frame count of 4.T17 asserts.
+  // A/B against SyncWriteSpe over seven input classes; only its last (sync) frame is compared.
   struct Class
   {
     const char * name;
@@ -1191,10 +1080,7 @@ TEST(ServoBus, write_goal_speeds_emits_the_sync_stage_syncwritespe_emits)
 
 TEST(ServoBus, a_speed_packet_matches_its_golden_bytes)
 {
-  // PHASE3 1.31.6, the speed path's golden frame -- the counterpart of 1.31.4, and there for the
-  // same reason: an A/B alone passes if both paths drift the same way. probe/out_p2_offline.txt
-  // Q3b "n=1", checksum re-derived by hand: 0xfe+0x07+0x83+0x2e+0x02+0x01+0xdc+0x85 = 0x31a, low
-  // byte 0x1a, ~0x1a = 0xe5.
+  // Golden n = 1 speed frame (speed -1500): sum 0x31a, so checksum ~0x1a = 0xe5.
   PacketCapture capture;
   ASSERT_TRUE(capture.is_open());
   EXPECT_TRUE(static_cast<bool>(capture.write_goal_speeds({GoalSpeed{1, -1500}})));
@@ -1206,9 +1092,7 @@ TEST(ServoBus, a_speed_packet_matches_its_golden_bytes)
 
 TEST(ServoBus, the_wrapper_built_packet_is_identical_on_a_second_call_with_the_same_inputs)
 {
-  // PHASE3 4.T18 / 1.31.9 / 1.11. The library re-encodes its caller's array in place, so the
-  // second call with an unchanged array emits a DIFFERENT frame; the wrapper reads its input and
-  // writes only its own scratch, so it cannot.
+  // The library re-encodes its caller's array in place; the wrapper does not, so repeats match.
   PacketCapture wrapper;
   ASSERT_TRUE(wrapper.is_open());
   const std::vector<GoalPosition> goals = {{1, -1234, 777, 7}, {2, 2048, 0, 0}};
@@ -1229,8 +1113,7 @@ TEST(ServoBus, the_wrapper_built_packet_is_identical_on_a_second_call_with_the_s
     0xff, 0xff, 0xfe, 0x0a, 0x83, 0x2e, 0x02, 0x01, 0xbc, 0x02, 0x02, 0xbc, 0x82, 0x45}));
   EXPECT_EQ(wheels.frames[0], wheels.frames[1]);
 
-  // The contrast that explains why the clause exists: {700, -700} becomes {700, -32068} inside
-  // SyncWriteSpe, so its second frame carries `44 fd` (measured, probe/out_p2_offline.txt Q3c).
+  // Contrast: SyncWriteSpe turns -700 into -32068 in place, so its second frame has 44 fd.
   PacketCapture library;
   ASSERT_TRUE(library.is_open());
   std::array<uint8_t, 2> ids = {1, 2};
@@ -1248,9 +1131,7 @@ TEST(ServoBus, the_wrapper_built_packet_is_identical_on_a_second_call_with_the_s
 
 TEST(ServoBus, write_goal_positions_does_not_modify_its_inputs)
 {
-  // PHASE3 4.T19 / 1.11 / 1.31.8. This is the property that makes the driver's per-cycle refill of
-  // p_pos_ar_ (src/waveshare_servos.cpp:1481) optional rather than load-bearing. Compared field by
-  // field because GoalPosition deliberately carries no operator== of its own.
+  // Inputs stay unchanged; compared field by field, because GoalPosition has no operator==.
   PacketCapture capture;
   ASSERT_TRUE(capture.is_open());
   const std::vector<GoalPosition> before = {{1, -1234, 777, 7}, {2, 2048, 0, 0}};
@@ -1276,8 +1157,7 @@ TEST(ServoBus, write_goal_positions_does_not_modify_its_inputs)
 
 TEST(ServoBus, thirty_one_position_records_go_out_as_two_packets_of_thirty_and_one)
 {
-  // PHASE3 4.T20 / 1.14. 31 records in one frame would be 256 bytes, one past the end of txBuf
-  // (probe/out_p2_offline.txt Q4).
+  // 31 records in one frame would be 256 bytes, one past the end of txBuf.
   PacketCapture capture;
   ASSERT_TRUE(capture.is_open());
   std::vector<GoalPosition> goals;
@@ -1310,9 +1190,7 @@ TEST(ServoBus, thirty_one_position_records_go_out_as_two_packets_of_thirty_and_o
 
 TEST(ServoBus, write_goal_positions_chunks_at_thirty_records)
 {
-  // PHASE3 1.31.10. 61 goals is 30 + 30 + 1: the last chunk is short, never padded, and each
-  // chunk is an independently valid frame with its own checksum, computed here rather than taken
-  // from the library that built it.
+  // 61 goals = 30 + 30 + 1: the last chunk is short, and each chunk has its own checksum.
   PacketCapture capture;
   ASSERT_TRUE(capture.is_open());
   std::vector<GoalPosition> goals;
@@ -1347,7 +1225,7 @@ TEST(ServoBus, write_goal_positions_chunks_at_thirty_records)
 
 TEST(ServoBus, eighty_three_speed_records_go_out_as_two_packets_of_eighty_two_and_one)
 {
-  // PHASE3 4.T21. 83 records in one frame would be 257 bytes, two past the end of txBuf.
+  // 83 records in one frame would be 257 bytes, two past the end of txBuf.
   PacketCapture capture;
   ASSERT_TRUE(capture.is_open());
   std::vector<GoalSpeed> goals;
@@ -1380,7 +1258,7 @@ TEST(ServoBus, eighty_three_speed_records_go_out_as_two_packets_of_eighty_two_an
 
 TEST(ServoBus, write_goal_speeds_chunks_at_eighty_two_records)
 {
-  // PHASE3 1.31.11. 165 goals is 82 + 82 + 1.
+  // 165 goals = 82 + 82 + 1.
   PacketCapture capture;
   ASSERT_TRUE(capture.is_open());
   std::vector<GoalSpeed> goals;
@@ -1415,9 +1293,8 @@ TEST(ServoBus, write_goal_speeds_chunks_at_eighty_two_records)
 
 TEST(ServoBus, an_empty_group_puts_nothing_on_the_wire)
 {
-  // PHASE3 4.T23 / 1.16 / R13. `u8 offbuf[IDN][7]` is a zero-length VLA at IDN == 0
-  // (src/SMS_STS.cpp:56, :263, undefined behaviour) and a bare syncWrite would broadcast
-  // mesLen = 4 with no records. The driver's two guards move here, and this is what pins them.
+  // An empty group sends nothing. In the library, IDN == 0 is a zero-length VLA (undefined
+  // behaviour) and an empty broadcast.
   PacketCapture capture;
   ASSERT_TRUE(capture.is_open());
   const WriteResult positions = capture.write_goal_positions({});
@@ -1433,8 +1310,7 @@ TEST(ServoBus, an_empty_group_puts_nothing_on_the_wire)
 
 TEST(ServoBus, the_position_record_carries_acc_first_and_a_zero_goal_time)
 {
-  // PHASE3 1.31.21 / 1.8, read straight out of a captured frame rather than out of the builder,
-  // so the record's place inside the packet is pinned too.
+  // Read from a captured frame, not the builder, so the record's place in the packet is checked.
   PacketCapture capture;
   ASSERT_TRUE(capture.is_open());
   capture.write_goal_positions({GoalPosition{1, -2000, 300, 77}, GoalPosition{2, 2000, 300, 0}});
@@ -1460,8 +1336,7 @@ TEST(ServoBus, the_position_record_carries_acc_first_and_a_zero_goal_time)
 
 TEST(ServoBus, a_zero_wheel_speed_is_two_zero_bytes)
 {
-  // PHASE3 1.31.22 / 1.9 / F2: the stop command every deactivation depends on. `00 80` -- a signed
-  // zero -- would be a direction flag with no magnitude, which is not what the servo is told today.
+  // Speed 0 is the stop command: 00 00, never 00 80 (a sign bit with no magnitude).
   PacketCapture capture;
   ASSERT_TRUE(capture.is_open());
   capture.write_goal_speeds({GoalSpeed{3, 0}});
@@ -1474,9 +1349,7 @@ TEST(ServoBus, a_zero_wheel_speed_is_two_zero_bytes)
 
 TEST(ServoBus, write_goal_positions_on_a_closed_bus_writes_nothing)
 {
-  // PHASE3 1.17 / 1.31.15. Today the same call reaches wFlushSCS() -> write(-1, ...) -> EBADF and
-  // silently does nothing; the explicit refusal exists so the caller can log it, because reaching
-  // the write path with no port is a driver bug rather than an operating condition.
+  // Refused as NOT_OPEN so the caller can log it; the library would write(-1) and fail silently.
   ServoBus fresh;
   ASSERT_FALSE(fresh.is_open());
   const WriteResult refused = fresh.write_goal_positions({GoalPosition{1, 0, 0, 0}});
@@ -1487,11 +1360,7 @@ TEST(ServoBus, write_goal_positions_on_a_closed_bus_writes_nothing)
   EXPECT_EQ(fresh.write_goal_speeds({GoalSpeed{1, 100}}).status, WriteStatus::NOT_OPEN);
   EXPECT_FALSE(fresh.write_acc(1, 40));
 
-  // The second arm 1.31.15 names: a bus that HELD a descriptor and lost it. It is a separate
-  // assertion because the two failures have different causes -- the first is a bus that was never
-  // given a port, this one is close() putting fd back to -1 (src/SCSerial.cpp:224-227). The seam
-  // supplies the descriptor because the refusal is decided by is_open() alone, and /dev/null is
-  // opened and closed for real here.
+  // Also a bus that was open and then closed: close() sets fd back to -1.
   PacketCapture opened_then_closed;
   ASSERT_TRUE(opened_then_closed.is_open());
   opened_then_closed.close();
@@ -1507,19 +1376,14 @@ TEST(ServoBus, write_goal_positions_on_a_closed_bus_writes_nothing)
 
 TEST_F(ServoBusFakeBus, write_acc_writes_register_41_and_reports_the_ack)
 {
-  // PHASE3 1.31.18 / 1.20 / F3. The ACC byte leaves the per-cycle sync write and travels in its
-  // own addressed INST_WRITE instead; only the schedule changes, not the byte. This is the case
-  // that CANNOT tell `!= 0` from the `!= -1` bug -- a successful write returns 1, which is neither
-  // -- which is why 1.31.19 is the one that has to be written first.
+  // ACC travels in its own addressed write of register 41. A success returns 1, so only the
+  // no-answer case below tells `!= 0` from `!= -1`.
   const waveshare_servos_test::FakeServo before = fake_.snapshot(1);
   EXPECT_TRUE(bus_.write_acc(1, 77));
   const waveshare_servos_test::FakeServo after = fake_.snapshot(1);
   EXPECT_EQ(after.mem[waveshare_servos_test::kRegAcc], 77);
   EXPECT_EQ(after.writes, before.writes + 1) << "one addressed write, and no EPROM unlock";
-  // PHASE3 4.T37 / F6. A plain addressed INST_WRITE: not a sync write, and NOT the unLockEprom /
-  // LockEprom pair set_mode has to bracket register 33 with (src/waveshare_servos.cpp:988-990).
-  // Register 41 is SRAM (include/SMS_STS.h:39-48), so that pair would be two extra round trips
-  // and two writes of an EPROM register (55) that Phase 3 promises never to touch.
+  // One plain INST_WRITE: register 41 is SRAM, so no unlock/lock of register 55 around it.
   EXPECT_EQ(after.sync_writes.size(), before.sync_writes.size());
   EXPECT_EQ(after.mem[55], before.mem[55]) << "SMS_STS_LOCK must not be written";
   EXPECT_EQ(after.writes, 1) << "exactly one transaction, so no unlock/lock bracket";
@@ -1527,11 +1391,8 @@ TEST_F(ServoBusFakeBus, write_acc_writes_register_41_and_reports_the_ack)
 
 TEST_F(ServoBusPty, write_acc_reports_a_servo_that_does_not_answer)
 {
-  // PHASE3 1.31.19 / 1.20. Nothing answers on this fixture's pty, so SCS::Ack reads six bytes that
-  // never arrive and returns 0 (src/SCS.cpp:265-295). `!= 0` is the whole point: Ack returns 0 on
-  // every failure path and 1 on success and NEVER -1, so the read side's `!= -1` convention
-  // (readByte, src/SCS.cpp:206-215) would make this function always return true and 1.25's
-  // unramped-wheel warning unreachable.
+  // SCS::Ack returns 1 or 0, never -1: write_acc must test != 0, unlike readByte's != -1.
+  // See docs/design.md, "Vendored library traps".
   ASSERT_TRUE(static_cast<bool>(bus_.open(port_, kBaudrate, 25)));
   const auto started = std::chrono::steady_clock::now();
   EXPECT_FALSE(bus_.write_acc(9, 40));
@@ -1546,14 +1407,8 @@ TEST_F(ServoBusPty, write_acc_reports_a_servo_that_does_not_answer)
 
 TEST_F(ServoBusPty, a_full_chunk_fills_the_transmit_buffer_without_overrunning_it)
 {
-  // PHASE3 4.T22 / 1.31.12 / F7. The GENUINE txBufLen the vendored writeSCS produced, read before
-  // wFlushSCS zeroes it (src/SCSerial.cpp:218) -- not the wrapper's own arithmetic. The four
-  // numbers are the ones measured on a pty in probe/out_p2_offline.txt.
-  //
-  // 31 position records (256 bytes) and 83 speed records (257) are deliberately absent and must
-  // stay absent: writeSCS has no bounds check, so building them against the real buffer is
-  // undefined behaviour, not a measurement. The capture seam, which never touches txBuf, is where
-  // the oversized cases live.
+  // The real txBufLen for 29/30 position and 81/82 speed records. Never build 31 or 83 here:
+  // writeSCS has no bounds check (PacketCapture holds the oversized cases).
   TxBufLenProbe probe;
   ASSERT_TRUE(static_cast<bool>(probe.open(port_, kBaudrate, kIoTimeoutMs)));
 
@@ -1566,9 +1421,7 @@ TEST_F(ServoBusPty, a_full_chunk_fills_the_transmit_buffer_without_overrunning_i
     speeds.push_back(GoalSpeed{id, 100});
   }
 
-  // Only these four frames, and never more: the fixture does not drain the master, so a case that
-  // wrote many full-size frames would start exercising wFlushSCS's EAGAIN retry loop instead of
-  // the chunker.
+  // Four frames only: this case does not drain the master (see drain_master).
   probe.write_goal_positions(
     std::vector<GoalPosition>(positions.begin(), positions.begin() + 29));
   probe.write_goal_positions(positions);
@@ -1584,10 +1437,7 @@ TEST_F(ServoBusPty, a_full_chunk_fills_the_transmit_buffer_without_overrunning_i
 
 TEST_F(ServoBusPty, write_goal_positions_on_an_empty_list_sends_nothing)
 {
-  // PHASE3 1.16 / 1.31.13. Emptiness is checked BEFORE the port, because "nothing to send" is
-  // success whatever the port is doing: stop_and_park prunes p_ids_ to the servos that answered
-  // and legitimately leaves it empty, and a wheels-only robot has an empty position group from
-  // the start.
+  // Empty is checked before the port: an empty group is normal (wheels-only robot, all pruned).
   ServoBus never_opened;
   ASSERT_FALSE(never_opened.is_open());
   EXPECT_EQ(never_opened.write_goal_positions({}).status, WriteStatus::OK);
@@ -1605,19 +1455,13 @@ TEST_F(ServoBusPty, write_goal_positions_on_an_empty_list_sends_nothing)
 
 TEST_F(ServoBusPty, reserve_goal_capacity_stops_the_write_path_allocating)
 {
-  // PHASE3 1.7 / 1.31.14. The real-time path must allocate nothing after build_groups() has sized
-  // the scratch, and the reserve clamps at the per-packet maxima so a hundred-servo group reserves
-  // one chunk rather than a hundred records.
+  // No allocation after reserve_goal_capacity(); the reserve clamps at one chunk (30/82 records).
   ASSERT_TRUE(static_cast<bool>(bus_.open(port_, kBaudrate, kIoTimeoutMs)));
   bus_.reserve_goal_capacity(30, 82);
   const size_t reserved = bus_.goal_scratch_capacity_bytes();
   EXPECT_GT(reserved, 0u);
 
-  // The hundred cycles put about 23 kB on the wire, several times what a pty holds. Draining the
-  // master every cycle is not tidiness: an undrained pty makes wFlushSCS spin on EAGAIN and then
-  // drop the rest of the frame silently (src/SCSerial.cpp:205-218), so the back of the loop would
-  // be exercising that retry budget instead of the chunker (PHASE3 1.30). `expected` and `drained`
-  // are what prove the drain kept up -- every byte the chunker built arrived.
+  // ~23 kB in 100 cycles: drain each cycle (see drain_master) and check every built byte arrived.
   size_t expected = 0;
   size_t drained = 0;
   for (int cycle = 0; cycle < 100; cycle++) {
@@ -1650,11 +1494,7 @@ TEST_F(ServoBusPty, reserve_goal_capacity_stops_the_write_path_allocating)
 
 TEST_F(ServoBusPty, an_id_outside_one_to_two_hundred_fifty_three_is_refused_whole)
 {
-  // PHASE3 1.18 / 1.31.16. All or nothing, and before a single byte is built: 254 is the broadcast
-  // address the frame header itself carries and 255 is the header byte, so a record addressed to
-  // either is nonsense the servos would misparse. on_init already rejects both, which makes this a
-  // tripwire rather than the primary gate -- and a partial command set would hide the driver bug
-  // behind plausible motion.
+  // Ids 0, 254 (broadcast) and 255 (header byte) refuse the whole group before a byte is built.
   ASSERT_TRUE(static_cast<bool>(bus_.open(port_, kBaudrate, kIoTimeoutMs)));
   for (const uint8_t bad : {uint8_t{254}, uint8_t{0}, uint8_t{255}}) {
     const std::vector<GoalPosition> goals = {
@@ -1676,10 +1516,7 @@ TEST_F(ServoBusPty, an_id_outside_one_to_two_hundred_fifty_three_is_refused_whol
 
 TEST_F(ServoBusFakeBus, the_records_reach_the_right_servos_in_request_order)
 {
-  // PHASE3 1.31.20, end to end against a register file: ids 1 and 2 are position servos, 3 and 4
-  // are wheels. A sync write is a broadcast and is never acked (src/SCS.cpp:132, :268), so the
-  // bytes may still be in the kernel's queue when write_goal_* returns -- wait_quiet() is what
-  // makes reading the records back deterministic rather than a race that loses the last one.
+  // A sync write is never acked: wait_quiet() before reading the fake's registers back.
   ASSERT_TRUE(static_cast<bool>(bus_.write_goal_positions({{1, 1000, 500, 30}, {2, -1000, 0, 0}})));
   ASSERT_TRUE(static_cast<bool>(bus_.write_goal_speeds({{3, 700}, {4, -700}})));
   fake_.wait_quiet();
@@ -1715,19 +1552,12 @@ TEST_F(ServoBusFakeBus, the_records_reach_the_right_servos_in_request_order)
   EXPECT_EQ(fake_.word(4, waveshare_servos_test::kRegGoalSpeed), -700);
 }
 
-// ---------------------------------------------------------------------------------------------
-// PHASE3 C2 stage A: the 15-byte decoder and the burst walker. Both are free functions over plain
-// bytes, so nothing here opens a port, builds a frame or instantiates an SMS_STS -- which is the
-// whole reason PHASE3 R17 made the walker public instead of an anonymous-namespace helper.
-// ---------------------------------------------------------------------------------------------
+// ---- Feedback decoder and sync-read burst walker: free functions over bytes, no port ----
 
 TEST(ServoBus, decode_feedback_block_reproduces_the_sms_sts_accessors)
 {
-  // PHASE3 4.T1 / 2.95 / 2.46. The one vector measured field for field against FeedBack() plus
-  // ReadPos/ReadSpeed/ReadLoad/ReadVoltage/ReadTemper/ReadMove/ReadCurrent(-1) themselves
-  // (recon/packets.md 5.2): offsets 0-1 position, 2-3 speed, 4-5 load, 6 voltage, 7 temperature,
-  // 10 moving, 13-14 current, all little endian. Offsets 8, 9, 11 and 12 are unnamed registers
-  // and must reach no field.
+  // Offsets 0-1 position, 2-3 speed, 4-5 load, 6 voltage, 7 temperature, 10 moving, 13-14 current.
+  // See docs/design.md, "Feedback block".
   constexpr std::array<uint8_t, 15> kBlock = {
     0xe8, 0x03, 0x2c, 0x81, 0x10, 0x04, 0x7c, 0x21, 0x00, 0x00, 0x01, 0x00, 0x00, 0x20, 0x80};
   const FeedbackBlock block = decode_feedback_block(kBlock.data(), 0);
@@ -1741,28 +1571,20 @@ TEST(ServoBus, decode_feedback_block_reproduces_the_sms_sts_accessors)
   EXPECT_EQ(block.moving_raw, 1);
   EXPECT_EQ(block.current_counts, -32);
 
-  // The status byte is the caller's -- the decoder is 15 bytes wide and cannot know what frame
-  // carried them, which is why it is the burst walker that supplies it (PHASE3 2.36).
+  // The decoder sees only the 15 data bytes; the walker passes the frame's own status byte.
   EXPECT_EQ(decode_feedback_block(kBlock.data(), 0x2b).status, 0x2b);
 }
 
 TEST(ServoBus, decode_feedback_block_takes_load_from_bit_ten_and_the_rest_from_bit_fifteen)
 {
-  // PHASE3 4.T2 / 2.98 / R4. The two sign conventions differ twice over: in WHICH bit, and in
-  // what survives above it. ReadPos computes -(Pos & ~(1<<15)) on an int holding a 16-bit word
-  // (src/SMS_STS.cpp:146-148), so clearing bit 15 clears the only high bit and the result is
-  // exact. ReadLoad computes -(Load & ~(1<<10)) on the same kind of int (:188-190), which clears
-  // bit 10 and LEAVES BITS 11..15 IN PLACE -- 0xffff becomes 0xfbff = 64511.
-  //
-  // The 0xffff row is the point of this case. A real servo never sets bits 11..15 (0..1000,
-  // include/SMS_STS.h:83), so a decoder that "cleans up" the mask to 0x3ff can only ever be caught
-  // here -- and it would publish a different `load` state than Phase 2 did.
+  // Load signs on bit 10 and keeps bits 11..15 (0xffff -> -64511), as ReadLoad does. Only the
+  // 0xffff row catches a decoder that masks with 0x3ff.
   std::array<uint8_t, 15> block = {};
   const std::array<std::pair<std::array<uint8_t, 2>, int>, 8> loads = {{
-    {{{0x10, 0x04}}, -16},        // 0x0410, the measured resting value of 4.T1
+    {{{0x10, 0x04}}, -16},        // 0x0410, the measured resting value
     {{{0x10, 0x00}}, 16},         // 0x0010, bit 10 clear, so no sign at all
     {{{0xff, 0x03}}, 1023},       // 0x03ff, the largest positive a real servo reports
-    {{{0x00, 0x04}}, 0},          // 0x0400, the load half of the `-0` of PHASE3 2.43
+    {{{0x00, 0x04}}, 0},          // 0x0400, a negative zero: decodes to 0
     {{{0x01, 0x04}}, -1},         // 0x0401, the smallest negative
     {{{0xff, 0x07}}, -1023},      // 0x07ff, the largest magnitude a real servo reports
     {{{0x00, 0x08}}, 2048},       // 0x0800, bit 11 is NOT a sign bit and must survive
@@ -1784,10 +1606,7 @@ TEST(ServoBus, decode_feedback_block_takes_load_from_bit_ten_and_the_rest_from_b
 
 TEST(ServoBus, decode_feedback_block_signs_position_speed_and_current_on_bit_fifteen)
 {
-  // PHASE3 2.97. The same six-row table applied to all three bit-15 fields, so a decoder that
-  // gets one of them right by copy-paste and another wrong fails here. 0x8000 decodes to -0,
-  // i.e. 0: that is what -(v & ~(1<<15)) does with the magnitude bits clear, and PHASE3 2.43
-  // says reproduce it rather than "fix" it.
+  // One table for all three bit-15 fields. 0x8000 decodes to 0 (-0), as in the library.
   const std::array<std::pair<uint16_t, int>, 6> rows = {{
     {0x0000, 0}, {0x0001, 1}, {0x7fff, 32767}, {0x8000, 0}, {0x8001, -1}, {0xffff, -32767}}};
   for (const auto & row : rows) {
@@ -1806,9 +1625,7 @@ TEST(ServoBus, decode_feedback_block_signs_position_speed_and_current_on_bit_fif
 
 TEST(ServoBus, decode_feedback_block_reads_the_moving_flag_at_offset_ten)
 {
-  // PHASE3 2.96 / 2.12. Register 66, the one field no accessor call in the driver exercises
-  // today: it is carried so the decoder's equivalence with the whole accessor set is complete,
-  // and it is the field an off-by-one in the unnamed registers 64, 65, 67, 68 lands on first.
+  // Moving flag = register 66 (offset 10), between the unnamed registers 64-65 and 67-68.
   std::array<uint8_t, 15> block = {};
   EXPECT_EQ(decode_feedback_block(block.data(), 0).moving_raw, 0);
   block[10] = 1;
@@ -1824,8 +1641,7 @@ TEST(ServoBus, decode_feedback_block_reads_the_moving_flag_at_offset_ten)
 
 TEST(ServoBus, decode_feedback_block_leaves_voltage_and_temperature_unsigned)
 {
-  // PHASE3 2.100. ReadVoltage and ReadTemper return a plain byte (src/SMS_STS.cpp:198,213) with
-  // no sign handling of any kind, so 0xff is 255 and never -1.
+  // Voltage and temperature are plain bytes: 0xff is 255, never -1.
   std::array<uint8_t, 15> block = {};
   block[6] = 0xff;
   block[7] = 0xff;
@@ -1837,14 +1653,8 @@ TEST(ServoBus, decode_feedback_block_leaves_voltage_and_temperature_unsigned)
 namespace
 {
 
-// The 84-byte reply to `syncReadPacketTx({1,2,3,4}, 4, 56, 15)`, captured byte for byte off this
-// bench at 1 Mbaud with the four servos at rest (probe/p1_syncread.md Q1, probe/out_q1.txt). Four
-// independent 21-byte frames, each `FF FF <id> 0x11 <status> <15 data bytes> <~cks>`.
-//
-// It is the anchor for every parser case below, for two reasons a synthetic burst cannot match:
-// servo 1 repeats its position word `89 06` at block offsets 11-12 (the unnamed registers 67, 68),
-// so a decoder that reads current two bytes early returns 1673 instead of 0; and servos 3 and 4
-// carry genuine bit-10 loads, 0x0408 and 0x040a, i.e. -8 and -10.
+// Real 84-byte sync-read reply (bench, ids 1-4, 1 Mbaud, at rest): four 21-byte frames.
+// Registers 67-68 are not zero on real servos; servos 3 and 4 report bit-10 (negative) loads.
 constexpr std::array<uint8_t, 84> kBenchBurst = {
   0xff, 0xff, 0x01, 0x11, 0x00, 0x89, 0x06, 0x00, 0x00, 0x00, 0x00, 0x7c, 0x22, 0x00, 0x00, 0x00,
   0x89, 0x06, 0x00, 0x00, 0x31,
@@ -1857,10 +1667,7 @@ constexpr std::array<uint8_t, 84> kBenchBurst = {
 
 constexpr std::size_t kFrameBytes = 21;
 
-// The checksum the servo computed and SCS::Read verifies: the uint8_t sum of id, length, status
-// and the 15 data bytes, complemented (src/SCS.cpp:359-367). Written out here rather than reused
-// from the wrapper so the parser's arithmetic is checked against a second implementation, which
-// is what made probe 1 Q6's "0 bad checksums in 5000 transactions" a result and not a tautology.
+// Independent checksum: ~(id + length + status + 15 data bytes), low 8 bits; not the wrapper's.
 uint8_t frame_checksum(const uint8_t * frame)
 {
   uint8_t sum = 0;
@@ -1870,18 +1677,13 @@ uint8_t frame_checksum(const uint8_t * frame)
   return static_cast<uint8_t>(~sum);
 }
 
-// Recompute one frame's trailing checksum in place. PHASE3 4.T11 insists the doctored frames are
-// built here and not copied: probe 1 Q4 prints them with the data elided and with frame 1's
-// checksum wrong (it prints frame 2's), so a copied literal would fail its own gate.
+// Recomputes one frame's checksum in place: doctored frames are built here, never copied.
 void repair(std::vector<uint8_t> & burst, std::size_t frame)  // NOLINT(runtime/references)
 {
   burst[frame * kFrameBytes + kFrameBytes - 1] = frame_checksum(&burst[frame * kFrameBytes]);
 }
 
-// The capture rebuilt with its frames in `frames` order, each still carrying its own id, status
-// and checksum. Reordering whole frames is the only way to build a burst that is individually
-// well formed and collectively out of request order, which is the case a positional parser
-// mis-attributes.
+// The capture with its frames reordered; each frame stays valid, only the order changes.
 std::vector<uint8_t> burst_of(const std::vector<std::size_t> & frames)
 {
   std::vector<uint8_t> burst;
@@ -1904,10 +1706,7 @@ FeedbackBlock bench_block(std::size_t frame)
 
 TEST(ServoBus, decode_feedback_block_reads_a_real_bench_frame)
 {
-  // PHASE3 4.T3 / 2.98a / 2.47. The three frames of the capture that carry something a synthetic
-  // block cannot: frame 1's repeated position word in the unnamed registers, and frames 3 and 4's
-  // real bit-10 loads at two different magnitudes -- two magnitudes because one alone does not
-  // separate a `~(1<<10)` mask from a `0x3ff` one.
+  // Real frames: frame 1 repeats its position in registers 67-68; frames 3, 4 have bit-10 loads.
   const std::array<std::tuple<std::size_t, int, int, int, int>, 3> frames = {{
     // frame index, position, load, voltage, temperature
     {0, 1673, 0, 124, 34},
@@ -1933,16 +1732,10 @@ TEST(ServoBus, decode_feedback_block_reads_a_real_bench_frame)
 
 TEST(ServoBus, min_io_timeout_ms_tracks_the_measured_cost_model)
 {
-  // PHASE3 4.T9 / R9 / 5.20b. The floor is the measured sync-read cost model
-  // t(n) = 0.476 + 0.290n ms (probe 1 Q3, least squares over n = 1..4) scaled by the measured
-  // p99/mean tail factor of 1.19 (probe 3 Q1: 2.058/1.734) and rounded up with 1 ms of slack --
-  // whole milliseconds because /dev/ttyACM0 is USB CDC and the host polls it once per 1 ms frame,
-  // so sub-millisecond tuning is meaningless (probe 3 bonus).
-  //
-  // These are the model evaluated BY HAND, so a later edit to the formula has to be deliberate.
+  // Floor = ceil(1.19 * (0.476 + 0.290 n)) + 1 ms, from bench data; values computed by hand.
+  // See docs/bus-timing.md, "Timeout floor".
   EXPECT_EQ(ServoBus::min_io_timeout_ms(1), 2u);
-  // 3 ms at four servos measured 0 failures in 2000 transactions (probe 3 Q2), which is what rules
-  // out the flat +2 margin an earlier draft proposed: it would have warned about that run.
+  // 3 ms at four servos: 0 failures in 2000 bench transactions.
   EXPECT_EQ(ServoBus::min_io_timeout_ms(4), 3u);
   EXPECT_EQ(ServoBus::min_io_timeout_ms(8), 5u);
   // The claim the new 5 ms default rests on: it stays silent up to nine servos. Nothing else in
@@ -1952,8 +1745,7 @@ TEST(ServoBus, min_io_timeout_ms_tracks_the_measured_cost_model)
   EXPECT_EQ(ServoBus::min_io_timeout_ms(16), 8u);
   EXPECT_EQ(ServoBus::min_io_timeout_ms(30), 12u);
 
-  // Monotonic over the whole chunk range, because the argument is the CHUNK size and a bus that
-  // grows must never be told it needs less time (PHASE3 2.81).
+  // Monotonic over the chunk range: a larger bus never gets a smaller floor.
   for (std::size_t servos = 2; servos <= ServoBus::sync_read_max_ids; servos++) {
     EXPECT_GE(ServoBus::min_io_timeout_ms(servos), ServoBus::min_io_timeout_ms(servos - 1)) <<
       servos;
@@ -1966,10 +1758,7 @@ TEST(ServoBus, min_io_timeout_ms_tracks_the_measured_cost_model)
 
 TEST(ServoBus, parse_sync_read_burst_decodes_four_frames_in_request_order)
 {
-  // PHASE3 4.T10 / 2.32. The real four-servo burst, parsed against the list it was asked for.
-  // The four checksums are verified here first, with the same independent helper the doctored
-  // frames of 4.T11 use, so a transcription slip in the literal fails in this case rather than
-  // somewhere downstream where it would look like a parser bug.
+  // The real burst against its request list. Checksums first, so a typo in the literal fails here.
   for (std::size_t frame = 0; frame < 4; frame++) {
     const uint8_t * bytes = kBenchBurst.data() + frame * kFrameBytes;
     ASSERT_EQ(bytes[kFrameBytes - 1], frame_checksum(bytes)) << "frame " << frame;
@@ -1996,20 +1785,14 @@ TEST(ServoBus, parse_sync_read_burst_decodes_four_frames_in_request_order)
 
 TEST(ServoBus, parse_sync_read_burst_gives_each_servo_the_status_byte_of_its_own_frame)
 {
-  // PHASE3 4.T11 / 2.36 / 2.49. Each servo's status is byte 4 of ITS OWN frame, taken from the
-  // same 21 bytes the data came from with nothing in between. The vendored syncReadPacketRx
-  // instead carries it in the shared SCS::Error, which it leaves untouched for an id that did not
-  // answer (src/SCS.cpp:358, measured with a 0xee poison in probe 1 Q4) -- so an absent servo
-  // there inherits the last answering one's byte.
+  // Status = byte 4 of the servo's own frame. SCS::Error would keep a stale value for a silent id.
   std::vector<uint8_t> burst = burst_of({0, 1, 2, 3});
   const std::array<uint8_t, 4> statuses = {0x11, 0x22, 0x44, 0x88};
   for (std::size_t frame = 0; frame < 4; frame++) {
     burst[frame * kFrameBytes + 4] = statuses[frame];
     repair(burst, frame);
   }
-  // The checksums recomputed by hand from the capture, as a check on `repair` itself: probe 1 Q4
-  // prints frame 1's as 0x21, which is frame 2's value, so a frame copied from the probe would
-  // fail its own gate and take slot 0 with it.
+  // Hand-computed checksums of the doctored frames: a check on repair() itself.
   const std::array<uint8_t, 4> repaired = {0x20, 0x21, 0x03, 0xa3};
   for (std::size_t frame = 0; frame < 4; frame++) {
     EXPECT_EQ(burst[frame * kFrameBytes + kFrameBytes - 1], repaired[frame]) << "frame " << frame;
@@ -2036,10 +1819,8 @@ TEST(ServoBus, parse_sync_read_burst_gives_each_servo_the_status_byte_of_its_own
 
 TEST(ServoBus, parse_sync_read_burst_skips_a_missing_id_and_decodes_the_rest)
 {
-  // PHASE3 4.T12 / 2.34. Servo 2 says nothing, so its 21 bytes are simply absent from the wire.
-  // Id 3 is AHEAD of the cursor in the request list, so slot 1 is abandoned and slot 2 takes the
-  // frame. The bench's own evidence for going on rather than giving up is that a burst with an
-  // absent id still decodes the rest perfectly, 1200/1200 in every case probe 1 Q5 tried.
+  // Servo 2 is silent, so its frame is missing: slot 1 stays empty and the rest decode.
+  // See docs/design.md, "Sync read".
   const std::vector<uint8_t> burst = burst_of({0, 2, 3});
   const std::vector<uint8_t> ids = {1, 2, 3, 4};
   std::vector<FeedbackBlock> blocks;
@@ -2067,10 +1848,7 @@ TEST(ServoBus, parse_sync_read_burst_skips_a_missing_id_and_decodes_the_rest)
 
 TEST(ServoBus, parse_sync_read_burst_refuses_a_frame_that_is_not_the_next_expected_id)
 {
-  // PHASE3 4.T13. The same four well-formed frames, in reverse order. HOW MANY decode is an
-  // implementation detail of the cursor and is deliberately not asserted; what is asserted is
-  // that no servo's data ever lands in another servo's slot. A naive positional parser passes
-  // 4.T10 and fails exactly here, which is why this case exists.
+  // Reversed frames: the count is not asserted, only that no slot holds another servo's data.
   const std::vector<uint8_t> burst = burst_of({3, 2, 1, 0});
   const std::vector<uint8_t> ids = {1, 2, 3, 4};
   std::vector<FeedbackBlock> blocks;
@@ -2091,16 +1869,8 @@ TEST(ServoBus, parse_sync_read_burst_refuses_a_frame_that_is_not_the_next_expect
 
 TEST(ServoBus, parse_sync_read_burst_never_refills_a_slot_the_cursor_has_passed)
 {
-  // PHASE3 2.34, the branch 4.T13 cannot reach. 4.T13's reversed burst fills slot 3 on its first
-  // frame and the walk then ends, so a walker that searched the WHOLE id list from 0 every time
-  // would pass it unchanged; this is the case that separates the two. The burst carries a second,
-  // stale frame for id 1 -- well formed, correct checksum, but behind the cursor -- between the
-  // frames of ids 2 and 3, which is what probe 3 Q6 measured coming off the wire: 71 frames whose
-  // id did not belong in the slot, in 3000 reads at a 1 ms timeout.
-  //
-  // A global id search rewinds the cursor and overwrites slot 0 with the stale sample; the
-  // forward-only search refuses the frame outright. The stale copy is doctored to position 0 so
-  // the difference is a value, not just a count.
+  // A stale duplicate of id 1 behind the cursor must be refused: the search only moves forward.
+  // A search from slot 0 would overwrite slot 0 with the stale (position 0) sample.
   std::vector<uint8_t> burst = burst_of({0, 1, 0, 2});
   burst[2 * kFrameBytes + 5] = 0x00;
   burst[2 * kFrameBytes + 6] = 0x00;
@@ -2128,11 +1898,7 @@ TEST(ServoBus, parse_sync_read_burst_never_refills_a_slot_the_cursor_has_passed)
 
 TEST(ServoBus, parse_sync_read_burst_resyncs_one_byte_at_a_time_after_a_rejected_frame)
 {
-  // PHASE3 2.33: a rejection advances by ONE byte, never by a whole frame. The difference only
-  // shows on a buffer whose real frames are not on 21-byte boundaries, which is precisely the
-  // buffer the rule exists for -- three stray bytes ahead of the capture make a well-formed
-  // header for a foreign id (0x63 is on no one's request list), and the real burst then starts at
-  // offset 3. Skipping 21 bytes past that rejection lands mid-frame and loses id 1 entirely.
+  // A rejected frame advances the walk one byte, not 21: three stray bytes shift every frame here.
   std::vector<uint8_t> burst = {0xff, 0xff, 0x63};
   burst.insert(burst.end(), kBenchBurst.begin(), kBenchBurst.end());
 
@@ -2153,10 +1919,7 @@ TEST(ServoBus, parse_sync_read_burst_resyncs_one_byte_at_a_time_after_a_rejected
 
 TEST(ServoBus, parse_sync_read_burst_adds_to_the_counters_rather_than_assigning_them)
 {
-  // PHASE3 2.35 / 2.6: an id list longer than sync_read_max_ids is several chunks and several
-  // walks, and the counters are session totals. Assigning instead of adding would make every
-  // chunked read report only its last chunk's failures, and the README's per-million figure and
-  // the bench's H11.fail_rate gate are both built on these two numbers.
+  // The counters are session totals across chunks: add to them, never assign.
   std::vector<uint8_t> burst = burst_of({0, 1, 2, 3});
   burst[kFrameBytes + 5 + 7] = 0x23;    // servo 2's temperature, checksum left stale
   const std::vector<uint8_t> ids = {1, 2, 3, 4};
@@ -2175,15 +1938,8 @@ TEST(ServoBus, parse_sync_read_burst_adds_to_the_counters_rather_than_assigning_
 
 TEST(ServoBus, parse_sync_read_burst_rejects_only_the_frame_that_failed_the_gate)
 {
-  // PHASE3 4.T14 as rewritten by R3. A rejected frame does NOT stop the parse: each 21-byte frame
-  // is independently verifiable -- header, id in its slot, length byte and its own checksum -- so
-  // one bad frame says nothing about the next, and stopping would turn one corrupted reply into
-  // three lost joints.
-  //
-  // Servo 2's temperature byte is flipped and its checksum left alone, so the frame fails gate
-  // step 4 and nothing else. The precondition R3 states holds here: no `FF FF` pair appears
-  // anywhere inside frame 2's body for the one-byte resync to latch on to, so the walk runs on to
-  // frame 3's real header.
+  // One bad checksum costs one slot and the walk goes on. This holds because frame 2 has no ff ff
+  // pair for the one-byte resync to latch on to.
   std::vector<uint8_t> burst = burst_of({0, 1, 2, 3});
   const std::size_t temperature = kFrameBytes + 5 + 7;
   ASSERT_EQ(burst[temperature], 0x22);
@@ -2209,12 +1965,8 @@ TEST(ServoBus, parse_sync_read_burst_rejects_only_the_frame_that_failed_the_gate
 
 TEST(ServoBus, parse_sync_read_burst_never_reads_past_the_buffer)
 {
-  // PHASE3 4.T15 / 2.32. A 21-byte buffer of all 0x01 against the id 1 is the exact shape that
-  // makes the vendored syncReadPacketRx read 18 bytes past the end: its resync loop runs to the
-  // end without finding `FF FF`, the last byte happens to equal the requested id, and
-  // src/SCS.cpp:355,358,361,365 then read 1 + 1 + 15 + 1 bytes beyond syncReadRxBuffLen
-  // (ASAN-confirmed, recon/packets.md 3.4). The `pos + 21 <= len` guard, evaluated before any
-  // byte of a frame is touched, is the whole fix.
+  // All-0x01 input makes the library's syncReadPacketRx read 18 bytes past the end; the walker's
+  // `pos + 21 <= len` check prevents that.
   const std::vector<uint8_t> ids = {1};
   std::vector<FeedbackBlock> blocks;
   const std::vector<uint8_t> all_ones(ServoBus::sync_read_frame_bytes, 0x01);
@@ -2229,9 +1981,7 @@ TEST(ServoBus, parse_sync_read_burst_never_reads_past_the_buffer)
   EXPECT_EQ(parse_sync_read_burst(all_ones.data(), 1, ids, &blocks, nullptr), 0u);
   EXPECT_EQ(parse_sync_read_burst(header.data(), header.size(), ids, &blocks, nullptr), 0u);
 
-  // and a frame that is well formed in every way except its length byte, which claims 0x12 where
-  // the 15-byte block makes it 0x11. SCS::Read never checks that byte at all (src/SCS.cpp:190-199,
-  // recon/packets.md landmine 12); the wrapper does, because it costs one comparison.
+  // Only the length byte is wrong (0x12, not 0x11). SCS::Read never checks it; the walker does.
   std::vector<uint8_t> wrong_length(kBenchBurst.begin(), kBenchBurst.begin() + kFrameBytes);
   wrong_length[3] = 0x12;
   repair(wrong_length, 0);
@@ -2239,13 +1989,8 @@ TEST(ServoBus, parse_sync_read_burst_never_reads_past_the_buffer)
     parse_sync_read_burst(wrong_length.data(), wrong_length.size(), ids, &blocks, nullptr), 0u);
   EXPECT_FALSE(blocks[0].valid);
 
-  // `length` is what readSCS returned, NOT the buffer's size, and that is the shape the shipped
-  // transaction layer calls with: the 648-byte rx_buf_ is reused every cycle (PHASE3 2.13-2.14),
-  // so every byte past `length` is still inside the allocation and holds last cycle's burst. No
-  // sanitizer can see a walker that trusts the allocation instead of the count -- only the return
-  // value can. A reply one byte short of its last frame must leave that slot empty rather than
-  // publish the previous cycle's frame as this cycle's sample, which is the contamination R8
-  // banned io_timeout_ms = 1 for (probe 3 Q4/Q6).
+  // Parse only `length` bytes: past it, the reused 648-byte buffer still holds the last burst.
+  // See docs/design.md, "Receive buffer".
   std::vector<uint8_t> rx(ServoBus::sync_read_buffer_bytes, 0);
   std::copy(kBenchBurst.begin(), kBenchBurst.end(), rx.begin());
   const std::vector<uint8_t> four = {1, 2, 3, 4};
@@ -2256,24 +2001,13 @@ TEST(ServoBus, parse_sync_read_burst_never_reads_past_the_buffer)
   EXPECT_FALSE(blocks[3].valid);
 }
 
-// ---------------------------------------------------------------------------------------------
-// PHASE3 C3 stage C: the fake bus on trial before anything depends on it (4.T24-4.T26).
-//
-// These drive a plain ServoBus straight at the vendored syncReadPacketTx, so what they pin is the
-// harness's reply burst and none of the wrapper's own transaction layer. The suite name is
-// FakeBusSyncRead and deliberately not ServoBusSyncRead: stage D declares a fixture class of that
-// name and GoogleTest refuses to run a suite whose cases do not all share one fixture
-// (PHASE3 4 section 3.3).
-// ---------------------------------------------------------------------------------------------
+// ---- FakeBus sync-read replies on their own. Not named ServoBusSyncRead: gtest needs one
+// fixture per suite name. ----
 
 namespace
 {
 
-// The four servos every sync-read case below starts from. Every field differs per servo, so a
-// block attributed to the wrong slot is visible rather than plausible, and no two bytes of any
-// reply are `ff ff`: a false header inside a payload would let the walker resync onto it after a
-// rejected frame and claim a second bad frame, which is what PHASE3 2.107's `bad_frames == 1`
-// would then be measuring instead of the gate.
+// Every field differs per servo, and no reply holds an ff ff pair (a false header).
 void seed_four_servos(waveshare_servos_test::FakeBus * fake)
 {
   for (uint8_t id = 1; id <= 4; id++) {
@@ -2284,9 +2018,7 @@ void seed_four_servos(waveshare_servos_test::FakeBus * fake)
   }
 }
 
-// One raw sync read through the vendored request builder, with the receive buffer supplied by the
-// caller. Stage C owns that buffer itself rather than leaning on the one PHASE3 2.13 gives the
-// constructor, so these cases stay a statement about the harness alone.
+// One raw sync read via the vendored request builder, into a receive buffer the caller owns.
 int raw_sync_read(ServoBus * bus, std::vector<uint8_t> * rx, const std::vector<uint8_t> & ids)
 {
   rx->assign(ids.size() * kFrameBytes + ServoBus::sync_read_slack_bytes, 0);
@@ -2302,10 +2034,7 @@ int raw_sync_read(ServoBus * bus, std::vector<uint8_t> * rx, const std::vector<u
 
 TEST(FakeBusSyncRead, the_fake_bus_is_silent_for_an_absent_id_and_answers_for_the_rest)
 {
-  // PHASE3 4.T25. An absent servo contributes no bytes at all -- not a short frame, not an error
-  // frame -- so the burst is three frames and the caller still waits the whole io_timeout_ms for
-  // the 84 bytes it asked for. That is the shape probe 1 Q5 measured on the bench and the reason
-  // a missing servo costs one timeout and not four (PHASE3 2.106).
+  // A silent servo sends nothing: 63 of 84 bytes arrive and the read waits one full timeout.
   waveshare_servos_test::FakeBus fake;
   seed_four_servos(&fake);
   fake.set_absent(2, true);
@@ -2329,10 +2058,7 @@ TEST(FakeBusSyncRead, the_fake_bus_is_silent_for_an_absent_id_and_answers_for_th
       "frame " << frame;
   }
 
-  // The absent servo answered nothing, but it WAS named in the request. The two counters have to
-  // be separable: sync_reads is bumped after the absent check, so it cannot tell "not asked" from
-  // "asked and silent", and the driver case that proves an absent servo is never put in the id
-  // list at all (PHASE3 3.38, F14) would then assert nothing (3 section H amendment).
+  // sync_read_named counts requests that name the servo, absent or not; sync_reads does not.
   EXPECT_EQ(fake.snapshot(2).sync_reads, 0);
   EXPECT_EQ(fake.snapshot(2).sync_read_named, 1);
   EXPECT_EQ(fake.snapshot(1).sync_read_named, 1);
@@ -2341,9 +2067,7 @@ TEST(FakeBusSyncRead, the_fake_bus_is_silent_for_an_absent_id_and_answers_for_th
 
 TEST(FakeBusSyncRead, the_fake_bus_answers_a_sync_read_with_one_frame_per_listed_servo)
 {
-  // PHASE3 4.T24 / F4. The request is the vendored builder's -- FF FF FE (IDN+4) 82 38 0F <ids>
-  // ~cks -- and what this pins is that the harness parses it and answers it the way the hardware
-  // does: one ordinary status frame per listed servo, back to back, in ID-LIST ORDER.
+  // Request FF FF FE (IDN+4) 82 38 0F ids ~chk. Reply: one status frame per id, in list order.
   waveshare_servos_test::FakeBus fake;
   seed_four_servos(&fake);
   ServoBus bus;
@@ -2367,7 +2091,7 @@ TEST(FakeBusSyncRead, the_fake_bus_answers_a_sync_read_with_one_frame_per_listed
   for (uint8_t id = 1; id <= 4; id++) {
     const waveshare_servos_test::FakeServo servo = fake.snapshot(id);
     EXPECT_EQ(servo.sync_reads, 1) << "id " << static_cast<int>(id);
-    // A sync read counts as a feedback read, deliberately (PHASE3 4.H11).
+    // A sync read also counts as a feedback read, on purpose.
     EXPECT_EQ(servo.feedback_reads, 1) << "id " << static_cast<int>(id);
     ASSERT_FALSE(servo.sync_read_requests.empty()) << "id " << static_cast<int>(id);
     EXPECT_EQ(servo.sync_read_requests.back().first, 56) << "id " << static_cast<int>(id);
@@ -2380,9 +2104,7 @@ TEST(FakeBusSyncRead, the_fake_bus_answers_a_sync_read_with_one_frame_per_listed
 
 TEST(FakeBusSyncRead, the_fake_bus_can_delay_truncate_and_mis_sum_a_burst)
 {
-  // PHASE3 4.T26 / 4.H6-4.H8. The three failure knobs the wrapper's error path is tested with, on
-  // trial themselves. Each phase clears the previous one, so the burst is only ever wrong in the
-  // one way the phase is about.
+  // The fake's three reply faults, one at a time; each step clears the one before.
   waveshare_servos_test::FakeBus fake;
   seed_four_servos(&fake);
   ServoBus bus;
@@ -2390,8 +2112,7 @@ TEST(FakeBusSyncRead, the_fake_bus_can_delay_truncate_and_mis_sum_a_burst)
   std::vector<uint8_t> rx;
   const int whole = 4 * static_cast<int>(kFrameBytes);
 
-  // Phase 1: the delay, compared only against an undelayed read of the same burst. Never an
-  // absolute bound -- the house rule at a_silent_bus_costs_one_io_timeout.
+  // Step 1: delay, compared with an undelayed read of the same burst.
   const auto prompt_started = std::chrono::steady_clock::now();
   ASSERT_EQ(raw_sync_read(&bus, &rx, {1, 2, 3, 4}), whole);
   const auto prompt = std::chrono::steady_clock::now() - prompt_started;
@@ -2402,14 +2123,12 @@ TEST(FakeBusSyncRead, the_fake_bus_can_delay_truncate_and_mis_sum_a_burst)
   EXPECT_GT(delayed, prompt) << "a delayed burst must take measurably longer than a prompt one";
   fake.set_sync_read_delay_ms(0);
 
-  // Phase 2: the tail cut off mid frame. 10 bytes is half of the last frame, which is the shape
-  // an over-reading parser decodes from short data (PHASE3 4.T33).
+  // Step 2: cut 10 bytes, half of the last frame.
   fake.set_sync_read_truncate_bytes(10);
   EXPECT_EQ(raw_sync_read(&bus, &rx, {1, 2, 3, 4}), whole - 10);
   fake.set_sync_read_truncate_bytes(0);
 
-  // Phase 3: one frame well formed and mis-summed. The burst keeps its length; only servo 3's
-  // checksum stops verifying, and the other three still do.
+  // Step 3: servo 3's frame keeps its length but fails its checksum.
   fake.set_sync_read_bad_checksum(3);
   EXPECT_EQ(raw_sync_read(&bus, &rx, {1, 2, 3, 4}), whole);
   for (std::size_t frame = 0; frame < 4; frame++) {
@@ -2425,9 +2144,7 @@ TEST(FakeBusSyncRead, the_fake_bus_can_delay_truncate_and_mis_sum_a_burst)
   bus.close();
 }
 
-// ---------------------------------------------------------------------------------------------
-// PHASE3 C3 stage D: the sync-read transaction through ServoBus (4.T27-4.T36, 2.99, 2.101-2.116).
-// ---------------------------------------------------------------------------------------------
+// ---- The sync-read transaction through ServoBus ----
 
 namespace
 {
@@ -2464,9 +2181,7 @@ void expect_block_eq(const FeedbackBlock & got, const FeedbackBlock & want, cons
   EXPECT_EQ(got.current_counts, want.current_counts) << w;
 }
 
-// A ServoBus wired to the full fake bus of test/fake_servo_bus.hpp rather than to this file's
-// cut-down FakeResponder: the sync-read cases need several servos, per-servo counters and the
-// failure knobs of PHASE3 4.H4-4.H8, none of which the local responder has.
+// ServoBus on the full FakeBus: several servos, per-servo counters and reply faults.
 class ServoBusSyncRead : public ::testing::Test
 {
 protected:
@@ -2481,8 +2196,7 @@ protected:
   void TearDown() override
   {
     bus_.close();
-    // The reply-corruption knobs corrupt the REPLY, and the fake checksum-verifies only what it
-    // RECEIVES (fake_servo_bus.hpp:337-344), so neither counter may move (PHASE3 2.94).
+    // Reply faults do not move these: the fake checks only the requests it receives.
     EXPECT_EQ(fake_.bad_checksums(), 0u) << "the wire itself misbehaved";
     EXPECT_EQ(fake_.quiet_timeouts(), 0u) << "wait_quiet gave up";
   }
@@ -2496,8 +2210,7 @@ protected:
 
 TEST_F(ServoBusSyncRead, sync_read_feedback_fills_one_block_per_id_in_request_order)
 {
-  // PHASE3 4.T27 / 2.101. One INST_SYNC_READ carries all four feedback blocks, and every slot is
-  // its own servo's: `blocks[k] is ids[k]'s reply` is the whole contract the driver indexes by.
+  // One sync read fills all four slots; blocks[k] is always ids[k]'s reply.
   const std::vector<uint8_t> ids = {1, 2, 3, 4};
   EXPECT_EQ(bus_.sync_read_feedback(ids, blocks_), 4u);
   ASSERT_EQ(blocks_.size(), 4u);
@@ -2517,9 +2230,7 @@ TEST_F(ServoBusSyncRead, sync_read_feedback_fills_one_block_per_id_in_request_or
 
 TEST_F(ServoBusSyncRead, sync_read_feedback_writes_every_slot_even_when_nobody_answers)
 {
-  // PHASE3 4.T28. Every slot is written on every call, so a failed transaction can never publish
-  // the previous cycle's sample as this cycle's. The first call fills all four on purpose: a
-  // wrapper that only writes the slots that decoded passes this case without it.
+  // Every slot is written on every call, so a failed read never republishes an old sample.
   const std::vector<uint8_t> ids = {1, 2, 3, 4};
   ASSERT_EQ(bus_.sync_read_feedback(ids, blocks_), 4u);
   fake_.set_sync_read_supported(false);
@@ -2537,12 +2248,7 @@ TEST_F(ServoBusSyncRead, sync_read_feedback_writes_every_slot_even_when_nobody_a
 
 TEST_F(ServoBusSyncRead, sync_read_feedback_agrees_field_for_field_with_read_feedback_one)
 {
-  // PHASE3 4.T29 / F9. The two transports are proved equal once, here at the seam, instead of
-  // forever: read_feedback_one issues Read(id, 56, ., 15), which is byte for byte the transaction
-  // FeedBack(id) makes (src/SMS_STS.cpp:123), and both paths run the SAME decoder. The fake is a
-  // register file with no ADC, so equality is exact -- the bench twin of this check has to allow
-  // +/-1 LSB on voltage and temperature, because two reads of the same servo by the same path
-  // differ that often (probe 1 Q2).
+  // Same decoder on both paths, so equality is exact here (the fake has no ADC noise).
   const std::vector<uint8_t> ids = {1, 2, 3, 4};
   ASSERT_EQ(bus_.sync_read_feedback(ids, blocks_), 4u);
   for (std::size_t slot = 0; slot < 4; slot++) {
@@ -2554,10 +2260,7 @@ TEST_F(ServoBusSyncRead, sync_read_feedback_agrees_field_for_field_with_read_fee
 
 TEST_F(ServoBusSyncRead, sync_read_feedback_matches_feedback_and_the_accessors_for_the_same_servo)
 {
-  // PHASE3 2.104 / F10. The other half of the equality: against the vendored FeedBack() plus the
-  // seven ReadX(-1) accessors, which is what Phase 2 published and what may not change. Nothing
-  // in the package calls an accessor after this chunk (R15), so this case is the record of what
-  // they used to answer.
+  // Equal to FeedBack() plus the seven ReadX(-1) accessors, which the driver no longer calls.
   const std::vector<uint8_t> ids = {1, 2, 3, 4};
   ASSERT_EQ(bus_.sync_read_feedback(ids, blocks_), 4u);
   for (std::size_t slot = 0; slot < 4; slot++) {
@@ -2575,13 +2278,9 @@ TEST_F(ServoBusSyncRead, sync_read_feedback_matches_feedback_and_the_accessors_f
 
 TEST_F(ServoBusSyncRead, the_receive_buffer_is_sized_to_the_id_list_and_owned_by_the_wrapper)
 {
-  // PHASE3 4.T30 / 2.15-2.17 / 2.102. syncReadRxBuffMax is the number of bytes readSCS waits for
-  // before it returns early (src/SCS.cpp:318, src/SCSerial.cpp:165-169), so it must be EXACTLY
-  // what this chunk's repliers owe. Oversized burns a whole io_timeout_ms on every healthy cycle
-  // -- probe 1 Q5 measured +18.6 ms at a 20 ms timeout, a 12.6x blow-up -- and undersized
-  // truncates the tail.
+  // syncReadRxBuffMax must be n * 21: readSCS returns early only when that many bytes arrive.
   const uint8_t * const buffer = bus_.syncReadRxBuff;
-  ASSERT_NE(buffer, nullptr) << "the constructor owns the buffer (PHASE3 2.13)";
+  ASSERT_NE(buffer, nullptr) << "the constructor owns the buffer";
   const std::vector<uint8_t> all = {1, 2, 3, 4};
   for (std::size_t n = 1; n <= all.size(); n++) {
     const std::vector<uint8_t> ids(all.begin(), all.begin() + static_cast<std::ptrdiff_t>(n));
@@ -2597,9 +2296,7 @@ TEST_F(ServoBusSyncRead, the_receive_buffer_is_sized_to_the_id_list_and_owned_by
     ServoBus::sync_read_slack_bytes,
     "the receive buffer no longer carries the nLen + 3 bytes of slack");
 
-  // No allocation after the first call, on the two proxies a test can actually observe: rx_buf_
-  // and tx_ids_ are private, so what is checked is the caller's vector and the public pointer
-  // that IS rx_buf_.data() (PHASE3 2.17).
+  // No allocation after the first call, seen through the caller's vector and syncReadRxBuff.
   const std::size_t capacity = blocks_.capacity();
   for (int cycle = 0; cycle < 100; cycle++) {
     ASSERT_EQ(bus_.sync_read_feedback(all, blocks_), 4u) << "cycle " << cycle;
@@ -2610,10 +2307,8 @@ TEST_F(ServoBusSyncRead, the_receive_buffer_is_sized_to_the_id_list_and_owned_by
 
 TEST_F(ServoBusSyncRead, sync_read_feedback_never_replaces_the_receive_buffer)
 {
-  // PHASE3 4.T31 / 2.103 / 2.13. syncReadBegin() allocates with `new u8[]` and syncReadEnd() frees
-  // with a scalar `delete` (src/SCS.cpp:325,331) -- mismatched, UB, a leak if begin is called
-  // twice, and a double free if it were ever handed the vector's storage. Both stay uncalled
-  // forever, and the pointer the constructor installed is the proof.
+  // syncReadBegin/End are never called (new[] freed by scalar delete); the constructor's buffer
+  // stays for the life of the object.
   const uint8_t * const from_the_constructor = bus_.syncReadRxBuff;
   ASSERT_NE(from_the_constructor, nullptr);
   const std::vector<uint8_t> ids = {1, 2, 3, 4};
@@ -2621,17 +2316,14 @@ TEST_F(ServoBusSyncRead, sync_read_feedback_never_replaces_the_receive_buffer)
     ASSERT_EQ(bus_.sync_read_feedback(ids, blocks_), 4u) << "cycle " << cycle;
     ASSERT_EQ(bus_.syncReadRxBuff, from_the_constructor) << "cycle " << cycle;
   }
-  // close() leaves the buffer alone too: it belongs to the object, not to the session, and
-  // clearing it would only open a window where the pointer is stale (PHASE3 2.18).
+  // close() keeps the buffer: it belongs to the object, not to the session.
   bus_.close();
   EXPECT_EQ(bus_.syncReadRxBuff, from_the_constructor);
 }
 
 TEST_F(ServoBusSyncRead, an_absent_servo_fails_alone_and_the_others_still_decode)
 {
-  // PHASE3 4.T32 / R3. Nothing on the bus at id 2: no frame at all, so the burst is 63 of the 84
-  // bytes asked for. The other three frames are perfect -- 1200/1200 real decodes in every
-  // absent-id case on the bench (probe 1 Q5) -- and exactly one slot is lost, not four.
+  // Id 2 is absent: 63 of 84 bytes arrive and only slot 1 is lost.
   fake_.set_absent(2, true);
   const std::vector<uint8_t> ids = {1, 2, 3, 4};
 
@@ -2649,10 +2341,8 @@ TEST_F(ServoBusSyncRead, an_absent_servo_fails_alone_and_the_others_still_decode
 
 TEST_F(ServoBusSyncRead, a_servo_missing_from_the_burst_leaves_only_its_own_slot_invalid)
 {
-  // PHASE3 2.105. The other absence: servo 3 is on the bus and answers pings, but never answers
-  // the feedback block. The wrapper cannot tell the two apart and must not try -- and note that a
-  // silent servo keeps status == 0, which is also what every HEALTHY servo on this bench reports
-  // (probe 1 Q1), so the driver must key on `valid` and never on `status == 0` (PHASE3 2.50).
+  // A silent servo's slot has status 0, as a healthy one has: callers must test valid, not status.
+  // See docs/design.md, "Feedback block".
   fake_.set_silent_feedback(3, true);
   const std::vector<uint8_t> ids = {1, 2, 3, 4};
 
@@ -2670,10 +2360,8 @@ TEST_F(ServoBusSyncRead, a_servo_missing_from_the_burst_leaves_only_its_own_slot
 
 TEST_F(ServoBusSyncRead, a_missing_servo_costs_one_io_timeout_for_the_whole_burst)
 {
-  // PHASE3 2.106 / 2.23. One INST_SYNC_READ is ONE readSCS() for the whole chunk
-  // (src/SCS.cpp:318), so a silent servo costs one timeout however many servos are listed -- not
-  // one per servo, which is what the per-servo FeedBack() path would have cost. Banded the way
-  // a_silent_bus_costs_one_io_timeout is: never an absolute figure.
+  // One sync read is one readSCS(): a silent servo costs one timeout per chunk, not per servo.
+  // See docs/bus-timing.md, "Cost of a silent servo".
   ASSERT_TRUE(bus_.set_io_timeout_ms(50));
   fake_.set_silent_feedback(3, true);
   const std::vector<uint8_t> ids = {1, 2, 3, 4};
@@ -2689,9 +2377,7 @@ TEST_F(ServoBusSyncRead, a_missing_servo_costs_one_io_timeout_for_the_whole_burs
 
 TEST_F(ServoBusSyncRead, a_truncated_burst_fails_only_the_servos_it_cut)
 {
-  // PHASE3 4.T33. A reply cut mid frame is the shape that makes an over-reading parser decode a
-  // block from bytes that are not there. The `pos + 21 <= len` guard is checked before any byte
-  // of a frame is touched, so 11 of 21 bytes is refused rather than decoded short.
+  // Cut mid-frame: the `pos + 21 <= len` check refuses a short frame before reading it.
   const std::vector<uint8_t> ids = {1, 2, 3, 4};
   for (const std::size_t cut : {ServoBus::sync_read_frame_bytes, std::size_t{10}}) {
     fake_.set_sync_read_truncate_bytes(cut);
@@ -2707,14 +2393,7 @@ TEST_F(ServoBusSyncRead, a_truncated_burst_fails_only_the_servos_it_cut)
 
 TEST_F(ServoBusSyncRead, a_frame_with_a_bad_checksum_invalidates_only_its_own_slot)
 {
-  // PHASE3 4.T34 as R3 rewrites it, and 2.107. Each 21-byte frame is independently verifiable --
-  // header, id in its slot, length byte and its own checksum -- so one bad frame says nothing
-  // about the next: the walker rejects it, resyncs by ONE byte and carries on. Stopping the parse
-  // would turn one corrupted reply into three lost joints.
-  //
-  // `bad_frames == 1` exactly is only sound because the seeded registers contain no `ff ff` pair
-  // (see seed_four_servos): the one-byte resync after the rejected frame would otherwise find a
-  // false header inside it and claim a second bad frame.
+  // One bad checksum invalidates one slot (seed_four_servos says why bad_frames is exactly 1).
   fake_.set_sync_read_bad_checksum(2);
   const std::vector<uint8_t> ids = {1, 2, 3, 4};
 
@@ -2726,8 +2405,7 @@ TEST_F(ServoBusSyncRead, a_frame_with_a_bad_checksum_invalidates_only_its_own_sl
   expect_block_eq(blocks_[3], seeded_block(4), "slot 3");
   const SyncReadStats stats = bus_.sync_read_stats();
   EXPECT_EQ(stats.bad_frames, 1u);
-  // The burst was full length, so this is NOT a short burst and nothing is drained: the three
-  // failure kinds have to stay distinguishable in the counters (PHASE3 2.116).
+  // Full length: not a short burst, so no drain. The failure kinds stay separate in the counters.
   EXPECT_EQ(stats.short_bursts, 0u);
   EXPECT_EQ(stats.drains, 0u);
   fake_.set_sync_read_bad_checksum(0);
@@ -2735,10 +2413,7 @@ TEST_F(ServoBusSyncRead, a_frame_with_a_bad_checksum_invalidates_only_its_own_sl
 
 TEST_F(ServoBusSyncRead, a_frame_carrying_an_unrequested_id_is_discarded)
 {
-  // PHASE3 2.108. The check syncReadPacketRx's return value never gave us: it accepts any frame
-  // anywhere in the buffer that carries the id it was asked about and never looks at the id's
-  // SLOT (src/SCS.cpp:352-355). On the bench at a 1 ms timeout that let 71 frames in 3000 reads
-  // sit in the wrong slot (probe 3 Q6), each one a foreign servo's data published as this one's.
+  // A frame with an unrequested id is discarded; syncReadPacketRx never checks the id's slot.
   fake_.set_reply_id_override(2, 7);
   const std::vector<uint8_t> ids = {1, 2, 3, 4};
 
@@ -2754,9 +2429,7 @@ TEST_F(ServoBusSyncRead, a_frame_carrying_an_unrequested_id_is_discarded)
 
 TEST_F(ServoBusSyncRead, a_frame_with_a_wrong_length_byte_is_discarded)
 {
-  // PHASE3 2.109. The knob keeps the frame the same length on the wire and repairs its checksum,
-  // so the only thing under test is gate step 3. SCS::Read never checks that byte at all
-  // (src/SCS.cpp:190-199, recon/packets.md landmine 12); the wrapper does, for one comparison.
+  // Length byte off by one, checksum repaired: only the length check (gate step 3) catches it.
   fake_.set_reply_length_delta(2, +1);
   const std::vector<uint8_t> ids = {1, 2, 3, 4};
 
@@ -2772,11 +2445,7 @@ TEST_F(ServoBusSyncRead, a_frame_with_a_wrong_length_byte_is_discarded)
 
 TEST_F(ServoBusSyncRead, replies_that_arrive_out_of_request_order_are_never_misattributed)
 {
-  // PHASE3 4.T35. The negative control for the forward-only slot match: every frame is
-  // individually perfect and the burst as a whole is backwards. A positional parser reports four
-  // successful reads with the data rotated, which is the one failure mode a control loop cannot
-  // see. How many decode is deliberately not asserted -- only that nothing decodes as somebody
-  // else.
+  // Replies in reverse order: nothing may decode as another servo; the count is not asserted.
   fake_.set_sync_read_reply_order(waveshare_servos_test::SyncReadReplyOrder::reversed);
   const std::vector<uint8_t> ids = {1, 2, 3, 4};
 
@@ -2792,17 +2461,13 @@ TEST_F(ServoBusSyncRead, replies_that_arrive_out_of_request_order_are_never_misa
 
 TEST_F(ServoBusSyncRead, each_frames_status_byte_lands_on_its_own_servo)
 {
-  // PHASE3 2.110 / 4.T51 / F18. The status byte is frame byte 4 of the servo's OWN frame, taken
-  // out of the same 21 bytes as its data with no bus call in between -- not SCS::Error, which
-  // Ping, Ack and Read all rewrite with different meanings, and which syncReadPacketRx leaves
-  // holding the PREVIOUS transaction's value for an absent id (measured with a 0xee poison,
-  // probe 1 Q4). The four values are the ones that probe doctored a real capture with.
+  // Each status byte comes from its servo's own frame, never from SCS::Error.
   const std::array<uint8_t, 4> statuses = {0x11, 0x22, 0x44, 0x88};
   for (uint8_t id = 1; id <= 4; id++) {
     fake_.set_status(id, statuses[id - 1]);
   }
 
-  // Once in ascending order, once descending, which is how probe 1 Q4 ruled out positional luck.
+  // Ascending, then descending: rules out positional luck.
   for (const std::vector<uint8_t> & ids :
     {std::vector<uint8_t>{1, 2, 3, 4}, std::vector<uint8_t>{4, 3, 2, 1}})
   {
@@ -2817,9 +2482,7 @@ TEST_F(ServoBusSyncRead, each_frames_status_byte_lands_on_its_own_servo)
 
 TEST_F(ServoBusSyncRead, sync_read_feedback_leaves_scs_error_untouched)
 {
-  // PHASE3 2.111 / 2.28. Nothing on this path may read or write SCS::Error. It is one shared byte
-  // that Ping, Ack and Read each give a different meaning (src/SCS.cpp:201,261,267,292), so a
-  // burst that routed its status bytes through it could not keep them apart for four servos.
+  // The sync path must not touch SCS::Error: Ping, Ack and Read each give it a different meaning.
   fake_.set_status(2, 0x22);
   bus_.Error = 0xee;
   const std::vector<uint8_t> ids = {1, 2, 3, 4};
@@ -2832,15 +2495,8 @@ TEST_F(ServoBusSyncRead, sync_read_feedback_leaves_scs_error_untouched)
 
 TEST_F(ServoBusSyncRead, a_sync_read_signs_its_values_even_when_err_is_set)
 {
-  // PHASE3 2.99 / F11 / R15. The one intentional difference from the vendored accessors: the sign
-  // is applied unconditionally. ReadSpeed/ReadLoad/ReadPos/ReadCurrent(-1) all return the RAW word
-  // when SMS_STS::Err is non-zero (src/SMS_STS.cpp:146,168,188,254), so a stale failed FeedBack()
-  // anywhere in the process would publish 33768 instead of -1000. Poisoning Err here is what
-  // fails the moment anyone routes the sync path back through those accessors.
-  //
-  // It has to be a BUS case and not a decoder case: decode_feedback_block is a free function over
-  // 15 bytes, so setting Err on some unrelated object could not change its answer and the
-  // assertion would be vacuous.
+  // Signs apply even with Err set; ReadX(-1) would return the raw word (33768, not -1000).
+  // A bus case, because the free decoder cannot see Err.
   fake_.set_feedback(1, -1000, -250, -300, 121, 41, 1, -700);
   bus_.Err = 1;
   const std::vector<uint8_t> ids = {1};
@@ -2851,14 +2507,12 @@ TEST_F(ServoBusSyncRead, a_sync_read_signs_its_values_even_when_err_is_set)
   EXPECT_EQ(blocks_[0].speed_ticks, -250);
   EXPECT_EQ(blocks_[0].load_raw, -300);
   EXPECT_EQ(blocks_[0].current_counts, -700);
-  EXPECT_EQ(bus_.Err, 1) << "and the sync path leaves the accessors' own gate alone (PHASE3 2.29)";
+  EXPECT_EQ(bus_.Err, 1) << "and the sync path leaves the accessors' own gate alone";
 }
 
 TEST_F(ServoBusSyncRead, an_empty_id_list_is_refused_without_touching_the_bus)
 {
-  // PHASE3 2.112 / 2.20. IDN == 0 would put FF FF FE 04 82 38 0F ~cks on the wire and then wait a
-  // whole timeout for zero bytes. The guard lives in the wrapper rather than at each call site so
-  // that no caller can forget it (R13's reasoning, applied to the read path).
+  // IDN 0 would still send a request and wait a full timeout; the wrapper refuses it.
   const std::vector<uint8_t> none;
   blocks_.assign(4, seeded_block(1));
 
@@ -2874,10 +2528,7 @@ TEST_F(ServoBusSyncRead, an_empty_id_list_is_refused_without_touching_the_bus)
 
 TEST_F(ServoBusSyncRead, a_closed_bus_refuses_a_sync_read)
 {
-  // PHASE3 2.113 / 2.21. Not merely pointless but dangerous: syncReadPacketTx ends in readSCS,
-  // which does FD_SET(fd, ...) (src/SCSerial.cpp:143-144), and with fd == -1 that shifts by a
-  // negative count and, with glibc's _FORTIFY_SOURCE fd_set check compiled in, aborts the whole
-  // test binary -- the same abort write_acc's port check exists for (PHASE3 1.30).
+  // Refused before readSCS: FD_SET(-1) aborts the process under _FORTIFY_SOURCE.
   const std::vector<uint8_t> ids = {1, 2, 3, 4};
   ServoBus never_opened;
   EXPECT_EQ(never_opened.sync_read_feedback(ids, blocks_), 0u);
@@ -2895,10 +2546,8 @@ TEST_F(ServoBusSyncRead, a_closed_bus_refuses_a_sync_read)
 
 TEST_F(ServoBusSyncRead, an_id_list_longer_than_thirty_is_split_into_chunks)
 {
-  // PHASE3 2.114 / 2.24. 30 ids per request, the same number the position sync write uses. The
-  // vendored limit is far higher -- the request is IDN + 8 bytes into the unchecked 255-byte
-  // txBuf -- but the burst must fit ONE io_timeout_ms, and at the measured 0.476 + 0.290n ms
-  // (probe 1 Q3) thirty ids is already ~9.2 ms, a whole 100 Hz period.
+  // 30 ids per sync read: at 0.476 + 0.290 n ms, 30 ids already take ~9.2 ms.
+  // See docs/bus-timing.md, "Cost per servo".
   std::vector<uint8_t> ids;
   for (uint8_t id = 1; id <= 40; id++) {
     if (id > 4) {
@@ -2923,17 +2572,8 @@ TEST_F(ServoBusSyncRead, an_id_list_longer_than_thirty_is_split_into_chunks)
 
 TEST_F(ServoBusSyncRead, a_short_burst_drains_the_line_before_the_next_transaction)
 {
-  // PHASE3 2.115 / 2.53. The contamination regression, and the case the whole error path exists
-  // for. A tcflush -- which is all rFlushSCS does -- can only discard bytes that have ALREADY
-  // arrived; the frame that poisons the next cycle is by definition one that has not. On the
-  // bench at a 1 ms timeout that produced 8 checksum-valid, correct-id, correct-length STALE
-  // frames in 3000 reads, the fastest completing in 0.371 ms against a 0.96 ms physical airtime
-  // (probe 3 Q4/Q6) -- data a control loop cannot tell from fresh. Reading the line out to a
-  // deadline is the only thing that fixes it: with a drain, all 2000 reads at 1 ms failed
-  // honestly instead (probe 3 Q4 row E).
-  //
-  // Servo 3's reply is held back two 1 ms poll windows, strictly inside io_timeout + drain, so
-  // the delayed frame lands during the drain and not during cycle 2's read window.
+  // A late frame must be drained, not read as the next cycle's reply: tcflush cannot drop bytes
+  // that have not arrived yet. See docs/design.md, "Late frames".
   ASSERT_TRUE(bus_.set_io_timeout_ms(2));
   fake_.set_reply_delay_polls(3, 2);
   const std::vector<uint8_t> ids = {1, 2, 3, 4};
@@ -2964,9 +2604,7 @@ TEST_F(ServoBusSyncRead, a_short_burst_drains_the_line_before_the_next_transacti
 
 TEST_F(ServoBusSyncRead, sync_read_stats_count_transactions_short_bursts_bad_frames_and_missing)
 {
-  // PHASE3 2.116. The five counters, moved by the three failure kinds one at a time, because the
-  // README number Phase 3 item 3 asks for is read straight out of them and a counter that lumps
-  // two failures together cannot be reported honestly.
+  // Five counters, moved one failure kind at a time, so each can be reported on its own.
   const std::vector<uint8_t> ids = {1, 2, 3, 4};
 
   // A clean burst moves the transaction count and nothing else. `drains == 0` is the assertion
@@ -2990,9 +2628,7 @@ TEST_F(ServoBusSyncRead, sync_read_stats_count_transactions_short_bursts_bad_fra
   EXPECT_EQ(stats.drains, 1u);
   fake_.set_silent_feedback(3, false);
 
-  // A corrupt frame: every byte arrived, so this is NOT a short burst and nothing is drained --
-  // but the id behind the rejected frame went unanswered, so missing_frames moves as well as
-  // bad_frames. The two overlap by design; they are not a partition of the burst.
+  // A bad frame moves bad_frames and missing_frames both (they overlap by design); no drain.
   fake_.set_sync_read_bad_checksum(2);
   ASSERT_EQ(bus_.sync_read_feedback(ids, blocks_), 3u);
   stats = bus_.sync_read_stats();
@@ -3006,11 +2642,7 @@ TEST_F(ServoBusSyncRead, sync_read_stats_count_transactions_short_bursts_bad_fra
 
 TEST_F(ServoBusSyncRead, sync_read_feedback_counts_what_it_lost)
 {
-  // PHASE3 4.T36. The scripted sequence the README's failure number is read out of: four clean
-  // bursts, one with an absent servo, one nobody answers. On this bench the real rate is 0 in
-  // 193,992 read transactions -- an upper bound of 29 per million at 95% confidence, by the rule
-  // of three (probe 3 Q1) -- so what the counter is for is making a DETERMINISTIC failure
-  // visible, not sampling a stochastic one.
+  // Scripted losses: 4 clean bursts, 1 with an absent servo, 1 that nobody answers.
   const std::vector<uint8_t> ids = {1, 2, 3, 4};
   for (int cycle = 0; cycle < 4; cycle++) {
     ASSERT_EQ(bus_.sync_read_feedback(ids, blocks_), 4u) << "cycle " << cycle;
@@ -3028,12 +2660,8 @@ TEST_F(ServoBusSyncRead, sync_read_feedback_counts_what_it_lost)
   fake_.set_sync_read_supported(true);
 }
 
-// ---------------------------------------------------------------------------------------------
-// PHASE6_SPEC D.1: what test/fake_servo_bus.hpp learned for the Phase 6 tools, on trial itself
-// before any tool is tested against it -- the FakeBusSyncRead precedent. Plain TESTs with their
-// own FakeBus, because two of them put a bad-checksum frame on the wire on purpose and the
-// fixtures above assert bad_checksums() == 0 on the way out.
-// ---------------------------------------------------------------------------------------------
+// ---- FakeBus features the tools use, tested first. Plain TESTs, because two of them send
+// bad-checksum frames on purpose. ----
 
 namespace
 {
@@ -3059,10 +2687,7 @@ using waveshare_servos_test::kRegOffset;
 using waveshare_servos_test::kRegPresentPosition;
 using waveshare_servos_test::kRegTorqueEnable;
 
-// A ServoBus that can also put on the wire what no vendored call would send as it stands -- raw
-// bytes, a request with no Ack() after it -- and read back whatever arrives, through the bus's own
-// raw-mode descriptor. writeBuf, writeSCS, wFlushSCS and readSCS are protected, so a derived type
-// is the only way to reach them; every other call is the ordinary ServoBus.
+// ServoBus plus raw access: send any bytes or a request with no Ack(), and read what arrives.
 struct RawWire : ServoBus
 {
   void send_raw(std::vector<uint8_t> bytes)
@@ -3093,7 +2718,7 @@ struct RawWire : ServoBus
     wFlushSCS();
   }
 
-  // FF FF id 02 06 ~sum, the frame of context/motor_reset_command_email.png
+  // RESET (0x06): FF FF id 02 06 ~checksum, no parameters.
   void send_reset(uint8_t id)
   {
     rFlushSCS();
@@ -3121,9 +2746,7 @@ int offset_word(const FakeBus & fake, uint8_t id)
 
 TEST(FakeBusTools, add_servo_seeds_its_id_register)
 {
-  // A real servo's register 5 IS its id. The tools read it back and refuse a servo whose id
-  // register disagrees with the id it answered at, so a fake that left it 0 would make every
-  // servo on it look inconsistent.
+  // Register 5 is the id; the tools refuse a servo whose register 5 differs from its answering id.
   FakeBus fake;
   fake.add_servo(7, 1);
   const FakeServo servo = fake.snapshot(7);
@@ -3141,9 +2764,7 @@ TEST(FakeBusTools, add_servo_seeds_its_id_register)
 
 TEST(FakeBusTools, descriptors_are_close_on_exec)
 {
-  // The CLI tests spawn the real tools on this fake. A child that inherited the master or the
-  // slave would hold the pty open after the parent is done with it -- and an inherited slave
-  // would show up in the child's own holder list. This is the only proof of the flag (D.5).
+  // The CLI tests spawn tools on this fake: an inherited master or slave would keep the pty open.
   FakeBus fake;
   const int master_flags = ::fcntl(fake.master_fd(), F_GETFD);
   const int slave_flags = ::fcntl(fake.slave_fd(), F_GETFD);
@@ -3155,9 +2776,7 @@ TEST(FakeBusTools, descriptors_are_close_on_exec)
 
 TEST(FakeBusTools, frame_log_records_requests_to_absent_unknown_and_broadcast_ids)
 {
-  // The frame log is what a coverage gate reads ("every id 0..253 was pinged three times"), so it
-  // must see a request whether or not anything answered it. Logged before the broadcast and the
-  // absent/unknown returns, or a scan of an empty bus would log nothing at all.
+  // The frame log records every request, answered or not: a scan's coverage check reads it.
   FakeBus fake;
   fake.add_servo(1);
   fake.add_servo(2);
@@ -3198,9 +2817,7 @@ TEST(FakeBusTools, frame_log_records_requests_to_absent_unknown_and_broadcast_id
 
 TEST(FakeBusTools, bytes_received_counts_garbage_and_bad_checksum_frames)
 {
-  // consume() drops garbage and bad-checksum frames before answer() ever sees them, so the frame
-  // log alone cannot prove that nothing was sent. The raw byte count can: it is taken right after
-  // read(), before anything is parsed.
+  // consume() drops garbage unlogged; bytes_received() counts every byte read, before parsing.
   FakeBus fake;
   fake.add_servo(1);
   RawWire bus;
@@ -3248,8 +2865,8 @@ TEST(FakeBusTools, writing_the_id_register_moves_the_servo)
 
 TEST(FakeBusTools, id_write_ack_can_come_from_the_new_id_or_not_at_all)
 {
-  // Which id acks an id write is unmeasured on the ST3025 (H15 records it), so the tools must
-  // succeed whichever it is. The fake can do all three.
+  // The ST3025 acks an id write from the old id (measured). The tools must also accept an ack
+  // from the new id or no ack, and the fake can do all three.
   FakeBus fake;
   fake.add_servo(4);
   fake.add_servo(5);
@@ -3317,9 +2934,8 @@ TEST(FakeBusTools, drop_when_locked_ignores_eeprom_writes_until_unlocked)
 
 TEST(FakeBusTools, volatile_when_locked_reverts_at_power_cycle)
 {
-  // Memory-table row 50: a write made while 55 reads 1 is applied and lost at power-off. The
-  // servo acts on it at once -- an id write moves it -- which is exactly why only a power cycle
-  // shows that a tool forgot to unlock.
+  // Written while locked (55 = 1): applied at once, lost at power-off.
+  // See docs/design.md, "Servo registers".
   FakeBus fake;
   fake.add_servo(1);
   fake.set_eeprom_policy(EepromPolicy::volatile_when_locked);
@@ -3392,10 +3008,8 @@ TEST(FakeBusTools, default_policy_is_apply_always)
 
 TEST(FakeBusTools, calibration_centres_present_and_moves_the_offset_on_bit_11)
 {
-  // Register 40 = 128: "current position correction is 2048". The model keeps the servo's
-  // physical angle and derives present from it and the offset. Its sign convention is the one H16
-  // measured on the ST3025 (README NOTE offset_sign = +1: the offset moves by position_before -
-  // 2048, sign-magnitude on bit 11), and ToolCalibrate.centres_a_position_servo pins it on purpose.
+  // 128 to register 40 sets present to 2048: offset += position - 2048, sign on bit 11
+  // (measured on the ST3025). See docs/tools.md, "calibrate_midpoint".
   FakeBus fake;
   fake.add_servo(2);
   fake.add_servo(3);
@@ -3549,7 +3163,7 @@ TEST(FakeBusTools, ignore_write_acks_but_does_not_apply)
 
 TEST(FakeBusTools, vanish_after_id_write)
 {
-  // context/motor_reset_command_email.png: a servo that answered nowhere after an id change.
+  // A servo that answers at no id after an id change.
   FakeBus fake;
   fake.add_servo(4);
   fake.set_vanish_after_id_write(4);
@@ -3567,8 +3181,8 @@ TEST(FakeBusTools, vanish_after_id_write)
 
 TEST(FakeBusTools, eeprom_commit_delays_the_ack_and_ignores_requests_meanwhile)
 {
-  // An EEPROM commit that outlasts the ack window: the ack arrives inside a LATER transaction's
-  // window, where it looks like a reply from the wrong servo (PHASE6_SPEC C.0 "late acks").
+  // A commit that outlasts the ack window: the late ack lands in a later transaction's window.
+  // See docs/design.md, "Late acks".
   FakeBus fake;
   fake.add_servo(1);
   fake.set_eeprom_commit_ms(1, 100);
@@ -3685,8 +3299,7 @@ TEST(FakeBusTools, drop_pings_ignores_exactly_n)
 
 TEST(FakeBusTools, a_twin_or_a_silent_read_can_be_limited_to_the_next_n)
 {
-  // One odd reply among clean ones -- twins that fall in and out of step, or a noisy line -- is
-  // what a tool must not forget once a retry comes back clean (review fixes F5, F6, F1).
+  // A tool must not forget one odd reply (twins out of step, a noisy line) when a retry is clean.
   FakeBus fake;
   fake.add_servo(1);
   RawWire bus;
@@ -3717,7 +3330,7 @@ TEST(FakeBusTools, a_twin_or_a_silent_read_can_be_limited_to_the_next_n)
 
 TEST(FakeBusTools, garbled_write_acks_break_the_ack_and_nothing_else)
 {
-  // A collision on the ack alone: the write applies, and reads and pings stay clean (review F28).
+  // A collision on the ack alone: the write applies, and reads and pings stay clean.
   FakeBus fake;
   fake.add_servo(1);
   fake.set_garble_write_acks(1, true);
@@ -3731,12 +3344,12 @@ TEST(FakeBusTools, garbled_write_acks_break_the_ack_and_nothing_else)
   EXPECT_EQ(bus.readByte(1, kRegAcc), 9);
 }
 
-// ---- factory_reset (factory_reset_evidence/FACTORY_RESET_SPEC.md 1, 2) ----
+// ---- factory_reset: the fake's RESET model ----
 
 TEST(FakeBusTools, reset_restores_the_factory_table_keeps_the_id_and_reinitialises_sram)
 {
-  // M1-M5 on the bench: every EEPROM register from 6 on goes back to the factory table, the id
-  // stays, and torque, goal and lock are re-initialised. The version bytes 0..4 are read-only.
+  // Measured on the bench: RESET restores EEPROM from register 6 on, keeps the id, and resets
+  // torque, goal and lock. Bytes 0..4 (version) are read-only.
   FakeBus fake;
   fake.add_servo(4, 1);
   fake.set_byte(4, 3, 10);
@@ -3768,15 +3381,15 @@ TEST(FakeBusTools, reset_restores_the_factory_table_keeps_the_id_and_reinitialis
   EXPECT_EQ(after.mem[37], 25);
   EXPECT_EQ(after.mem[kRegTorqueEnable], 0);
   EXPECT_EQ(fake.word(4, waveshare_servos_test::kRegGoalPosition), 0);
-  EXPECT_EQ(after.mem[kRegLock], 1) << "the reset closes the lock (M5)";
+  EXPECT_EQ(after.mem[kRegLock], 1) << "the reset closes the lock";
   EXPECT_EQ(fake.resets(), (std::vector<uint8_t>{4}));
   EXPECT_EQ(bus.Ping(4), 4);
 }
 
 TEST(FakeBusTools, reset_is_a_flash_write_whatever_the_lock_says)
 {
-  // Under volatile_when_locked an EEPROM WRITE with the lock closed is lost at power-off; the
-  // reset is no WRITE, and its values outlive a power cycle (M2 was sent with the lock closed).
+  // RESET is not a WRITE: its values survive a power cycle even with the lock closed (measured).
+  // See docs/tools.md, "factory_reset".
   FakeBus fake;
   fake.add_servo(4, 1);
   fake.set_eeprom_policy(EepromPolicy::volatile_when_locked);
@@ -3794,7 +3407,7 @@ TEST(FakeBusTools, reset_is_a_flash_write_whatever_the_lock_says)
 
 TEST(FakeBusTools, reset_ack_waits_for_the_commit_only_when_a_byte_changed)
 {
-  // M1 against M4: 25 ms when the flash was rewritten, under a millisecond when nothing differed.
+  // Measured: the RESET ack takes ~25 ms when flash changes, under 1 ms when nothing differs.
   FakeBus fake;
   fake.add_servo(4, 1);
   fake.set_eeprom_commit_ms(4, 60);
@@ -3846,9 +3459,8 @@ TEST(FakeBusTools, reset_knobs_ignore_it_or_skip_a_register)
 
 TEST(FakeBusTools, baud_model_hears_only_the_rate_register_6_names)
 {
-  // Off by default, so every earlier suite runs at whatever rate it likes. On, a servo at
-  // register 6 = 1 answers at 500000 only -- and after a reset at 500000 its ack still comes at
-  // that rate while every later request needs 1000000 (M3).
+  // Off by default. On: register 6 = 1 answers at 500000 only; after RESET the ack comes at
+  // 500000, and then only 1000000 works.
   FakeBus fake;
   fake.add_servo(4);
   fake.set_byte(4, 6, 1);
@@ -3875,11 +3487,7 @@ TEST(FakeBusTools, baud_model_hears_only_the_rate_register_6_names)
   EXPECT_EQ(fast.Ping(4), 4) << "the factory rate";
 }
 
-// ---------------------------------------------------------------------------------------------
-// PHASE6_SPEC D.2: the checked transactions the Phase 6 tools are built on, over the fake bus.
-// Each kind is produced by the wire itself -- a twin, a stranger's id, a late ack -- and never by
-// mocking the library, so the vendored request builders and readSCS run unchanged.
-// ---------------------------------------------------------------------------------------------
+// ---- Checked transactions. Each reply kind comes from the wire: twin, foreign id, late ack ----
 
 namespace
 {
@@ -3931,9 +3539,7 @@ protected:
 
 TEST_F(ServoBusChecked, checked_ping_silent_costs_one_timeout_and_zero_bytes)
 {
-  // A scan pings 254 ids three times each and nearly all are silent. The drain runs only when a
-  // byte arrived, so a silent id costs one window and nothing more -- measured against the
-  // vendored Ping, which never drains, and not against a clock.
+  // A scan pings 254 ids 3 times, mostly silent: a silent id must cost one window, no drain.
   ASSERT_TRUE(bus_.set_io_timeout_ms(5));
   const Reply reply = bus_.checked_ping(9);
   EXPECT_EQ(reply.kind, ReplyKind::SILENT);
@@ -3944,10 +3550,7 @@ TEST_F(ServoBusChecked, checked_ping_silent_costs_one_timeout_and_zero_bytes)
   EXPECT_EQ(reply.from_id, -1);
   EXPECT_GE(reply.elapsed_us, 5000u) << "the whole window";
 
-  // Each call is timed on its own and the FASTEST of each kind compared (review fix F18): a drain
-  // after every silence adds 2 ms to every checked call, its minimum included, while a scheduling
-  // stall inflates only the calls it lands on. Two sums with a 10 ms margin failed under load with
-  // no drain at all.
+  // Compare the fastest call of each kind: a drain adds 2 ms to every call, a stall only to some.
   constexpr int kPings = 10;
   std::chrono::steady_clock::duration vendored = std::chrono::hours(1);
   std::chrono::steady_clock::duration checked = std::chrono::hours(1);
@@ -4018,8 +3621,7 @@ TEST_F(ServoBusChecked, checked_ping_garbled_is_GARBLED)
 
 TEST_F(ServoBusChecked, checked_ping_reply_from_another_id_is_WRONG_ID_with_frame_bytes_6)
 {
-  // The shape of a late ack caught by a ping (PHASE6_SPEC C.0, is_late_ack): a whole, well-formed
-  // six-byte frame, from somebody else.
+  // A late ack caught by a ping looks like this: a well-formed 6-byte frame from another id.
   fake_.set_faults_apply_to_addressed(true);
   fake_.set_reply_id_override(1, 7);
   const Reply reply = bus_.checked_ping(1);
@@ -4050,9 +3652,8 @@ TEST_F(ServoBusChecked, checked_calls_refuse_0xfe_and_0xff_without_sending)
 
 TEST_F(ServoBusChecked, checked_calls_on_a_closed_bus_return_NOT_OPEN_without_aborting)
 {
-  // readSCS does FD_SET(fd, ...), and with fd == -1 glibc's _FORTIFY_SOURCE check aborts the
-  // whole binary (the reason write_acc checks the port). The same bus answers before and after,
-  // so NOT_OPEN is the closed bus speaking, not a call that never works.
+  // Refused before readSCS (see a_closed_bus_refuses_a_sync_read). The bus answers before and
+  // after, so NOT_OPEN means closed.
   ASSERT_EQ(bus_.checked_ping(1).kind, ReplyKind::ONE);
   bus_.close();
   fake_.clear_frames();
@@ -4096,9 +3697,8 @@ TEST_F(ServoBusChecked, checked_read_returns_the_payload)
 
 TEST_F(ServoBusChecked, checked_read_rejects_a_reply_from_another_id)
 {
-  // The hole this call exists to close, shown on the vendored call first: SCS::Read checks neither
-  // the responder id nor the length byte (src/SCS.cpp:173-203), so a Read-based implementation
-  // hands servo 7's payload over as servo 1's.
+  // SCS::Read checks neither the reply's id nor its length byte; checked_read checks both.
+  // See docs/design.md, "Checked transactions".
   fake_.set_faults_apply_to_addressed(true);
   fake_.set_reply_id_override(1, 7);
   uint8_t mode = 0xaa;
@@ -4114,9 +3714,7 @@ TEST_F(ServoBusChecked, checked_read_rejects_a_reply_from_another_id)
 
 TEST_F(ServoBusChecked, checked_read_of_a_bare_status_frame_is_STATUS_ONLY)
 {
-  // A commit-latency ack caught by a read: the write's 5 ms window closed before the servo acked,
-  // the read went out while it was still committing (and was ignored), and the ack landed in the
-  // read's window. A well-formed frame from the right id -- only its length gives it away.
+  // A late write ack caught by a read: right id, but a bare 6-byte status frame (STATUS_ONLY).
   fake_.set_eeprom_commit_ms(1, 30);
   ASSERT_TRUE(bus_.set_io_timeout_ms(60));
   const uint8_t offset = 7;
@@ -4168,9 +3766,7 @@ TEST_F(ServoBusChecked, checked_read_rejects_a_bad_checksum)
 
 TEST_F(ServoBusChecked, checked_write_reports_the_acking_id_old_new_or_none)
 {
-  // An ack is advisory (PHASE6_SPEC C.0): SCS::Ack returns 1 whatever the status byte says,
-  // rejects an ack from the new id, and cannot hear a servo with register 8 = 0. checked_write
-  // takes a frame from any id as the ack and says whose it was.
+  // Acks are advisory: checked_write takes a frame from any id as the ack and reports the id.
   fake_.add_servo(4);
   fake_.add_servo(5);
   fake_.add_servo(6);
@@ -4204,8 +3800,7 @@ TEST_F(ServoBusChecked, checked_write_reports_the_acking_id_old_new_or_none)
 
 TEST_F(ServoBusChecked, checked_write_restores_io_timeout_after_its_ack_window)
 {
-  // An EEPROM write gets a longer ack window than the bus's io timeout (PHASE6_SPEC R7). The
-  // window is borrowed for that one transaction and given back, both ways round.
+  // The ack window replaces the io timeout for one transaction only, longer or shorter.
   ASSERT_TRUE(bus_.set_io_timeout_ms(5));
   const uint8_t value = 1;
   const Reply write = bus_.checked_write(9, kRegTorqueEnable, &value, 1, 40);
@@ -4225,9 +3820,7 @@ TEST_F(ServoBusChecked, checked_write_restores_io_timeout_after_its_ack_window)
 
 TEST_F(ServoBusChecked, a_late_ack_is_drained_and_not_read_as_the_next_reply)
 {
-  // The commit outlasts the write's ack window and the ack lands while nobody is listening. The
-  // next transaction must not take it for its own reply: to a ping of a silent id it would be a
-  // reply from the wrong servo, and to a read a short, well-formed frame.
+  // A late ack on the line must be drained, not taken as the next transaction's reply.
   fake_.set_eeprom_commit_ms(1, 30);
   const uint8_t offset = 7;
   EXPECT_EQ(bus_.checked_write(1, kRegOffset, &offset, 1, 5).kind, ReplyKind::SILENT);
@@ -4244,8 +3837,8 @@ TEST_F(ServoBusChecked, a_late_ack_is_drained_and_not_read_as_the_next_reply)
 
 TEST_F(ServoBusChecked, checked_calls_leave_the_sync_read_drain_count_alone)
 {
-  // SyncReadStats::drains is the control loop's error-path count, which the README quotes. The
-  // checked calls drain after every reply; counting those there would let one scan swamp it.
+  // drains is the control loop's error-path count. The checked calls drain after every reply, so
+  // counting those would let one scan swamp it.
   fake_.set_twin(1, TwinReply::doubled);
   const uint64_t before = bus_.sync_read_stats().drains;
   const Reply reply = bus_.checked_ping(1);
@@ -4258,9 +3851,8 @@ TEST_F(ServoBusChecked, checked_calls_leave_the_sync_read_drain_count_alone)
 
 TEST_F(ServoBusChecked, checked_calls_refuse_a_count_outside_1_to_64_without_sending)
 {
-  // SCSerial::writeSCS appends to txBuf[255] with no bound check (src/SCSerial.cpp:179-191), so an
-  // unchecked count is an out-of-bounds write; and a READ of 0 bytes is answered by a bare status
-  // frame, the very shape STATUS_ONLY exists to single out. Neither reaches the wire.
+  // Counts outside 1..64 are refused: a large count overruns txBuf, and a READ of 0 is answered
+  // by a bare status frame.
   const std::array<uint8_t, 255> bytes{};
   const uint8_t too_many = static_cast<uint8_t>(ServoBus::checked_max_bytes + 1);
   EXPECT_EQ(bus_.checked_read(1, 3, 0).kind, ReplyKind::INVALID_COUNT);
@@ -4278,11 +3870,11 @@ TEST_F(ServoBusChecked, checked_calls_refuse_a_count_outside_1_to_64_without_sen
   EXPECT_EQ(most.data.size(), ServoBus::checked_max_bytes);
 }
 
-// ---- factory_reset (FACTORY_RESET_SPEC 2, "New bus primitives") ----
+// ---- factory_reset: checked_reset and set_baudrate ----
 
 TEST_F(ServoBusChecked, checked_reset_sends_the_bench_frame_and_hears_the_ack)
 {
-  // FF FF 04 02 06 F3 is the frame the bench took (M1): one request, six bytes, no parameter.
+  // FF FF 04 02 06 F3: the RESET frame used on the bench (six bytes, no parameter).
   fake_.add_servo(4, 1);
   fake_.clear_frames();
   const Reply reply = bus_.checked_reset(4, 100);

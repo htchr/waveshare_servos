@@ -1,6 +1,5 @@
-// calibrate_midpoint -- makes a position servo's present position its midpoint, 2048, verified by
-// reading back (PHASE6_SPEC C.3). All of it is in tool_main (parameters, port) and servo_tools
-// (the bus logic).
+// calibrate_midpoint -- makes a position servo's present position its midpoint, 2048, verified
+// by reading back. All of it is in tool_main (parameters, port) and servo_tools (bus logic).
 
 #include "tool_main.hpp"
 

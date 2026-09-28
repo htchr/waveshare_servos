@@ -1,8 +1,5 @@
-// A package that uses waveshare_servos can have an include/visibility_controls.h of its own, and
-// cpplint gives that header the include guard VISIBILITY_CONTROLS_H_. Define that guard here, as
-// such a header does when it is included first: waveshare_servos.hpp must still get its
-// WAVESHARE_SERVOS_* macros, so the installed visibility_controls.h keeps a guard in the package's
-// own namespace. With a colliding guard this file does not compile.
+// Defines the guard cpplint gives a consumer's own visibility_controls.h. waveshare_servos.hpp
+// must still compile, so the installed header needs a package-namespaced guard.
 #define VISIBILITY_CONTROLS_H_
 
 #include <gmock/gmock.h>

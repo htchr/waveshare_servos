@@ -1,20 +1,7 @@
 """
-A synthetic run tree for the hil_gates self-test (PHASE2_SPEC 12.3, 12.5).
+Synthetic run tree for `hil_gates.py --self-test`, in the file shapes hil_check.sh writes.
 
-`hil_gates.py --self-test` used to exercise only the gate primitives of 12.2 against synthetic
-series. That left the per-scenario checkers h1..h17 -- the twenty entries of hil_gates.py's
-CHECKERS, where the report of 12.4 is actually built -- entirely unexecuted, so a checker that
-could not run at all still reported GREEN. This module writes a run directory with the same file
-shapes hil_check.sh produces, thin enough to build in memory and complete enough that every
-checker walks its whole body.
-
-The data is mostly NOT tuned to make every row PASS. The self-test's claim is only that the
-checkers run and emit rows; the verdicts themselves are what a real bench run decides. The
-exception is a scenario whose rows are proved by DIFFERENTIAL injection -- H11's wheels_turning,
-H1's activate, H12's clamp rows, and every row of the tool scenarios H13-H17 -- where the copy
-carrying the defect has to be compared against a green baseline or the injection proves nothing;
-see the H12 and H13-H17 entries below and hil_gates.py's _self_test_soak_load, _self_test_h1_ping,
-_self_test_h12_clamps and _self_test_tools.
+Most data is not tuned to PASS; rows proved by differential injection get a green baseline.
 """
 
 import json
@@ -34,12 +21,8 @@ IFACES = ('position', 'velocity', 'effort', 'current', 'voltage', 'temperature',
 REAL = ('joint1', 'joint2', 'joint3', 'joint4')
 BLOCK_KEYS = ('n', 'mode', 'pos_last_raw', 'pos_slope_ls_rad_s')
 
-# A post-Phase-3-plausible bench, in microseconds (PHASE3 5.16 item 1). The pre-Phase-3 numbers
-# here were 1500.0 [900.0 - 2800.0] read and 700.0 [400.0 - 1200.0] write, and 0.70 ms of write is
-# now ABOVE WRITE_MS_AVG_MAX. This fixture is shared by h1, h9 and h11, and h1/h9 gate maxima too,
-# so all four figures clear all four constants: 1.70 < 2.15, 2.60 < 4.00, 0.30 < 0.60, 0.90 < 1.50.
-# The self-test's claim is never that these verdicts are right (see the docstring) -- but a fixture
-# that reads like a broken bench misleads the next reader.
+# Plausible cycle costs in microseconds, under every READ_MS_*/WRITE_MS_* bound in hil_gates.py
+# (several checkers share them). Only plausibility matters here, not the verdicts.
 DIAGNOSTICS = (
     'name: waveshare_servos\n'
     '  read_cycle.execution_time\n'
@@ -90,7 +73,7 @@ def djs(t, cols):
 
 
 def nine(t, current=0.05, position=0.0, velocity=0.0):
-    """Return the nine state interfaces of 12.5 H9, related as the driver relates them."""
+    """Return the nine state interfaces H9 declares, related as the driver relates them."""
     n = len(t)
     amps = [current] * n
     effort = [a * TORQUE_CONSTANT_NM_PER_A for a in amps]
@@ -104,8 +87,7 @@ def ids(per_servo):
     """
     Return the readback shape hil_check.sh writes, one block per servo id.
 
-    Every key in BLOCK_KEYS stays at the top of the block; the rest are nested under `registers`,
-    which is where the readback helper puts what it read off the servo.
+    BLOCK_KEYS stay at the top of a block; the other keys go under `registers`.
     """
     out = {}
     for servo, fields in per_servo.items():
@@ -123,15 +105,8 @@ def readback(servos=(1, 2, 3, 4), **common):
     return ids({servo: dict(common) for servo in servos})
 
 
-#
-# Phase 6 (PHASE6_SPEC E.2-E.8): the tools' scenarios H13-H17 and the bench's EEPROM snapshots.
-#
-# The four servos below are the golden baseline hil_eeprom took before any Phase 6 tool touched
-# the bench (phase6_evidence/bench_eeprom_baseline.snap, E.0), so every snapshot and every scan
-# table in this fixture reads like that bench and not like an invented one: firmware 3 20, model
-# bytes 10 25 (the word 6410), modes 0 0 1 1, offsets raw 2044 / 2245 / 0 / 0 (+2044 and -197 on
-# bit 11), torque and lock 1 everywhere. Register 2 is undefined and 5 is the id; both are filled
-# in per servo.
+# ---- tool scenarios H13-H17. The servos below are the bench's measured EEPROM baseline:
+# firmware 3 20, modes 0 0 1 1, offsets +2044 -197 0 0; register 2 is undefined, 5 is the id.
 BENCH_EEPROM = (3, 20, None, 10, 25, None, 0, 0, 1, 0, 0, 255, 15, 70, 140, 50, 232, 3, 45, 44, 44,
                 32, 32, 0, 0, 0, 1, 1, 230, 0, 1, None, None, None, 20, 200, 80, 25, 250, 50)
 BENCH = {1: {'offset_raw': 2044, 'mode': 0, 'position': 1413, 'volts_raw': 124, 'temp': 35},
@@ -154,10 +129,9 @@ USAGE = {'scan': 'usage: ros2 run waveshare_servos scan [--ros-args -p port:=/de
 def bench_servo(bench_id, id_register=None, offset_raw=None, mode=None, torque=1, lock=1,
                 goal=None, position=None):
     """
-    Return one servo of a hil_eeprom snapshot, in the RESULT JSON shape (E.1).
+    Return one servo of a hil_eeprom snapshot, in the RESULT JSON shape.
 
-    `bench_id` picks which of the four physical servos this is; `id_register` is what its register
-    5 says, which differs only while H15 has moved servo 4 to 253.
+    `bench_id` picks the physical servo; `id_register` is its register 5 (253 while H15 moved it).
     """
     bench = BENCH[bench_id]
     raw = bench['offset_raw'] if offset_raw is None else offset_raw
@@ -168,7 +142,7 @@ def bench_servo(bench_id, id_register=None, offset_raw=None, mode=None, torque=1
     at = bench['position'] if position is None else position
     return {'n': 39, 'eeprom': {str(reg): value for reg, value in enumerate(values) if reg != 2},
             'sram': {'40': torque, '55': lock},
-            # a wheel's goal position reads 0 on the bench (E.0); an arm's is where it holds
+            # a wheel's goal position reads 0 on the bench; an arm's reads where it holds
             'volatile': {'42': (at if values[33] == 0 else 0) if goal is None else goal, '56': at,
                          '62': bench['volts_raw'], '63': bench['temp'], '65': 0}}
 
@@ -185,7 +159,7 @@ def bench_snapshot(census=(1, 2, 3, 4)):
 
 
 def snap_text(snap):
-    """Render a snapshot as the .snap file hil_eeprom writes with --out (E.1, DEVIATIONS D-5)."""
+    """Render a snapshot as the .snap file hil_eeprom writes with --out."""
     ids = sorted(int(i) for i in snap['ids'])
     lines = ['hil_eeprom snapshot 1', 'ids ' + ' '.join(str(i) for i in ids),
              'ok ' + ('true' if snap['ok'] else 'false')]
@@ -209,7 +183,7 @@ def snapshot_files(label, snap):
 
 
 def scan_row(servo_id, block):
-    """One row of scan's table (C.1), printed from a snapshot block the way servo_tools does."""
+    """One row of scan's table, printed from a snapshot block the way servo_tools does."""
     eeprom, volatile = block['eeprom'], block['volatile']
     mode = eeprom['33']
     raw = eeprom['31'] | eeprom['32'] << 8
@@ -240,12 +214,12 @@ def ran(label, rc, serial_speed_lines, holders='', seconds='0.412'):
 
 
 def refused(tool, message):
-    """Return a usage refusal's stderr (A.1 step 6): the prefixed message, the bare usage."""
+    """Return a usage refusal's stderr: the prefixed message, then the bare usage."""
     return '%s: %s\n%s\n' % (tool, message, USAGE[tool])
 
 
 def held(tool, pid, comm):
-    """Return the C.0 port-held refusal as open_bus prints it through the prefixing stream."""
+    """Return the port-held refusal as open_bus prints it through the prefixing stream."""
     return ("%s: port '%s' is held by another process (pid %s %s); refusing to share the bus -- "
             'stop that process first (a running controller manager holds the port for as long as '
             'its hardware component is configured). Nothing was sent to the servos.\n'
@@ -253,7 +227,7 @@ def held(tool, pid, comm):
 
 
 def set_id_detail(start, new, verdict, writes=0, **fields):
-    """set_id's detail line (C.2), `none` for what the run never measured (DEVIATIONS D-25)."""
+    """Return set_id's detail line, with `none` for what the run never measured."""
     order = ('lock_before', 'unlock_read', 'id_write_ack', 'ack_ms', 'verify_ms', 'new_id_pings',
              'late_ack_from', 'late_ack_ms', 'old_id_silent', 'identity_same', 'lock_after')
     line = {key: 'none' for key in order}
@@ -272,19 +246,16 @@ def merged(*parts, **more):
 
 
 def gate_facts():
-    """Return the facts guard_begin and guard_end leave behind on a clean run (E.2)."""
+    """Return the facts guard_begin and guard_end leave behind on a clean run."""
     return {'journal_written': 'true', 'journal_left': 'false', 'pre_eeprom_rc': '0',
             'post_eeprom_rc': '0', 'guard_compare_rc': '0'}
 
 
 def build_tools(root):
     """
-    Write H13-H17, a HEALTHY bench on which every non-NOTE row of h13..h17 passes.
+    Write H13-H17 as a HEALTHY bench: every non-NOTE row of h13..h17 passes.
 
-    The departure from the module docstring's "not tuned to make every row PASS" is the H12 one:
-    hil_gates.py's _self_test_tools proves every one of these rows by differential injection (E.8)
-    -- a copy of one scenario directory carrying exactly one defect must turn exactly the listed
-    rows red -- and that argument needs a baseline where each row is green.
+    _self_test_tools injects one defect per copy, so it needs a green baseline.
     """
     bench = bench_snapshot()
     guard = snapshot_files('pre_eeprom', bench) + snapshot_files('post_eeprom', bench)
@@ -309,9 +280,8 @@ def build_tools(root):
               ('guard_compare.json', {'equal': True, 'eeprom_only': False, 'diffs': []}),
               ('released.json', {'verdict': 'acquired'})])
 
-    # H14: every tool refuses a held port, and the refusals write nothing. Stage A runs while the
-    # controller manager (CM_PID) holds the port, stage B against a flock-only port_probe
-    # (PROBE_PID), stage C with the port free and every id silent but 3.
+    # H14: stage A with the CM (CM_PID) holding the port, B a flock-only probe (PROBE_PID),
+    # C with the port free and every id silent except 3.
     facts = merged(gate_facts(), controllers_active='true', cm_pids=CM_PID,
                    driver_warns_before='3', driver_warns_after='3', probe_pid=PROBE_PID)
     files = list(guard)
@@ -371,9 +341,8 @@ def build_tools(root):
         ('released.json', {'verdict': 'acquired'})]
     write(root, 'H14', facts=facts, files=files)
 
-    # H15: set_id 4 -> 253 -> 4. The moved snapshot is servo 4 answering at 253 with nothing but
-    # register 5 changed; the tool's own way back leaves the bench as it was, so the restore after
-    # it writes nothing at all (DEVIATIONS D-8).
+    # H15: servo 4 at 253 changes only register 5; set_id's way back restores the bench, so the
+    # restore after it writes nothing.
     moved = snapshot({1: bench_servo(1), 2: bench_servo(2), 3: bench_servo(3),
                       253: bench_servo(4, id_register=253)}, census=(1, 2, 3, 253))
     back_detail = set_id_detail(
@@ -402,10 +371,8 @@ def build_tools(root):
                                 'after': [], 'problems': [], 'signal_deferred': False}),
               ('guard_compare.json', {'equal': True, 'eeprom_only': False, 'diffs': []})])
 
-    # H16: calibrate_midpoint on id 2, then the refusal on the wheel id 3. Id 2 rests at 1026 and
-    # its offset reads raw 2245 (-197 on bit 11); after the tool it reads 2048 at the same shaft
-    # angle, so its offset moved by 2048 - 1025 = 1023 ticks (the tool's own settled, torque-off
-    # position_before is 1025) to raw 0x0cc4 = -1220. Torque stays OFF, the lock closed [Q2, Q3].
+    # H16: id 2 (offset raw 2245 = -197) reads 2048 after calibration: offset -197 - 1023 = -1220
+    # (raw 0x0cc4), torque off, lock closed. The wheel id 3 is refused (exit 4).
     calibrated = snapshot({1: bench_servo(1), 3: bench_servo(3), 4: bench_servo(4),
                            2: bench_servo(2, offset_raw=0x0cc4, torque=0, goal=1026,
                                           position=2048)})
@@ -446,12 +413,11 @@ def build_tools(root):
                   'before': [], 'after': [], 'problems': [], 'signal_deferred': False}),
               ('guard_compare.json', {'equal': True, 'eeprom_only': False, 'diffs': []})])
 
-    # H17: the bench as found. initial_eeprom.snap is the pre-flight's snapshot and baseline.snap
-    # the golden one of E.0, both copied in by h_H17; final_eeprom is taken there and then.
+    # H17: initial_eeprom.snap (pre-flight) and baseline.snap (golden baseline), both copied in
+    # by h_H17; final_eeprom is taken there.
     write(root, 'H17',
           facts={'final_eeprom_rc': '0', 'journal_present': 'false',
-                 'baseline_source': '/home/ubuntu/waveshare_ws/phase6_evidence/'
-                                    'bench_eeprom_baseline.snap'},
+                 'baseline_source': '/home/user/bench_eeprom_baseline.snap'},
           files=snapshot_files('final_eeprom', bench) + [
               ('initial_eeprom.snap', snap_text(bench)), ('baseline.snap', snap_text(bench))])
 
@@ -486,11 +452,8 @@ def build(root):
           log="[INFO] Successful 'activate'\n[INFO] bus on '/dev/ttyACM0' at 1000000 baud\n",
           files=[('steady.json', rec(quiet, long_t)), ('diagnostics.txt', DIAGNOSTICS)])
 
-    # H1B, the shipped example commanded rather than only watched. Its recordings deliberately
-    # reuse the shapes of the bench scenarios whose bounds h1b borrows -- the arm columns are
-    # H2's and the wheel column is H3's `spun` -- because the point of h1b is that the same
-    # measurements are taken on the packaged stack, and a fixture that made them look like
-    # different measurements would hide a checker that had drifted off them.
+    # H1B reuses H2's arm columns and H3's `spun` wheel column: h1b takes the same measurements
+    # on the packaged stack, so the fixture must not make them look different.
     write(root, 'H1B',
           facts={'controllers_active': 'true', 'hw_state': 'active',
                  'diff_drive_state': 'inactive', 'arm_state_after': 'active',
@@ -592,11 +555,8 @@ def build(root):
                'joint3': nine(long_t, velocity=2.0), 'joint4': nine(long_t, velocity=-2.0),
                'joint5': nine(long_t, current=0.0)}
     listed = '\n'.join('%s/%s' % (j, i) for j in REAL + ('joint5',) for i in IFACES)
-    # t_cycle_done is 8.0 against a 12 s recording (long_t is 1200 samples at 100 Hz), so 400
-    # samples follow the cycle and H9.cycle_recorded clears its 100-sample floor with room to
-    # spare. It has to be a real margin rather than a value tuned to just pass: the row exists to
-    # notice a recorder that stopped near the cycle, and a fixture sitting on the boundary would
-    # make the red-first injection for it indistinguishable from fixture noise.
+    # t_cycle_done 8.0 in a 12 s recording leaves 400 samples after the cycle, well above
+    # H9.cycle_recorded's 100-sample floor, so an injection there is never fixture noise.
     write(root, 'H9',
           facts={'t_cycled': '2.0', 't_plus0': '1.0', 't_plus1': '3.0',
                  't_minus0': '5.0', 't_minus1': '7.0', 't_cycle_done': '8.0',
@@ -625,16 +585,8 @@ def build(root):
                  ('term_after_exit.json', {'any_moving': False}),
                  ('shutdown.json', rec(quiet, mid_t))])
 
-    # H11, the soak of PHASE3 5.13/5.16. Written after H10 and not beside H9 because it reuses
-    # H9's `columns` local: `nine:=true` means the soak recording carries all nine interfaces, so
-    # h11's temperature NOTE has data. `columns` also carries a joint5 the real H11 has no
-    # equivalent of -- h11 names its joints explicitly, so it is inert, and matching the shape the
-    # rest of this fixture already uses is worth more than trimming it.
-    #
-    # The point of the entry is the bug this whole module exists to catch: a checker that reads a
-    # file label or a fact key nobody writes emits a degenerate row and the self-test still says
-    # GREEN. h11 reads `steady_soak.json`, `diagnostics.txt` and the `soak_s` fact, so all three
-    # are here; `port_free_before` / `port_free_after` come from write()'s own base facts.
+    # H11 reuses H9's `columns` (nine:=true, so h11's temperature NOTE has data; joint5 is inert).
+    # h11 reads steady_soak.json, diagnostics.txt and soak_s, so all three are written.
     write(root, 'H11',
           facts={'controllers_active': 'true', 'hw_state': 'active', 'soak_s': '600'},
           log=('[INFO] bus totals: transactions 60000, failed 0 (0.0 per million), '
@@ -643,39 +595,13 @@ def build(root):
                                           dynamic_joint_states=djs(long_t, columns))),
                  ('diagnostics.txt', DIAGNOSTICS)])
 
-    # H12, the limits scenario of jazzy.md section 6 step 8: three stacks, and the middle one
-    # renders +-0.8 rad / 2.0 rad/s <limit>s against bench_limits.yaml's enforce_command_limits,
-    # so the controller manager's JointSaturationLimiter clamps an arm command of 1.2 rad and a
-    # wheel command of 8.0 rad/s. Written last because it is the newest scenario, not because it
-    # runs last on the bench (it runs before H11, so the soak's ten minutes are spent after every
-    # fast row has reported).
-    #
-    # This entry is a HEALTHY H12 -- every h12 row passes over it -- which is a departure from the
-    # module docstring's "not tuned to make every row PASS", and deliberate. Two of h12's rows are
-    # proved by differential injection in hil_gates.py (_self_test_h12_clamps copies this
-    # directory, unclamps one recording in it and asserts that exactly one row turns red), and
-    # that argument only works against a baseline where the row in question is green: on a
-    # fixture where the row was already red, an injection would prove nothing at all. The same
-    # reasoning as _self_test_soak_load's H11 copy and _self_test_h1_ping's H1 copies.
-    #
-    # The numbers are the plausible ones rather than the exact ones wherever the bench has a
-    # measured answer: the arm settles 0.0033 rad short of a commanded target (H2.target.move_to_06
-    # read 0.5967 for 0.6 in the post-Phase-4 baseline), so the clamped arm rests at 0.7967 and
-    # not at a suspiciously exact 0.8, and turn() quantises 2.0 rad/s to the 26-quantum lattice
-    # value 1.99417 the same way a real reported velocity is quantised. Both sit inside their
-    # tolerances with room to spare, so a red row here is a checker defect and never fixture noise.
+    # H12, healthy: _self_test_h12_clamps needs green rows to inject into. Bench-plausible values:
+    # the arm settles 0.0033 rad short (0.7967), and turn() quantises 2.0 rad/s to 1.99417.
     clamp_t = times(500)                      # 5 s: 0.5 pre + 2.0 move + 2.5 post, as h_H12 asks
     parked = round(OFFSET * STEPS_PER_RAD)    # 1024 ticks; the joint angle is raw * TICK - OFFSET
     arm_regs = {'torque_enable': 1, 'acc': 10, 'goal_position_raw': parked, 'goal_speed_raw': 0}
-    # The limiter lines, and the reason this file writes three cm*.stdout files. h_H12 records
-    # limited_cm_log so the gate reads the ONE log its limited stack wrote, and the two ordinary
-    # stacks that bracket it run against bench.yaml, where enforce_command_limits is false and no
-    # limiter is ever built. The order here is joint3, joint1, joint4, joint2 ON PURPOSE:
-    # hardware_interface emits these in hash-map order (jazzy.md's Phase 4 amendment to section 6
-    # step 8), so a checker that matched them by index would pass on a sorted fixture and fail on
-    # the bench. Note that log.txt below does NOT carry them, where the real scenario_end would
-    # (it concatenates every *.stdout into log.txt) -- that is what makes an injection into
-    # cm2.stdout a single defect, and h12 reads the named file rather than log.txt anyway.
+    # Limiter lines only in the limited stack's cm2.stdout, in hardware_interface's hash-map order
+    # (match by name). log.txt omits them, so an injection into cm2.stdout is one defect.
     limiter = ''.join('[INFO] [resource_manager]: Creating JointSaturationLimiter for joint '
                       "'%s' in hardware 'bench'\n" % j for j in ('joint3', 'joint1',
                                                                  'joint4', 'joint2'))
@@ -685,10 +611,7 @@ def build(root):
                  'park_spawner_rc': '0', 'park_controllers_active': 'true',
                  'park_cm_exit_code': '0',
                  'limited_spawner_rc': '0', 'limited_controllers_active': 'true',
-                 # 137 = 128 + SIGKILL, which is what stop_stack KILL must produce: the limited
-                 # stack is killed with 8.0 rad/s still commanded so the goal-speed register
-                 # survives. h12 reports it and gates nothing on it (a 0 here would mean the kill
-                 # missed), exactly as H8's KILLed stack recorded cm_exit_code 137 on the bench.
+                 # 137 = 128 + SIGKILL: killed with 8.0 rad/s still commanded. Reported, not gated.
                  'limited_cm_exit_code': '137', 'limited_cm_log': 'cm2.stdout',
                  'arm_state_after': 'active',
                  'park_final_spawner_rc': '0', 'park_final_controllers_active': 'true',
@@ -709,6 +632,6 @@ def build(root):
                  ('arm_post.json', ids({1: dict(arm_regs, pos_last_raw=parked),
                                         2: dict(arm_regs, pos_last_raw=parked)}))])
 
-    # H13-H17, the tools' scenarios of Phase 6: a healthy bench, see build_tools.
+    # H13-H17, the tool scenarios: a healthy bench, see build_tools.
     build_tools(root)
     return root

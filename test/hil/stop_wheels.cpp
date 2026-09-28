@@ -1,22 +1,5 @@
-// stop_wheels: HIL safety and readback helper for the waveshare_servos bench.
-//
-// Default: open the port, WriteSpe(id, 0, acc) on every wheel id, then read back the present
-// speed and position a few times and print them.
-// --read-only: never command anything, only sample present speed/position (used to find out
-// whether wheels are still spinning after a lifecycle transition).
-// --registers: before anything else, read what was last written to each servo: mode (33), torque
-// enable (40), acceleration (41), goal position (42-43) and goal speed (46-47), both sign-magnitude
-// (bit 15). Read-only; used to compare the driver's last goals between builds on the bus itself.
-// Every sample is time-stamped, so a spinning wheel's speed also comes out as a least-squares slope
-// of its unwrapped position over the sampling window (pos_slope_ls_rad_s).
-//
-// Built against the vendored SCServo sources of the package (unmodified); see
-// build_stop_wheels.sh. Refuses to run while another process holds the port, because two
-// processes on the tty corrupt the bus.
-//
-// Output: human readable sample lines, then one line "RESULT {json}".
-// Exit codes: 0 ok, 1 port busy, 2 cannot open port, 3 a servo did not answer,
-//             4 (stop mode) a wheel still moving after the stop command, 64 usage.
+// stop_wheels: bench safety helper. Sends speed 0 to the wheels (none with --read-only), then
+// samples speed and position. See docs/bench-check.md, "stop_wheels".
 
 #include <dirent.h>
 #include <limits.h>
@@ -273,7 +256,7 @@ int main(int argc, char ** argv)
     const double span_s = (pos[k].size() >= 2) ? interval_ms * (pos[k].size() - 1) / 1000.0 : 0.0;
     const double slope = span_s > 0 ? dpos * rad_per_step / span_s : 0.0;
     // the speed register jitters by one 50 steps/s quantum at rest, so require more than that
-    // or a real position change (8 ticks over the default 0.5 s window = 0.025 rad/s)
+    // or a real position change (8 ticks over the default 0.4 s span = about 0.031 rad/s)
     const bool moving = (max_abs > 100) || (std::abs(dpos) > 8);
     still_moving = still_moving || moving;
     // least-squares slope of the unwrapped position against the sample time stamps

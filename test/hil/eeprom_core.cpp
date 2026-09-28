@@ -1,10 +1,5 @@
-// hil_eeprom core (PHASE6_SPEC E.1). See eeprom_core.hpp for what it is and why it stands apart
-// from the tools.
-//
-// Every bus access below is one of the six vendored calls R12 allows -- Ping, Read, readByte,
-// readWord, writeByte, writeWord -- behind an is_open() guard: on a closed bus the vendored readSCS
-// would FD_SET(-1), which aborts under _FORTIFY_SOURCE (see ServoBus::write_acc in
-// src/servo_bus.cpp).
+// hil_eeprom core; see eeprom_core.hpp. Every bus call is a vendored call behind is_open().
+// See docs/design.md, "Vendored library traps".
 
 #include "eeprom_core.hpp"
 
@@ -52,8 +47,7 @@ std::string value_text(int value)
   return value == kUnreadable ? "x" : std::to_string(value);
 }
 
-// JSON: a register value is a number, or the string "x" when it could not be read -- the same `x`
-// as the .snap, so a gate that looks for one finds it in either (E.8).
+// JSON value: a number, or the string "x" when unreadable (the same `x` as in the .snap).
 std::string json_value(int value)
 {
   return value == kUnreadable ? "\"x\"" : std::to_string(value);
@@ -207,9 +201,8 @@ const std::vector<int> & compared_registers(bool eeprom_only)
   return eeprom_only ? eeprom_registers() : all;
 }
 
-// The memory table's two-byte EEPROM fields: min and max angle (9, 11), max torque (16), the two
-// protection words (24, 28) and the offset (31). Written whole, so a failure between the two
-// halves cannot leave a word that is neither the old value nor the new one.
+// Two-byte EEPROM fields: angle limits, max torque, min startup force, protection current,
+// offset. Restore writes each in one frame, so no word is left half written.
 const std::vector<int> & word_fields()
 {
   static const std::vector<int> fields = {9, 11, 16, 24, 28, 31};
@@ -256,14 +249,7 @@ bool ServoRecord::complete() const
 }
 
 // ---- the .snap text ----
-//
-//   hil_eeprom snapshot 1
-//   ids 1 2 3 4
-//   ok true
-//   census 1 2 3 4                                   (only when the census was taken)
-//   servo 1 eeprom 3 6 - 9 3 1 0 ...                 (40 values: '-' for 2, 'x' unreadable)
-//   servo 1 sram 40=1 55=0
-//   servo 1 volatile 42=1026 56=1026 62=122 63=33 65=0
+// See docs/bench-check.md, "hil_eeprom".
 
 std::string format_snap(const Snapshot & snap)
 {
@@ -680,10 +666,8 @@ std::vector<std::string> source_problems(const Snapshot & source)
 namespace
 {
 
-// Blocks SIGINT, SIGTERM, SIGHUP and SIGQUIT on this thread from the first write of a sequence to
-// its end (E.1 "Signals"). The handlers stay installed, so a signal that arrives meanwhile is only
-// held; when the mask is restored it runs the handler, which sets the flag -- after the sequence,
-// never between an unlock and its lock.
+// Blocks SIGINT, SIGTERM, SIGHUP and SIGQUIT from the first write to end(). A held signal sets the
+// stop flag after the sequence, never between an EEPROM unlock and its lock.
 class DeferredSignals
 {
 public:
@@ -720,10 +704,8 @@ private:
   sigset_t saved_{};
 };
 
-// Every write goes through here, so a report lists exactly what went on the wire, and the first
-// one starts the deferral. The ack is never consulted: SCS::Ack rejects an ack from a new id and
-// returns 1 whatever the status byte says (src/SCS.cpp:265-295), so the read-back after each write
-// is the only verdict.
+// Logs every write and starts the signal deferral. Acks are ignored (SCS::Ack returns 1 whatever
+// the status byte says), so the read-back is the only verdict.
 class Writer
 {
 public:
@@ -1802,8 +1784,7 @@ int run(
     }
   }
   if (command == "restore") {
-    // E.1 restore step 0, before the port is opened: a source restore would have to guess from
-    // is refused with nothing sent
+    // Check the source before the port opens: a source with gaps is refused and nothing is sent.
     if (!load_snap(options.values["--from"], &source, &error)) {
       return failure(out, "unreadable_source", error, kExitCannotResolve);
     }

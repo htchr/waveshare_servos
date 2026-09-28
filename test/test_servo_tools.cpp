@@ -1,14 +1,5 @@
-// Tests for src/servo_tools.{hpp,cpp} -- the Phase 6 tools' bus logic (PHASE6_SPEC B.3, C, D.4).
-//
-// Every case drives the library in-process against the fake bus of test/fake_servo_bus.hpp: the
-// vendored packet code runs unchanged over an openpty() pair, and the fake's frame log is the
-// witness. That log, not anything the tools report about themselves, is what the gates read:
-//   - a scan's coverage is the exact ping-count map, compared as a whole;
-//   - "wrote nothing else" is the whole ordered list of WRITE frames;
-//   - "sent nothing" is the raw byte count, which sees even a frame the fake could not parse.
-// The fake's EEPROM model runs under volatile_when_locked, the memory table's reading and the
-// strictest policy: a write made while register 55 reads 1 applies and is lost at power-off, so
-// only a verified unlock makes an id or an offset survive power_cycle().
+// Tests for src/servo_tools: the tools' bus logic, in-process on the fake bus. The fake's frame
+// log, not the tools' reports, is the witness. See docs/development.md, "Fake servo bus".
 
 #include <gmock/gmock.h>
 
@@ -90,7 +81,7 @@ using waveshare_servos_test::kInstRead;
 using waveshare_servos_test::TwinReply;
 
 constexpr int kBaudrate = 1000000;
-constexpr uint32_t kIoTimeoutMs = 5;    // io_timeout_ms_for(1000000), the tools' own (C.0)
+constexpr uint32_t kIoTimeoutMs = 5;    // io_timeout_ms_for(1000000), the tools' own
 
 }  // namespace
 
@@ -160,10 +151,8 @@ private:
   std::string path_;
 };
 
-// Descriptors 1 and 2 of the whole process pointed at two files, for the length of one call: the
-// vendored begin() printf()s "serial speed N" through C stdio, which no std::ostream argument can
-// catch. finish() puts both back and reads what arrived; call it before any EXPECT, whose output
-// would otherwise land in the files.
+// Points fds 1 and 2 at files for one call: begin() printf()s "serial speed N" via C stdio.
+// Call finish() before any EXPECT, or its output lands in the files.
 class CapturedStdio
 {
 public:
@@ -228,10 +217,8 @@ private:
   std::string err_;
 };
 
-// Another PROCESS holding the port by its advisory lock alone, with no TIOCEXCL: the stimulus of
-// the bench's flock-only holder (port_probe --no-exclusive, E.4), and the only holder whose pid a
-// refusal can name, since open_bus leaves this process's own pid out. The child is forked from a
-// threaded process, so it calls nothing but async-signal-safe functions until it _exit()s.
+// Another process that holds the port by flock only (as port_probe --no-exclusive). Forked
+// from a threaded process, the child uses only async-signal-safe calls until _exit().
 class ChildHolder
 {
 public:
@@ -290,7 +277,7 @@ private:
   bool held_ = false;
 };
 
-// The shared fixture: a fake bus under the strictest EEPROM policy, a ServoBus opened on it at the
+// The shared fixture: a fake bus under volatile_when_locked, a ServoBus opened on it at the
 // tools' own 5 ms, and a Session over them with a local stop flag and string streams.
 class ToolFixture : public ::testing::Test
 {
@@ -336,10 +323,8 @@ protected:
     }
   }
 
-  // A servo as the bench delivers it (E.0): firmware 3.6, model word 9 3, baud register 0 (1 M),
-  // response level 1, angle limits 0 and 4095, 12.2 V, 30 C, torque on and the EEPROM lock closed
-  // (register 55 reads 1 on all four bench servos) -- plus an offset and a position of its own,
-  // so a value read from the wrong servo cannot pass for the right one.
+  // Bench-like: baud reg 0, limits 0-4095, 12.2 V, 30 C, torque on, lock closed, own offset and
+  // position. Firmware/model bytes are 3.6/777, not the ST3025's 3.20/6410.
   void seed_bench_like(uint8_t id, uint8_t mode)
   {
     fake_.add_servo(id, mode);
@@ -369,7 +354,7 @@ protected:
   std::optional<std::size_t> writes_sent_;   // set by the set_id, calibrate and reset cases
 };
 
-// scan's stdout contract (C.1), the header the HIL parser matches exactly.
+// scan's stdout header, which the HIL parser matches exactly.
 constexpr const char * kHeader =
   " id  type  mode  model  baud_reg     baud  position  voltage_V  temp_C  status  offset";
 
@@ -393,7 +378,7 @@ std::vector<std::string> tokens_of(const std::string & line)
   return tokens;
 }
 
-// What an empty bus sees from a full scan: every id 0..253 pinged `attempts` times [Q5].
+// What an empty bus sees from a full scan: every id 0..253 pinged `attempts` times.
 std::map<uint8_t, int> empty_bus_pings()
 {
   std::map<uint8_t, int> pings;
@@ -403,8 +388,8 @@ std::map<uint8_t, int> empty_bus_pings()
   return pings;
 }
 
-// Every case scans the whole range the executable scans [Q5]: a narrowed range in a test would
-// hide a narrowed range in the tool.
+// Every case scans the tool's whole range, 0..253: a narrowed range in a test would hide a
+// narrowed range in the tool.
 class ToolScan : public ToolFixture
 {
 protected:
@@ -586,8 +571,8 @@ std::string ack_name(const ::testing::TestParamInfo<IdWriteAck> & info)
   return "unknown";
 }
 
-// Servo 2 in mode 0 at 1026 with the offset model on, torque on and the lock closed (D.4; the
-// bench's id 2 rests at 1026), under volatile_when_locked.
+// Servo 2 in mode 0 at 1026 (where the bench's id 2 rests), offset model on, torque on, lock
+// closed, under volatile_when_locked.
 class ToolCalibrate : public ToolFixture
 {
 protected:
@@ -607,8 +592,7 @@ protected:
     return report;
   }
 
-  // The whole write list of a calibration that switched the torque off: torque, verified unlock,
-  // 128, verified lock [Q1, Q2, Q3].
+  // A calibration that switched the torque off: torque 0, verified unlock, 128, verified lock.
   static std::vector<WriteRecord> clean_calibration()
   {
     return {WriteRecord{2, 40, {0}}, WriteRecord{2, 55, {0}}, WriteRecord{2, 40, {128}},
@@ -616,10 +600,8 @@ protected:
   }
 };
 
-// Servo 4 as the bench had it for the reset (FACTORY_RESET_SPEC M1, M2): a wheel with an offset and
-// a return delay that are not factory, torque on and the lock closed. Its factory table is its
-// EEPROM with those three put back, and the offset model is on, so a reset that clears the offset
-// moves the present position the way the servo's would (1052 + 5).
+// Servo 4 as for the bench reset: a wheel whose mode, offset and return delay are not factory.
+// Offset model on, so clearing the offset moves the present position (1052 + 5).
 class ToolFactoryReset : public ToolFixture
 {
 protected:
@@ -640,8 +622,8 @@ protected:
     return report;
   }
 
-  // Servo 4 at register 6 = 1 under the baud model, on a bus opened at 500000: the servo a reset
-  // moves to the factory rate (M3).
+  // Servo 4 at baud register 1 (500000) under the baud model, on a bus opened at 500000: a reset
+  // moves it to the factory rate.
   void at_500000()
   {
     fake_.set_byte(4, 6, 1);
@@ -699,9 +681,8 @@ TEST_F(ToolOpen, holders_text_lists_this_pid_when_self_pid_is_not_this_process)
 
 TEST_F(ToolOpen, a_flock_only_holder_exits_1_before_begin)
 {
-  // The discriminating case of item 4 (G.3): a tool that opened the port with a raw
-  // SMS_STS::begin would get past a lock-only holder and print "serial speed". open_bus is refused
-  // at the lock, before begin(), so the line appears on neither stream.
+  // A raw SMS_STS::begin would pass a flock-only holder and print "serial speed"; open_bus is
+  // refused at the lock, before begin(), so the line is on neither stream.
   const ChildHolder holder(fake_.port());
   ASSERT_TRUE(holder.held());
   fake_.clear_frames();
@@ -755,7 +736,7 @@ TEST_F(ToolOpen, holders_are_found_through_a_symlink)
 
 TEST_F(ToolOpen, every_bus_status_maps_to_one_exit_and_a_non_empty_message)
 {
-  // C.0 step 3's table, for every status the bus can report and the errnos that split them.
+  // Every status the bus can report, and the errnos that split them: one exit, one message.
   const std::string port = "/dev/ttyUSB7";
   const std::string holders = " (pid 4321 ros2_control_no)";
   struct Row
@@ -813,7 +794,7 @@ TEST_F(ToolOpen, serial_speed_goes_to_stderr_and_stdout_stays_clean)
 
 TEST_F(ToolOpen, io_timeout_values)
 {
-  // C.0's table: an 8-byte request and a 43-byte reply at 10 bits a byte, plus 2 ms, never below
+  // An 8-byte request and a 43-byte reply at 10 bits a byte, rounded up, plus 2 ms; never below
   // the driver's 5 ms.
   const std::vector<std::pair<int, uint32_t>> table = {
     {9600, 56}, {19200, 29}, {38400, 16}, {57600, 11}, {115200, 7}, {500000, 5}, {1000000, 5}};
@@ -848,7 +829,7 @@ TEST_F(ToolOpen, every_run_function_returns_2_on_a_closed_bus_without_aborting)
   EXPECT_EQ(fake_.bytes_received(), 0u);
 }
 
-// ---- ToolExit (final_exit, tool_main step 5) ----
+// ---- ToolExit (final_exit) ----
 
 TEST(ToolExit, the_port_gone_with_no_write_is_2)
 {
@@ -890,7 +871,7 @@ TEST(ToolExit, a_present_port_changes_nothing)
   }
 }
 
-// ---- ToolScan [Q5 sets the range in every case] ----
+// ---- ToolScan: every case scans ids 0..253 ----
 
 TEST_F(ToolScan, pings_every_id_0_to_253_exactly_attempts_times_and_nothing_else)
 {
@@ -983,8 +964,8 @@ TEST_F(ToolScan, finds_servos_at_0_1_2_3_4_and_253_and_decodes_every_column)
 
 TEST_F(ToolScan, rows_are_eleven_tokens_and_the_header_and_footer_are_fixed)
 {
-  // The HIL parser's contract (E.2 scan_table): the exact header, rows of exactly 11 tokens that
-  // start with the id, the footer, and nothing else on stdout. The column widths are pinned too.
+  // The contract of hil_gates.py scan_table(): exact header, 11-token rows that start with the
+  // id, the footer, nothing else on stdout. Column widths are pinned too.
   seed_bench_like(1, 0);
   seed_bench_like(2, 1);
   const ScanResult result = run_scan();
@@ -1080,9 +1061,8 @@ TEST_F(ToolScan, a_garbled_reads_twin_is_an_anomaly)
 
 TEST_F(ToolScan, a_twin_seen_once_on_a_read_is_still_an_anomaly)
 {
-  // Review fix F6. Twins that ping in step and collide on ONE register read: the retry comes back
-  // clean and every column reads, but the odd reply was a twin all the same -- as on the ping
-  // path, it is kept. One doubled read at id 1, one garbled read at id 2.
+  // Twins that collide on one read only: the clean retry does not hide them, the odd reply is
+  // kept. See docs/tools.md, "Two servos on one id".
   seed_bench_like(1, 0);
   seed_bench_like(2, 0);
   fake_.set_twin(1, TwinReply::doubled_reads, 1);
@@ -1203,7 +1183,7 @@ TEST_F(ToolScan, scan_on_a_closed_bus_returns_2)
   EXPECT_EQ(fake_.bytes_received(), 0u);
 }
 
-// ---- ToolSetId (C.2): writes() is compared as a WHOLE ORDERED LIST ----
+// ---- ToolSetId: writes() is compared as a whole ordered list ----
 
 TEST_F(ToolSetId, moves_4_to_253_and_verifies)
 {
@@ -1236,8 +1216,8 @@ TEST_F(ToolSetId, moves_4_to_253_and_verifies)
 
 TEST_F(ToolSetId, the_id_survives_a_power_cycle_under_volatile_when_locked)
 {
-  // seed_bench_like leaves register 55 at 1, as on the bench: an id written without the verified
-  // unlock, or before it, is applied and then lost at power-off (memory-table row 50).
+  // Lock 55 starts at 1, as on the bench: an id written without the verified unlock is applied,
+  // then lost at power-off.
   const SetIdReport report = run(4, 253);
   ASSERT_EQ(report.exit, Exit::kOk) << err_.str();
   fake_.power_cycle();
@@ -1299,9 +1279,8 @@ TEST_F(ToolSetId, succeeds_for_a_servo_that_acks_no_write)
 
 TEST_F(ToolSetId, refuses_a_taken_new_id_before_addressing_the_start_id)
 {
-  // The bench's H14 `taken` case sends start id 200 (silent) and new id 3 (a servo): it can write
-  // nothing even to a regressed tool only because the taken check comes first and sends nothing
-  // at all to S.
+  // The taken check comes first and sends nothing to S: that is why the bench's H14 `taken`
+  // case (start 200, silent; new 3, a servo) cannot write even with a regressed tool.
   seed_bench_like(3, 1);
   const SetIdReport report = run(4, 3);
   EXPECT_EQ(report.exit, Exit::kRefused);
@@ -1370,9 +1349,8 @@ TEST_F(ToolSetId, refuses_a_garbled_reads_twin_at_the_start_id_exit_4_no_writes)
 
 TEST_F(ToolSetId, a_start_id_garbled_once_then_clean_is_refused_exit_4_no_writes)
 {
-  // Review fix F5 (R10). Two factory-new servos on id 4 collide on the first ping and happen to
-  // be in step for the second: the collision was the only twin evidence there will be, and it is
-  // not thrown away because a later ping came back clean.
+  // Two new servos on id 4 collide on the first ping and are in step on the second: that one
+  // collision is twin evidence and is kept.
   fake_.set_twin(4, TwinReply::garbled, 1);
   const SetIdReport report = run(4, 253);
   EXPECT_EQ(report.exit, Exit::kRefused) << err_.str();
@@ -1419,9 +1397,8 @@ TEST_F(ToolSetId, stops_before_the_id_write_when_the_lock_does_not_open)
 
 TEST_F(ToolSetId, an_unlock_whose_read_back_is_lost_is_relocked_and_verified_exit_5)
 {
-  // Review fix F1. The unlock applies, but its read-back is lost: the lock may be open, so the
-  // relock matters, and its read-back is what says whether it closed. The servo acks no write,
-  // so each write waits out its 100 ms window and the knob lands between write and read-back.
+  // The unlock applies but its read-back is lost: the relock and its read-back decide. No acks,
+  // so each lock write waits its 100 ms window and the knob lands before the read-back.
   fake_.set_write_acks(4, false);
   AfterWrites lose(fake_, 1, [this] {fake_.set_silent_read(4, 55, 1);});
   const SetIdReport report = run(4, 253);
@@ -1444,8 +1421,7 @@ TEST_F(ToolSetId, an_unlock_whose_read_back_is_lost_is_relocked_and_verified_exi
 
 TEST_F(ToolSetId, a_lock_left_unverified_after_a_failed_unlock_is_named_exit_5)
 {
-  // Review fix F1: neither read-back of 55 comes back. Nothing is known about the lock, and exit
-  // 5 names register 55 (A.3: SRAM 55 may differ, and is named).
+  // Neither read-back of 55 comes back: the lock state is unknown, and exit 5 names register 55.
   fake_.set_write_acks(4, false);
   AfterWrites lose(fake_, 1, [this] {fake_.set_silent_read(4, 55);});
   const SetIdReport report = run(4, 253);
@@ -1479,7 +1455,7 @@ TEST_F(ToolSetId, an_id_write_that_does_not_take_is_relocked_exit_5)
 
 TEST_F(ToolSetId, a_servo_lost_after_the_write_exits_6_with_no_further_writes)
 {
-  // context/motor_reset_command_email.png: after an id write the servo answered at neither id.
+  // A reported failure: after an id write, the servo answered at neither id.
   fake_.set_vanish_after_id_write(4);
   const SetIdReport report = run(4, 253);
   EXPECT_EQ(report.exit, Exit::kInconsistent);
@@ -1511,9 +1487,8 @@ TEST_F(ToolSetId, a_lock_that_does_not_close_exits_6)
 
 TEST_F(ToolSetId, an_unreadable_servo_at_the_new_id_is_relocked_exit_6)
 {
-  // Review fix F9. The move happened (N answers, S is silent), but the identity read at N fails:
-  // exit 6, and the lock the run opened is closed again -- exactly one servo answers at N, so a
-  // verified lock there is safe -- and the message says so rather than leaving it open unnamed.
+  // Moved (N answers, S is silent) but N's identity read fails: exit 6. One servo answers at N,
+  // so the lock is closed there, verified, and the message says so.
   AfterWrites unreadable(fake_, 2, [this] {fake_.set_silent_read(253, 3);});
   const SetIdReport report = run(4, 253);
   unreadable.join();
@@ -1531,9 +1506,8 @@ TEST_F(ToolSetId, an_unreadable_servo_at_the_new_id_is_relocked_exit_6)
 
 TEST_P(ToolSetIdSlowCommit, a_slow_eeprom_commit_is_waited_out)
 {
-  // The commit outlasts the 100 ms ack window. An ack from the old id then lands in a ping of
-  // the new one, where it looks like a reply from the wrong servo: it is recorded as the one
-  // tolerated late ack, and the ping is repeated.
+  // The commit outlasts the 100 ms ack window: the old id's ack lands in a ping of the new id
+  // and is kept as the one tolerated late ack. See docs/design.md, "Late acks".
   fake_.set_id_write_ack(4, GetParam());
   fake_.set_eeprom_commit_ms(4, 200);
   const SetIdReport report = run(4, 253);
@@ -1600,9 +1574,8 @@ TEST_F(ToolSetId, stop_flag_before_the_first_write_exits_130_with_no_writes)
 
 TEST_F(ToolSetId, stop_flag_during_the_pre_write_checks_exits_130_with_no_writes)
 {
-  // Review fix F12. Raised once the first ping of N is out, i.e. after the entry check: two more
-  // silent pings of N, the pings of S and its register reads come before the last check, which
-  // is the one that has to catch it -- before the pre-write notice and before any write.
+  // Raised after the first ping of N: the last check, before the pre-write notice and any write,
+  // must catch it.
   std::thread raiser([this] {
       const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
       while (fake_.ping_counts()[253] < 1 && std::chrono::steady_clock::now() < deadline) {
@@ -1622,8 +1595,8 @@ TEST_F(ToolSetId, stop_flag_during_the_pre_write_checks_exits_130_with_no_writes
 
 TEST_F(ToolSetId, a_garbled_id_write_ack_is_recorded_without_an_ack_time)
 {
-  // Review fix F28. Acks are advisory, so the move succeeds; a garbled ack's elapsed time may be
-  // its window's end, so no ack_ms is recorded for it -- the rule calibrate_midpoint follows.
+  // Acks are advisory, so the move succeeds. A garbled ack's time may be its window's end, so
+  // no ack_ms is recorded (calibrate_midpoint does the same).
   fake_.set_garble_write_acks(4, true);
   const SetIdReport report = run(4, 253);
   EXPECT_EQ(report.exit, Exit::kOk) << err_.str();
@@ -1652,9 +1625,8 @@ TEST_F(ToolSetId, stop_flag_after_the_first_write_is_deferred)
 
 TEST_F(ToolSetId, nothing_is_printed_during_the_sequence)
 {
-  // Observed from the commit-latency window: from the first write (the unlock) until the closing
-  // lock goes out, `err` must not grow -- not even by the late-ack line this run has to report,
-  // which arrives in the middle of that window and is only printed once the sequence is over.
+  // From the unlock until the closing lock is sent, err must not grow: the late-ack line arrives
+  // mid-sequence and is printed only after it.
   LockedBuffer buffer;
   std::ostream err(&buffer);
   Session session{bus_, waveshare_servos::defaults::kPingAttempts, kIoTimeoutMs, &stop_, out_,
@@ -1698,7 +1670,7 @@ TEST_F(ToolSetId, edges_start_0_and_new_253)
   EXPECT_EQ(moved->mem[5], 253);
 }
 
-// ---- ToolCalibrate (C.3) [Q1, Q2, Q3] ----
+// ---- ToolCalibrate ----
 
 TEST_F(ToolCalibrate, centres_a_position_servo)
 {
@@ -1777,8 +1749,8 @@ TEST_F(ToolCalibrate, the_offset_survives_a_power_cycle_under_volatile_when_lock
 
 TEST_F(ToolCalibrate, refuses_a_wheel_exit_4_zero_writes)
 {
-  // [Q1] A midpoint means nothing to a wheel, and the old tool's Mode(id, 0) would have silently
-  // made it a position servo.
+  // A midpoint means nothing to a wheel; the old tool's Mode(id, 0) silently made it a position
+  // servo.
   seed_bench_like(3, 1);
   const CalibrateReport report = run(3);
   EXPECT_EQ(report.exit, Exit::kRefused);
@@ -1829,7 +1801,7 @@ TEST_F(ToolCalibrate, a_firmware_that_ignores_128_is_not_applied_exit_5_and_relo
   ASSERT_TRUE(servo.has_value());
   EXPECT_EQ(servo->mem[55], 1);
   EXPECT_EQ(servo->mem[40], 0);
-  // review fix F21/F8: the torque the run switched off is named, as A.3 row 5 requires
+  // The message names the torque the run switched off.
   EXPECT_THAT(
     err_.str(), HasSubstr(
       "the calibration did not take: position still reads 1026 and the offset register is "
@@ -1838,8 +1810,8 @@ TEST_F(ToolCalibrate, a_firmware_that_ignores_128_is_not_applied_exit_5_and_relo
 
 TEST_F(ToolCalibrate, a_moving_servo_is_refused_exit_4_with_only_the_torque_write)
 {
-  // [Q2] A servo that is still moving once its torque is off has no midpoint to take. A helper
-  // thread moves the shaft between reads for longer than the settle window.
+  // A servo still moving with its torque off has no midpoint to take. A helper thread moves the
+  // shaft for longer than the settle window.
   std::atomic<bool> done{false};
   std::thread mover([this, &done] {
       int position = 1026;
@@ -1877,7 +1849,7 @@ TEST_F(ToolCalibrate, an_already_centred_servo_succeeds_without_an_offset_change
 
 TEST_F(ToolCalibrate, stops_before_128_when_the_lock_does_not_open)
 {
-  // [Q3] 55 reads 1 and ignores writes: no 128 without a verified unlock; the torque it already
+  // 55 reads 1 and ignores writes: no 128 without a verified unlock; the torque already
   // switched off is named.
   fake_.set_ignore_write(2, 55, true);
   const CalibrateReport report = run(2);
@@ -1907,8 +1879,6 @@ TEST_F(ToolCalibrate, a_slow_calibration_commit_is_waited_out)
   EXPECT_EQ(fake_.word(2, 56), 2048);
 }
 
-// ---- review fixes (phase6_evidence/DEVIATIONS.md, "review fix F<n>") ----
-
 namespace
 {
 
@@ -1926,8 +1896,7 @@ void note_hup(int signal_number)
 
 TEST_F(ToolCalibrate, an_id_garbled_once_then_clean_is_refused_exit_4_no_writes)
 {
-  // Review fix F5 (R10), as for set_id: a collision on the first ping is twin evidence, whatever
-  // the second ping says.
+  // As for set_id: a collision on the first ping is twin evidence, whatever the second says.
   fake_.set_twin(2, TwinReply::garbled, 1);
   const CalibrateReport report = run(2);
   EXPECT_EQ(report.exit, Exit::kRefused) << err_.str();
@@ -1941,9 +1910,8 @@ TEST_F(ToolCalibrate, an_id_garbled_once_then_clean_is_refused_exit_4_no_writes)
 
 TEST_F(ToolCalibrate, a_lock_left_unverified_after_a_failed_unlock_is_named_exit_5)
 {
-  // Review fix F1, calibrate's side: both read-backs of 55 are lost, so whether the lock closed
-  // again is unknown, and the exit-5 message names register 55 next to the torque. Acks are off,
-  // so the unlock waits out its 100 ms window and the knob lands before its read-back.
+  // Both read-backs of 55 are lost: the lock state is unknown, and exit 5 names 55 and the
+  // torque. No acks, so the unlock's 100 ms window lets the knob land before its read-back.
   fake_.set_write_acks(2, false);
   AfterWrites lose(fake_, 2, [this] {fake_.set_silent_read(2, 55);});
   const CalibrateReport report = run(2);
@@ -1964,10 +1932,8 @@ TEST_F(ToolCalibrate, a_lock_left_unverified_after_a_failed_unlock_is_named_exit
 
 TEST_F(ToolCalibrate, an_offset_that_changes_after_it_was_read_is_inconsistent_exit_6)
 {
-  // Review fix F2. The firmware ignores 128 (the offset model off), and the offset registers move
-  // between step 8's read and step 10's identity read -- a commit that lands late. The later read
-  // is the truth: no "unchanged, nothing changed" exit 5 on the stale one. Acks are off, so the
-  // closing lock's 100 ms window holds the knob's landing before the identity read.
+  // 128 is ignored, then 31-32 change between the post-calibration read and the final identity
+  // read (a late commit): the later read wins, so exit 6, not exit 5 "unchanged".
   fake_.set_offset_model(2, false);
   fake_.set_write_acks(2, false);
   AfterWrites late(fake_, 4, [this] {fake_.set_byte(2, 31, 0x07);});
@@ -1983,9 +1949,8 @@ TEST_F(ToolCalibrate, an_offset_that_changes_after_it_was_read_is_inconsistent_e
 
 TEST_F(ToolCalibrate, a_stop_during_the_settle_exits_130_before_the_unlock)
 {
-  // Review fix F7. The torque is off and an arm may be sagging when the user presses Ctrl-C:
-  // nothing has been written to EEPROM yet, and nothing is. R4's reason for deferring a signal --
-  // never die between unlock and lock -- starts at the unlock, so the last check is just before it.
+  // Ctrl-C during the torque-off settle: nothing is in EEPROM yet, so the last check before the
+  // unlock acts on it. See docs/design.md, "Signals during an EEPROM write".
   AfterWrites raiser(fake_, 1, [this] {stop_ = 1;});
   const CalibrateReport report = run(2);
   raiser.join();
@@ -2002,9 +1967,8 @@ TEST_F(ToolCalibrate, a_stop_during_the_settle_exits_130_before_the_unlock)
 
 TEST_F(ToolCalibrate, a_signal_pending_before_the_unlock_exits_130)
 {
-  // Review fix F7, through a signal: the sequence blocks the four stop signals on this thread from
-  // its first write, so a SIGHUP sent to it stays pending -- its handler has not run, the flag is
-  // still 0 -- when the last check comes. Only sigpending() can see it there.
+  // Through a signal: the sequence blocks the stop signals from its first write, so SIGHUP is
+  // still pending (flag 0) at the last check; only sigpending() sees it.
   struct sigaction mine{};
   mine.sa_handler = note_hup;
   sigemptyset(&mine.sa_mask);
@@ -2031,8 +1995,8 @@ TEST_F(ToolCalibrate, a_signal_pending_before_the_unlock_exits_130)
 
 TEST_F(ToolCalibrate, stop_flag_during_the_pre_write_checks_exits_130_with_no_writes)
 {
-  // Review fix F12. Raised once the first (dropped) ping is out, after the entry check: the last
-  // check before the notice is what has to catch it.
+  // Raised after the first (dropped) ping, past the entry check: the last check before the
+  // notice must catch it.
   fake_.drop_pings(2, 2);
   std::thread raiser([this] {
       const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
@@ -2052,7 +2016,7 @@ TEST_F(ToolCalibrate, stop_flag_during_the_pre_write_checks_exits_130_with_no_wr
 
 TEST_F(ToolCalibrate, stop_flag_after_the_calibration_write_is_deferred)
 {
-  // Review fix F12: from the unlock on, a stop waits for the verified lock (R4).
+  // From the unlock on, a stop waits for the verified lock.
   fake_.set_eeprom_commit_ms(2, 200);
   AfterWrites raiser(fake_, 3, [this] {stop_ = 1;});
   const CalibrateReport report = run(2);
@@ -2067,7 +2031,7 @@ TEST_F(ToolCalibrate, stop_flag_after_the_calibration_write_is_deferred)
 
 TEST_F(ToolCalibrate, a_torque_that_will_not_go_off_is_not_applied_exit_5)
 {
-  // Review fix F17 (a), the Q2 lurch guard: no unlock and no 128 while the torque is still on.
+  // Lurch guard: no unlock and no 128 while the torque is still on.
   fake_.set_ignore_write(2, 40, true);
   const CalibrateReport report = run(2);
   EXPECT_EQ(report.exit, Exit::kNotApplied) << err_.str();
@@ -2082,9 +2046,8 @@ TEST_F(ToolCalibrate, a_torque_that_will_not_go_off_is_not_applied_exit_5)
 
 TEST_F(ToolCalibrate, a_torque_read_back_lost_before_the_unlock_is_named_exit_5)
 {
-  // Review fix F8 (c): a torque write whose read-back is lost leaves the torque state unknown,
-  // which "nothing was changed" would misstate. A 50 ms ack window for SRAM writes and no acks,
-  // so the knob lands between the torque write and its read-back.
+  // A lost torque read-back leaves the torque state unknown, which "nothing was changed" would
+  // misstate. A 50 ms SRAM ack window and no acks let the knob land before the read-back.
   fake_.set_write_acks(2, false);
   Session session{bus_, waveshare_servos::defaults::kPingAttempts, 50, &stop_, out_, err_};
   AfterWrites lost(fake_, 1, [this] {fake_.set_silent_read(2, 40, 1);});
@@ -2102,8 +2065,8 @@ TEST_F(ToolCalibrate, a_torque_read_back_lost_before_the_unlock_is_named_exit_5)
 
 TEST_F(ToolCalibrate, a_lock_that_does_not_close_exits_6)
 {
-  // Review fix F17 (b), the Q3 verified lock: the lock starts open, so a servo that ignores
-  // writes to 55 passes the unlock (it reads 0), takes the 128, and never locks again.
+  // The lock starts open, so a servo that ignores writes to 55 passes the unlock (reads 0),
+  // takes the 128 and never locks again.
   fake_.set_byte(2, 55, 0);
   fake_.set_ignore_write(2, 55, true);
   const CalibrateReport report = run(2);
@@ -2118,8 +2081,8 @@ TEST_F(ToolCalibrate, a_lock_that_does_not_close_exits_6)
 
 TEST_F(ToolCalibrate, a_torque_that_comes_back_on_and_stays_on_exits_6)
 {
-  // Review fix F17 (c), Q2 after the 128: the firmware turns the torque on, and the write that
-  // should switch it off again is ignored. The commit's 200 ms hold the knob's landing.
+  // The firmware turns the torque on after the 128 and ignores the write that should turn it
+  // off. The 200 ms commit holds the knob's landing.
   fake_.set_register40_after(2, 1);
   fake_.set_eeprom_commit_ms(2, 200);
   AfterWrites stuck(fake_, 3, [this] {fake_.set_ignore_write(2, 40, true);});
@@ -2138,7 +2101,7 @@ TEST_F(ToolCalibrate, a_torque_that_comes_back_on_and_stays_on_exits_6)
 
 TEST_F(ToolCalibrate, a_torque_read_back_lost_after_the_calibration_write_is_named)
 {
-  // Review fix F23: an unread register 40 prints as what happened, never as the value -1.
+  // An unread register 40 prints as what happened, never as the value -1.
   fake_.set_eeprom_commit_ms(2, 200);
   AfterWrites lost(fake_, 3, [this] {fake_.set_silent_read(2, 40);});
   const CalibrateReport report = run(2);
@@ -2154,7 +2117,7 @@ TEST_F(ToolCalibrate, a_torque_read_back_lost_after_the_calibration_write_is_nam
 
 TEST_F(ToolCalibrate, a_calibration_that_changes_another_register_exits_6)
 {
-  // Review fix F17 (d): registers 3..39 other than 31-32 must read back as before.
+  // Registers 3..39 other than 31-32 must read back as before.
   fake_.set_eeprom_commit_ms(2, 200);
   AfterWrites stray(fake_, 3, [this] {fake_.set_byte(2, 13, 77);});
   const CalibrateReport report = run(2);
@@ -2168,7 +2131,7 @@ TEST_F(ToolCalibrate, a_calibration_that_changes_another_register_exits_6)
       "[0-9]+ to 77; run scan"));
 }
 
-// ---- ToolFactoryReset (factory_reset_evidence/FACTORY_RESET_SPEC.md 2) ----
+// ---- ToolFactoryReset ----
 
 namespace
 {
@@ -2258,8 +2221,8 @@ TEST_F(ToolFactoryReset, with_torque_already_off_only_the_reset_is_sent)
 
 TEST_F(ToolFactoryReset, moves_a_servo_at_500000_to_the_factory_rate_and_verifies_it_there)
 {
-  // M3: the RESET goes out at 500000 and is acked at that rate; afterwards the servo answers at
-  // 1000000 only. The bus follows it without letting go of the port.
+  // The RESET goes out and is acked at 500000; after it the servo answers at 1000000 only. The
+  // bus follows it without releasing the port.
   at_500000();
   const FactoryResetReport report = run(4);
   EXPECT_EQ(report.exit, Exit::kOk) << err_.str();
@@ -2284,8 +2247,8 @@ TEST_F(ToolFactoryReset, moves_a_servo_at_500000_to_the_factory_rate_and_verifie
 
 TEST_F(ToolFactoryReset, a_servo_already_at_factory_changes_nothing_and_says_so)
 {
-  // M4: a servo already at its factory values is reset all the same, and nothing reads
-  // differently afterwards. That is a success, not a "did not take".
+  // A servo already at its factory values is reset all the same and reads the same after it:
+  // a success, not "did not take".
   fake_.set_byte(4, 33, 0);
   fake_.set_byte(4, 7, 0);
   fake_.set_word(4, 31, 0, 11);
@@ -2334,7 +2297,7 @@ TEST_F(ToolFactoryReset, refuses_twins_exit_4_and_sends_no_reset)
 
 TEST_F(ToolFactoryReset, an_id_garbled_once_then_clean_is_refused_exit_4)
 {
-  // PHASE6 review fix F5, as for set_id and calibrate: one collision is twin evidence.
+  // As for set_id and calibrate: one collision is twin evidence.
   fake_.set_twin(4, TwinReply::garbled, 1);
   const FactoryResetReport report = run(4);
   EXPECT_EQ(report.exit, Exit::kRefused) << err_.str();
@@ -2358,8 +2321,8 @@ TEST_F(ToolFactoryReset, refuses_an_id_register_mismatch_exit_4)
 
 TEST_F(ToolFactoryReset, a_firmware_without_reset_is_not_applied_exit_5)
 {
-  // An instruction the firmware does not know goes unanswered and changes nothing. The torque the
-  // run switched off is named, as A.3 row 5 requires of an SRAM change.
+  // An unknown instruction goes unanswered and changes nothing; the message names the torque
+  // the run switched off.
   fake_.set_reset_supported(4, false);
   const FactoryResetReport report = run(4);
   EXPECT_EQ(report.exit, Exit::kNotApplied) << err_.str();
@@ -2469,9 +2432,8 @@ TEST_F(ToolFactoryReset, stop_flag_during_the_pre_write_checks_exits_130_with_no
 
 TEST_F(ToolFactoryReset, a_stop_after_the_torque_write_exits_130_before_the_reset)
 {
-  // Review fix F7's rule for the reset: the torque write comes before anything that cannot be
-  // undone, so a stop there is still acted on. The servo acks no write and the SRAM ack window is
-  // 50 ms, which is what gives the raiser time to land between the torque write and the check.
+  // The torque write comes before anything that cannot be undone, so a stop there is acted on.
+  // No acks and a 50 ms SRAM ack window let the raiser land before the check.
   fake_.set_write_acks(4, false);
   Session session{bus_, waveshare_servos::defaults::kPingAttempts, 50, &stop_, out_, err_};
   AfterWrites raiser(fake_, 1, [this] {stop_ = 1;});
@@ -2541,8 +2503,8 @@ TEST_F(ToolFactoryReset, the_reset_survives_a_power_cycle_under_volatile_when_lo
 
 TEST_F(ToolFactoryReset, a_reset_that_leaves_the_lock_open_is_closed_and_verified)
 {
-  // The ST3025's reset closes the lock (M5); a firmware that leaves SRAM alone would leave a lock
-  // this run found open still open, so the tool closes it.
+  // The ST3025's RESET closes the lock; a firmware that keeps SRAM would leave an open lock
+  // open, so the tool closes it and verifies.
   fake_.set_byte(4, 55, 0);
   fake_.set_reset_keeps_sram(4, true);
   const FactoryResetReport report = run(4);

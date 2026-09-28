@@ -33,7 +33,7 @@ namespace tools
 namespace
 {
 
-// servo_tools.hpp's typed copies of the vendored register names (review fix F29): kept equal.
+// servo_tools.hpp's typed copies of the vendored register names: kept equal.
 static_assert(kRegModelL == SMS_STS_MODEL_L && kRegId == SMS_STS_ID, "register names drifted");
 static_assert(kRegBaud == SMS_STS_BAUD_RATE && kRegOffsetL == SMS_STS_OFS_L, "register drift");
 static_assert(kRegLock == SMS_STS_LOCK, "register names drifted");
@@ -137,9 +137,8 @@ void add_once(std::vector<std::string> * anomalies, const std::string & anomaly)
   }
 }
 
-// C.1 step 3: "A read that is not ONE is retried once." A first reply that was doubled, garbled
-// or from another id is still twin evidence when the retry comes back clean, so it is kept as an
-// anomaly of the row, exactly as the ping path keeps one (R10; review fix F6).
+// A read that is not ONE is retried once. A doubled, garbled or wrong-id first reply stays an
+// anomaly of the row even if the retry is clean: it is still evidence of a second servo.
 Reply read_with_retry(
   ServoBus & bus, uint8_t id, uint8_t first, uint8_t count, std::vector<std::string> * anomalies)
 {
@@ -156,7 +155,7 @@ Reply read_with_retry(
 }
 
 // One table row: 11 whitespace-separated tokens, `?` for whatever could not be read and for
-// whatever derives from it, right-aligned under the header's column ends (C.1).
+// whatever derives from it, right-aligned under the header's column ends.
 std::string scan_row_text(const ScanRow & row)
 {
   const auto known = [](bool readable, const std::string & text) {
@@ -209,11 +208,8 @@ std::string reply_text(const Reply & reply, const char * transaction, int id)
   return text + " at a " + transaction + " of " + std::to_string(id);
 }
 
-// C.0 "Deferred signals" and "Quiet sequence", from the first write to the end of a sequence: the
-// four stop signals are blocked on this thread (their handlers stay installed, so a signal
-// delivered to another thread still only sets the flag), and every diagnostic goes to a buffer
-// that is printed once the sequence is over. With SIGPIPE ignored as well, nothing a user or a
-// closed pipe does can stop the tool between an EEPROM unlock and its lock.
+// Blocks the stop signals and buffers diagnostics from the first write to the end of a sequence.
+// See docs/design.md, "Signals during an EEPROM write".
 class Sequence
 {
 public:
@@ -244,8 +240,8 @@ public:
 
   std::ostream & err() {return started_ ? buffer_ : session_.err;}
 
-  // The last stop check, just before the unlock (review fix F7): the flag, or a stop signal held
-  // pending by this sequence's own mask -- its handler has not run, so the flag cannot show it.
+  // The last stop check before the unlock or the RESET: the flag, or a stop signal held pending
+  // by this sequence's own mask (its handler has not run, so the flag cannot show it).
   bool stop_pending() const
   {
     if (stop_requested(session_)) {
@@ -291,9 +287,8 @@ private:
   bool started_ = false;
 };
 
-// The transactions of one set_id or calibrate run: every write is counted (the report's
-// writes_sent is compared with the wire in the tests), and from the committing write on, the one
-// tolerated late ack (C.0) is recognised, recorded and its transaction repeated.
+// The transactions of one run: each write and the RESET is counted (tests compare writes_sent
+// with the wire); after arm(), one late ack is recognised, recorded and its transaction repeated.
 class Wire
 {
 public:
@@ -326,7 +321,7 @@ public:
   Clock::time_point committed() const {return committed_;}
 
   // True for the first reply that is_late_ack() accepts after arm(); it is recorded and the
-  // caller repeats the transaction. A second one, like any other anomaly, is the caller's to judge.
+  // caller repeats the transaction. A second one, like any other anomaly, the caller judges.
   bool tolerated(const Reply & reply, const char * transaction, int id)
   {
     if (log_ == nullptr || *late_from_ != -1 || !is_late_ack(reply, {late_a_, late_b_})) {
@@ -348,9 +343,8 @@ public:
     return reply;
   }
 
-  // Writes `value` to register 55 and reads it back: the verified unlock (0) and lock (1) of C.0.
-  // Only a read-back of 55 itself can show that a lock did not open; a read-back of the payload
-  // cannot. Returns the read-back.
+  // Writes register 55 (0 opens the EEPROM lock, 1 closes it) and returns its read-back: only
+  // that read-back shows a lock that did not open. See docs/design.md, "Servo registers".
   Reply set_lock(uint8_t id, uint8_t value)
   {
     write(id, kRegLock, value, kEepromAckMs);
@@ -380,9 +374,8 @@ private:
   Clock::time_point committed_{};
 };
 
-// The end of a sequence: signals unblocked, the held-back diagnostics printed, then the outcome
-// -- a success on `out`, anything else on `err` -- and the deferred-signal note when one came. An
-// exit 130 is the signal acted upon before the unlock, so it gets no "completed first".
+// Ends a sequence: unblocks signals, prints the held-back diagnostics, then the outcome. Exit 130
+// acted on the signal before any EEPROM change, so it gets no "completed first" note.
 template<typename Report>
 Report conclude(
   Report & report, Session & session, Sequence & sequence, Exit exit, const std::string & message)
@@ -410,9 +403,8 @@ std::string raw_word(int value)
   return text;
 }
 
-// The best-effort relock after an unlock that did not verify (C.0), read back and recorded
-// (review fix F1): "" when 55 reads 1 again, else the clause exit 5 must carry -- A.3 allows SRAM
-// 55 to differ only when the message names it.
+// "" when the best-effort relock reads back 1, else the clause the exit 5 message must carry:
+// exit 5 allows register 55 (SRAM) to differ only when the message names it.
 std::string relock_clause(const Reply & relocked)
 {
   if (relocked && relocked.data[0] == 1) {
@@ -467,8 +459,8 @@ uint32_t io_timeout_ms_for(int baudrate) noexcept
   if (baudrate <= 0) {
     return floor;
   }
-  // 51 bytes of 10 bits each, in milliseconds, rounded up: integer arithmetic, so the table in
-  // C.0 is exact and no libm rounding mode can move it.
+  // 51 bytes of 10 bits each, in milliseconds, rounded up: integer arithmetic, so no libm
+  // rounding mode can move the result.
   constexpr uint64_t kBitMilliseconds = 51u * 10u * 1000u;
   const uint64_t rate = static_cast<uint64_t>(baudrate);
   const uint32_t wire = static_cast<uint32_t>((kBitMilliseconds + rate - 1) / rate) + 2u;
@@ -477,8 +469,8 @@ uint32_t io_timeout_ms_for(int baudrate) noexcept
 
 int offset_from_raw(uint16_t raw) noexcept
 {
-  // -(raw & ~bit) like the driver's signed_on_bit_ten (src/servo_bus.cpp:62-65): bits above the
-  // sign stay in the magnitude rather than being masked away, so garbage shows as garbage.
+  // -(raw & ~bit) like the driver's signed_on_bit_ten: bits above the sign stay in the
+  // magnitude rather than being masked away, so garbage shows as garbage.
   constexpr uint16_t kSign = 1u << 11;
   return (raw & kSign) != 0 ? -static_cast<int>(raw & ~kSign) : static_cast<int>(raw);
 }
@@ -553,9 +545,8 @@ Exit open_bus(ServoBus & bus, const std::string & port, int baudrate, std::ostre
     canonical = port;
   }
 
-  // Step 2: stdout is the tools' result channel, and SCSerial::begin() printf()s "serial speed N"
-  // to it (ServoBus::open flushes right after). For the length of the open, descriptor 1 is
-  // descriptor 2, so the line lands on stderr; a refusal before begin() prints it nowhere.
+  // Step 2: SCSerial::begin() printf()s "serial speed N" to stdout, the result channel. For the
+  // length of the open, descriptor 1 is descriptor 2, so the line lands on stderr.
   std::fflush(stdout);
   const int saved = ::dup(STDOUT_FILENO);
   if (saved != -1) {
@@ -594,7 +585,7 @@ Exit open_bus(ServoBus & bus, const std::string & port, int baudrate, std::ostre
 bool is_late_ack(const Reply & reply, std::initializer_list<int> ids) noexcept
 {
   // A ping that caught it sees a well-formed six-byte frame from the wrong id; a read that caught
-  // it sees a bare status frame where its payload should be (B.4, appendix J #3).
+  // it sees a bare status frame where its payload should be.
   const bool shaped = (reply.kind == ReplyKind::WRONG_ID && reply.frame_bytes == 6) ||
     reply.kind == ReplyKind::STATUS_ONLY;
   return shaped && std::find(ids.begin(), ids.end(), reply.from_id) != ids.end();
@@ -602,9 +593,8 @@ bool is_late_ack(const Reply & reply, std::initializer_list<int> ids) noexcept
 
 Exit final_exit(Exit outcome, std::size_t writes_sent, bool port_exists) noexcept
 {
-  // A port that vanished during the run (a USB drop) says nothing about the servos unless a
-  // write went out: then the run's own outcome is still the truth about their state, and "2:
-  // nothing sent" would be a lie. 130 stays 130: the run stopped on a signal either way.
+  // A vanished port (a USB drop) gives exit 2 only if no write went out; otherwise the outcome
+  // still describes the servo. 130 stays 130.
   if (port_exists || outcome == Exit::kInterrupted || writes_sent > 0) {
     return outcome;
   }
@@ -699,7 +689,7 @@ ScanResult scan(Session & session, uint8_t first, uint8_t last)
         to_string(feedback.kind) + ")");
     }
 
-    // Step 5: notes, which change nothing about the exit.
+    // Step 4: notes, which change nothing about the exit.
     if (id == 0) {
       row.notes.push_back(
         "the hardware interface accepts ids 1..253; give this servo another id with set_id "
@@ -708,7 +698,7 @@ ScanResult scan(Session & session, uint8_t first, uint8_t last)
     if (row.identity && row.mode >= 2) {
       row.notes.push_back("mode " + std::to_string(row.mode) + " has no driver support");
     }
-    // Raw, because the driver's bit names and memory-table row 57 disagree on bits 1 and 4.
+    // Raw, because the driver's bit names and the STS3215 memory table disagree on bits 1 and 4.
     if (row.status > 0) {
       row.notes.push_back("status " + hex_byte(row.status));
     }
@@ -812,8 +802,8 @@ SetIdReport set_id(Session & session, uint8_t start_id, uint8_t new_id)
     return refuse(Exit::kInterrupted, "interrupted; nothing was written");
   }
 
-  // Step 1, before anything is sent to S: N answers nothing, on EVERY attempt. This order is what
-  // lets the bench's refusal cases address a silent start id safely (R11, E.4).
+  // Step 1, before anything goes to S (start_id): N (new_id) is silent on EVERY attempt. This
+  // order lets the bench check's refusal cases address a silent start id safely.
   for (int attempt = 0; attempt < attempts; attempt++) {
     if (bus.checked_ping(new_id).kind != ReplyKind::SILENT) {
       return refuse(
@@ -824,9 +814,8 @@ SetIdReport set_id(Session & session, uint8_t start_id, uint8_t new_id)
     }
   }
 
-  // Step 2: one clean answer from S, and every reply before it silent. A doubled, garbled or
-  // misaddressed reply refuses even when a later ping comes back clean: two servos that collided
-  // once and then happened to answer in step are still two servos (R10; review fix F5).
+  // Step 2: one clean answer from S, and every reply before it silent; one collision refuses.
+  // See docs/tools.md, "Two servos on one id".
   const std::string twins = "more than one servo may answer at id " + s + " (factory-new servos "
     "all start at id 1); connect only the servo to renumber. Nothing was written.";
   bool answered = false;
@@ -886,7 +875,7 @@ SetIdReport set_id(Session & session, uint8_t start_id, uint8_t new_id)
       return conclude(report, session, sequence, exit, message);
     };
   // A stop that came after the check above -- while the notice was written -- is still acted on:
-  // nothing has been written yet (review fix F7).
+  // nothing has been written yet.
   if (sequence.stop_pending()) {
     return finish(Exit::kInterrupted, "interrupted; nothing was written");
   }
@@ -894,7 +883,7 @@ SetIdReport set_id(Session & session, uint8_t start_id, uint8_t new_id)
   const Reply unlocked = wire.set_lock(start_id, 0);
   report.unlock_read = unlocked ? unlocked.data[0] : -1;
   if (report.unlock_read != 0) {
-    // best effort: put the lock back as it most likely was, and say what it reads (F1)
+    // best effort: put the lock back as it most likely was, and say what it reads
     const Reply relocked = wire.set_lock(start_id, 1);
     report.lock_after = relocked ? relocked.data[0] : -1;
     return finish(
@@ -909,7 +898,7 @@ SetIdReport set_id(Session & session, uint8_t start_id, uint8_t new_id)
   if (ack.kind == ReplyKind::SILENT) {
     report.id_write_ack = "none";
   } else if (ack.kind == ReplyKind::GARBLED) {
-    report.id_write_ack = "garbled";  // no ack_ms: its elapsed time may be the window's end (F28)
+    report.id_write_ack = "garbled";  // no ack_ms: its elapsed time may be the window's end
   } else {
     report.id_write_ack = ack.from_id == start_id ? "old_id" :
       (ack.from_id == new_id ? "new_id" : "other");
@@ -960,8 +949,8 @@ SetIdReport set_id(Session & session, uint8_t start_id, uint8_t new_id)
     report.old_id_silent = silent == attempts;
   }
 
-  // The outcome matrix of step 6. No row but the first writes anything further, apart from the
-  // relock of the second.
+  // The outcomes of step 6. Only "the id did not take" writes again here (the relock at S);
+  // success goes on to step 7.
   if (!anomalies.empty()) {
     std::string kinds;
     for (const std::string & anomaly : anomalies) {
@@ -1001,9 +990,8 @@ SetIdReport set_id(Session & session, uint8_t start_id, uint8_t new_id)
       "servo was on id " + s + " or " + n + ". Run scan.");
   }
 
-  // Step 7: the servo at N is the servo that was at S, with only its id changed. On a failure
-  // exactly one servo answers at N and none at S, so the lock this run opened is closed there
-  // before the exit, and the message says whether it closed (review fix F9).
+  // Step 7: the servo at N is the one that was at S, with only its id changed. On a failure the
+  // lock this run opened is closed at N first, and the message says whether it closed.
   const auto relocked_at_n = [&wire, &report, new_id]() {
       const Reply locked = wire.set_lock(new_id, 1);
       report.lock_after = locked ? locked.data[0] : -1;
@@ -1073,8 +1061,8 @@ CalibrateReport calibrate_midpoint(Session & session, uint8_t id)
     return refuse(Exit::kInterrupted, "interrupted; nothing was written");
   }
 
-  // Step 1: one clean answer, and every reply before it silent -- as set_id's step 2 (R10; review
-  // fix F5): a collision seen once is twin evidence, whatever a later ping says.
+  // Step 1: one clean answer, and every reply before it silent, as in set_id's step 2: a
+  // collision seen once is twin evidence, whatever a later ping says.
   const std::string twins = "more than one servo may answer at id " + i + "; connect only the "
     "servo to calibrate. Nothing was written.";
   bool answered = false;
@@ -1123,7 +1111,7 @@ CalibrateReport calibrate_midpoint(Session & session, uint8_t id)
   report.offset_raw_before = word_at(before.data, at(kRegOffsetL));
   report.torque_before = torque.data[0];
 
-  // Step 3 [Q1]: a midpoint means something only to a position servo, and the mode is an EEPROM
+  // Step 3: a midpoint means something only to a position servo, and the mode is an EEPROM
   // write this tool does not make.
   if (report.mode != 0) {
     const char * kind = report.mode == 1 ? "wheel" : (report.mode == 2 ? "pwm" : "other");
@@ -1138,8 +1126,8 @@ CalibrateReport calibrate_midpoint(Session & session, uint8_t id)
     return refuse(Exit::kInterrupted, "interrupted; nothing was written");
   }
 
-  // Step 4 [Q2]: the sequence starts with the torque off. With torque on, the servo would drive to
-  // its old goal in the new frame the moment the offset changed -- about 1022 ticks on the bench.
+  // Step 4: torque off first, or the servo drives to its old goal in the new frame the moment
+  // the offset changes. See docs/tools.md, "calibrate_midpoint".
   Sequence sequence(session);
   sequence.begin(
     "about to calibrate the midpoint of servo " + i + " (an EEPROM write of its offset, registers "
@@ -1155,7 +1143,7 @@ CalibrateReport calibrate_midpoint(Session & session, uint8_t id)
     const Reply off = wire.read(id, SMS_STS_TORQUE_ENABLE, 1);
     if (!off || off.data[0] != 0) {
       // Read back as still on: nothing changed. Not read back at all: the write may have taken,
-      // so the torque state is unknown, and the message may not claim otherwise (F8).
+      // so the torque state is unknown, and the message may not claim otherwise.
       return finish(
         Exit::kNotApplied, "could not switch the torque of servo " + i + " off (register 40 "
         "reads " + byte_read(off) + "); " + (off ? std::string("nothing was changed") :
@@ -1164,8 +1152,8 @@ CalibrateReport calibrate_midpoint(Session & session, uint8_t id)
     torque_clause = "; its torque is now OFF";
   }
 
-  // Step 5 [Q2]: the position the verdict is measured against is the one it settles at with the
-  // torque off: two reads 100 ms apart within 1 tick, sampled every 20 ms.
+  // Step 5: the verdict's reference is the position it settles at with the torque off: two
+  // reads 100 ms apart within 1 tick, sampled every 20 ms.
   constexpr int kSampleMs = 20;
   constexpr int kSettleSpanMs = 100;
   constexpr int kSettleTicks = 1;
@@ -1204,20 +1192,19 @@ CalibrateReport calibrate_midpoint(Session & session, uint8_t id)
     std::this_thread::sleep_until(read_at + std::chrono::milliseconds(kSampleMs));
   }
 
-  // The last stop check (review fix F7). The torque write and the settle come before any EEPROM
-  // write; R4's reason to hold a signal back -- never die between unlock and lock -- starts at
-  // the unlock. So a Ctrl-C while the arm settles stops the run here, with the offset untouched.
+  // The last stop check: a signal held back during the torque write and the settle still stops
+  // the run here, before the unlock, with the offset untouched.
   if (sequence.stop_pending()) {
     return finish(
       Exit::kInterrupted, torque_clause.empty() ? std::string("interrupted; nothing was written") :
       "interrupted" + torque_clause + "; no EEPROM byte was written");
   }
 
-  // Step 6 [Q3]: the verified unlock, so the offset outlives a power cycle.
+  // Step 6: the verified unlock, so the offset outlives a power cycle.
   const Reply unlocked = wire.set_lock(id, 0);
   report.unlock_read = unlocked ? unlocked.data[0] : -1;
   if (report.unlock_read != 0) {
-    // best effort: put the lock back as it most likely was, and say what it reads (F1)
+    // best effort: put the lock back as it most likely was, and say what it reads
     const Reply relocked = wire.set_lock(id, 1);
     report.lock_after = relocked ? relocked.data[0] : -1;
     return finish(
@@ -1227,7 +1214,7 @@ CalibrateReport calibrate_midpoint(Session & session, uint8_t id)
   }
 
   // Step 7: the byte SMS_STS::CalibrationOfs writes, through the id-checked primitive. From here
-  // one late ack from I is tolerated.
+  // one late ack from the servo is tolerated.
   wire.arm(id, id, "calibration write", &sequence.err());
   const Reply ack = wire.write(id, SMS_STS_TORQUE_ENABLE, 128, kEepromAckMs);
   if (ack.kind == ReplyKind::SILENT) {
@@ -1239,9 +1226,8 @@ CalibrateReport calibrate_midpoint(Session & session, uint8_t id)
     report.ack_ms = static_cast<int>(ack.elapsed_us / 1000);
   }
 
-  // Step 8: poll the position until it reads the midpoint. A read the servo answered is paced at
-  // 20 ms; a silent one has already waited its whole window, so the next goes out at once and a
-  // late ack is always heard by somebody.
+  // Step 8: poll the position until it reads the midpoint. An answered read is paced at 20 ms; a
+  // silent one already waited its window, so the next goes at once and a late ack is heard.
   std::vector<std::string> anomalies;
   const Clock::time_point poll_started = Clock::now();
   while (true) {
@@ -1271,7 +1257,7 @@ CalibrateReport calibrate_midpoint(Session & session, uint8_t id)
   const Reply register40 = wire.read(id, SMS_STS_TORQUE_ENABLE, 1);
   report.register40_after = register40 ? register40.data[0] : -1;
 
-  // Step 9 [Q2]: torque stays off, whatever the firmware did to register 40 after the 128.
+  // Step 9: torque stays off, whatever the firmware did to register 40 after the 128.
   Reply off;
   if (report.register40_after != 0) {
     wire.write(id, SMS_STS_TORQUE_ENABLE, 0, session.io_timeout_ms);
@@ -1281,7 +1267,7 @@ CalibrateReport calibrate_midpoint(Session & session, uint8_t id)
     report.torque_final = 0;
   }
 
-  // Step 10 [Q3]: the verified lock, and every other identity register as it was.
+  // Step 10: the verified lock, and every other identity register as it was.
   const Reply locked = wire.set_lock(id, 1);
   report.lock_after = locked ? locked.data[0] : -1;
   const Reply after = wire.read(id, kIdentityFirst, kIdentityBytes);
@@ -1298,9 +1284,8 @@ CalibrateReport calibrate_midpoint(Session & session, uint8_t id)
     report.identity_same = changed.empty();
   }
 
-  // What the verdict does not gate (G.1.2): the sign of the offset change against
-  // position_before - 2048, recorded only. H16 measured the ST3025's convention as +1 (the offset
-  // moves by position_before - 2048; README NOTE offset_sign), and the fake models the same.
+  // offset_sign is recorded, not gated; the ST3025 and the fake bus both give +1.
+  // See docs/tools.md, "calibrate_midpoint".
   const int before_ofs = offset_from_raw(static_cast<uint16_t>(report.offset_raw_before));
   const uint16_t raw_after = static_cast<uint16_t>(std::max(report.offset_raw_after, 0));
   const int after_ofs = offset_from_raw(raw_after);
@@ -1319,7 +1304,7 @@ CalibrateReport calibrate_midpoint(Session & session, uint8_t id)
   }
   if (report.torque_final != 0) {
     // In this branch step 9 wrote and read 40 (torque_final is 0 without it), so `off` is its
-    // read-back: a value, or what came instead of one -- never a -1 dressed as a value (F23).
+    // read-back: a value, or what came instead of one -- never a -1 dressed as a value.
     return finish(
       Exit::kInconsistent, "the torque of servo " + i + (off ? " will not go off" :
       " cannot be confirmed off") + " after the calibration write (register 40 reads " +
@@ -1341,9 +1326,8 @@ CalibrateReport calibrate_midpoint(Session & session, uint8_t id)
       Exit::kInconsistent, "the calibration write changed more than the offset of servo " + i +
       ": " + changed + "; run scan");
   }
-  // Step 10's read also holds 31-32, later than step 8's. The verdict below rests on step 8's, so
-  // the two must agree: an offset that moved in between (a commit landing late) makes both the
-  // "unchanged" of exit 5 and the "went from" of exit 0 claims about a stale read (review fix F2).
+  // Step 10 read 31-32 again, later than step 8's read that the verdict uses: an offset that
+  // moved in between (a late commit) would make the verdict rest on a stale read.
   const int offset_final = word_at(after.data, at(kRegOffsetL));
   if (report.offset_raw_after >= 0 && offset_final != report.offset_raw_after) {
     return finish(
@@ -1365,7 +1349,7 @@ CalibrateReport calibrate_midpoint(Session & session, uint8_t id)
     " (raw " + raw_word(report.offset_raw_before) + " -> " + raw_word(report.offset_raw_after) +
     ")";
   if (!centred && !offset_changed) {
-    // A.3 row 5: an SRAM change this run made is named -- here the torque step 4 switched off.
+    // Exit 5 names any SRAM change this run made: here the torque step 4 switched off.
     return finish(
       Exit::kNotApplied, "the calibration did not take: position still reads " +
       std::to_string(*report.position_after) + " and the offset register is unchanged; any lock "
@@ -1408,8 +1392,8 @@ FactoryResetReport factory_reset(Session & session, uint8_t id)
     return refuse(Exit::kInterrupted, "interrupted; nothing was written");
   }
 
-  // Step 1: one clean answer, and every reply before it silent, as set_id and calibrate (review
-  // fix F5): a RESET to an id two servos share resets both.
+  // Step 1: one clean answer, and every reply before it silent, as in set_id: a RESET to an id
+  // that two servos share resets both.
   const std::string twins = "more than one servo may answer at id " + i + "; connect only the "
     "servo to reset. Nothing was written.";
   bool answered = false;
@@ -1466,7 +1450,7 @@ FactoryResetReport factory_reset(Session & session, uint8_t id)
     return refuse(Exit::kInterrupted, "interrupted; nothing was written");
   }
 
-  // Step 4: the sequence. From here every path ends in finish().
+  // Step 3: the sequence. From here every path ends in finish().
   const int rate_before = bus.baudrate();
   Sequence sequence(session);
   sequence.begin(
@@ -1483,9 +1467,8 @@ FactoryResetReport factory_reset(Session & session, uint8_t id)
     return finish(Exit::kInterrupted, "interrupted; nothing was written");
   }
 
-  // Step 5: the torque off, as calibrate's step 4. The ST3025's reset switches it off by itself
-  // (M4), but in which order it rewrites the mode, the offset and the torque is unmeasured, and a
-  // servo still holding a position when its offset or mode changes under it would lurch.
+  // Step 4: torque off, as in calibrate_midpoint. The reset also turns it off, but in an unknown
+  // order, and a servo that holds a position while its offset or mode changes would lurch.
   std::string torque_clause;
   if (report.torque_before != 0) {
     wire.write(id, SMS_STS_TORQUE_ENABLE, 0, session.io_timeout_ms);
@@ -1500,14 +1483,14 @@ FactoryResetReport factory_reset(Session & session, uint8_t id)
     torque_clause = "; its torque is now OFF";
   }
 
-  // Step 6: the last stop check (review fix F7's rule): nothing so far is more than an SRAM write.
+  // Step 5: the last stop check; nothing so far is more than an SRAM write.
   if (sequence.stop_pending()) {
     return finish(
       Exit::kInterrupted, torque_clause.empty() ? std::string("interrupted; nothing was written") :
       "interrupted" + torque_clause + "; the reset was not sent");
   }
 
-  // Step 7: the RESET. Its ack is recorded, never believed; from here one late ack is tolerated.
+  // Step 6: the RESET. Its ack is recorded, never believed; from here one late ack is tolerated.
   wire.arm(id, id, "reset", &sequence.err());
   const Reply ack = wire.reset(id, kEepromAckMs);
   if (ack.kind == ReplyKind::SILENT) {
@@ -1519,8 +1502,8 @@ FactoryResetReport factory_reset(Session & session, uint8_t id)
     report.ack_ms = static_cast<int>(ack.elapsed_us / 1000);
   }
 
-  // Step 8: a reset servo talks at the factory rate (M3). The line follows it on the descriptor
-  // the bus already holds, so the port is never let go.
+  // Step 7: a reset servo talks at the factory rate. The line follows it on the descriptor the
+  // bus already holds, so the port is never let go.
   const auto elsewhere_hint = []() {
       return "Run scan with -p baudrate:=" + std::to_string(kFactoryBaudrate) + ", the rate a "
              "reset servo talks at; power-cycle it if it answers nowhere.";
@@ -1533,7 +1516,7 @@ FactoryResetReport factory_reset(Session & session, uint8_t id)
       elsewhere_hint());
   }
 
-  // Step 9: poll a READ of the identity block. A READ sees a late ack as a bare status frame,
+  // Step 8: poll a READ of the identity block. A READ sees a late ack as a bare status frame,
   // which a ping could not tell from its own reply.
   std::vector<std::string> anomalies;
   const auto read_back = [&bus, &wire, &anomalies, id]() {
@@ -1571,8 +1554,8 @@ FactoryResetReport factory_reset(Session & session, uint8_t id)
   }
   report.verify_ms = elapsed_ms(wire.committed());
 
-  // Step 10: torque off and the lock closed, each verified -- the ST3025's reset leaves both so
-  // (M4, M5), and a firmware that does not is put there.
+  // Step 9: torque off and the lock closed, each verified. The ST3025's reset leaves both so; a
+  // firmware that does not is put there.
   std::string lock_clause;
   if (after) {
     Reply off = wire.read(id, SMS_STS_TORQUE_ENABLE, 1);
@@ -1589,7 +1572,7 @@ FactoryResetReport factory_reset(Session & session, uint8_t id)
     report.lock_after = locked ? locked.data[0] : -1;
   }
 
-  // Step 11: the verdict.
+  // Step 10: the verdict.
   if (!anomalies.empty()) {
     return finish(
       Exit::kInconsistent, "after the reset of servo " + i + " the replies were not clean (" +
@@ -1652,7 +1635,7 @@ FactoryResetReport factory_reset(Session & session, uint8_t id)
       " (factory: 0, 0x0000 and 0); registers changed: " + changed + ". Run scan.");
   }
 
-  // Step 12.
+  // Step 11.
   const std::string what_changed = changed.empty() ?
     std::string("No register in 3..39 changed: it was at them already. ") :
     "Registers changed: " + changed + ". ";

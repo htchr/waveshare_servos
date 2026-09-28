@@ -54,10 +54,8 @@ def generate_launch_description():
     use_mock_hardware = LaunchConfiguration('use_mock_hardware')
     gui = LaunchConfiguration('gui')
 
-    # Command concatenates this list with no separator, so every space is an element of its own.
-    # xacro accepts arguments a document does not declare, silently and with exit status 0, so
-    # these three name:= pairs only do anything because description/urdf/example.urdf.xacro
-    # declares them and forwards them into the example_ws_ros2_control macro call.
+    # Command joins this list with no separator, so each space is its own element. xacro ignores
+    # an undeclared arg silently, so example.urdf.xacro must declare all three.
     robot_description_content = Command(
         [
             PathJoinSubstitution([FindExecutable(name='xacro')]),
@@ -75,9 +73,8 @@ def generate_launch_description():
             ' ', 'use_mock_hardware:=', use_mock_hardware,
         ]
     )
-    # The rendered URDF is XML, not YAML. Without an explicit ``value_type=str`` launch tries to
-    # YAML-parse it and aborts the whole launch the moment the document contains anything YAML
-    # considers syntax (a colon in an XML comment is enough).
+    # value_type=str: the URDF is XML, and launch would otherwise YAML-parse it (a colon in an
+    # XML comment aborts the launch).
     robot_description = {
         'robot_description': ParameterValue(robot_description_content, value_type=str)
     }
@@ -93,11 +90,8 @@ def generate_launch_description():
         [FindPackageShare('waveshare_servos'), 'description/rviz', 'example_ws.rviz']
     )
 
-    # The controller manager takes the robot description from the /robot_description topic that
-    # robot_state_publisher latches (transient-local), so there is no ~/robot_description
-    # subscription for a remapping to match and this node carries none. output='both' puts both the
-    # driver's log lines and the vendored serial layer's raw stdout on the console and in
-    # launch.log; output='log' hid only the latter.
+    # Takes the URDF from robot_state_publisher's transient-local /robot_description; no remap.
+    # output='both' also shows the vendored serial layer's raw stdout.
     control_node = Node(
         package='controller_manager',
         executable='ros2_control_node',
@@ -110,10 +104,8 @@ def generate_launch_description():
         output='both',
         parameters=[robot_description],
     )
-    # RViz can start straight away: robot_state_publisher publishes /robot_description with
-    # transient-local durability, so a late subscriber still receives it. The saved config must ask
-    # for that durability, which is why example_ws.rviz sets the RobotModel description topic to
-    # Transient Local - with Volatile there, RViz would silently show no model.
+    # example_ws.rviz reads /robot_description as Transient Local; with Volatile, RViz would show
+    # no model and no error.
     rviz_node = Node(
         package='rviz2',
         executable='rviz2',
@@ -123,13 +115,8 @@ def generate_launch_description():
         condition=IfCondition(gui),
     )
 
-    # One spawner, three controllers, in this order. Without --activate-as-group the spawner loads,
-    # configures and activates them strictly in command-line order with one switch each, so
-    # joint_state_broadcaster comes up first and a controller that fails to activate does not take
-    # the others down with it. The spawner waits for the controller manager indefinitely
-    # (--controller-manager-timeout defaults to 0.0), so no timer or event handler is needed to
-    # sequence it after control_node. The controller manager already has this YAML as its own
-    # parameters; --param-file makes the spawner self-contained as well.
+    # One switch per controller, in this order (no --activate-as-group), so one failure does not
+    # stop the others. The spawner waits for the controller manager with no timeout.
     controller_spawner = Node(
         package='controller_manager',
         executable='spawner',
@@ -145,20 +132,8 @@ def generate_launch_description():
         ],
     )
 
-    # diff_drive_controller drives joint3/joint4 through the same velocity command interfaces as
-    # joint_velocity_controller, and ros2_control gives each command interface to one controller
-    # only, so the two can never be active together. It is loaded and configured but left inactive:
-    # it claims no interface and cannot move a servo, while its cmd_vel and odom topics exist from
-    # startup. Swap with
-    #   ros2 control switch_controllers --strict \
-    #     --deactivate joint_velocity_controller --activate diff_drive_controller
-    #
-    # Ordering between the two spawner PROCESSES is a race, not a sequence: every spawner on this
-    # machine serialises on one lock file (~/.ros/locks/ros2-control-controller-spawner.lock) and
-    # holds it while it waits for the controller manager, so this one often loads first. That is
-    # safe only because --inactive claims nothing. Two consequences: do not read "diff_drive is
-    # inactive" as "diff_drive was spawned last", and do not run this launch at the same time as
-    # anything else that spawns controllers (test/hil_check.sh does).
+    # Inactive, so it claims nothing and the two spawners may run in either order; it shares
+    # joint3/joint4 with joint_velocity_controller. See docs/setup.md, "Drive a differential base".
     diff_drive_spawner = Node(
         package='controller_manager',
         executable='spawner',

@@ -1,30 +1,5 @@
-// The whole component lifecycle over a pseudo terminal (PHASE2_SPEC 10.2 - 10.5).
-//
-// The plugin is loaded through pluginlib from the ament index -- the installed artifact, as
-// test_load_waveshare_servos loads it -- and driven by a ResourceManager, while a fake SMS/STS
-// servo bus (test/fake_servo_bus.hpp) answers on the master side of an openpty() pair. Nothing
-// here needs a servo, a USB adapter or the real bench port.
-//
-// Standing rule, mechanical and non-negotiable: every case that reaches on_configure passes an
-// explicit <param name="port"> naming its own pty, and every case ends with
-// EXPECT_FALSE(process_has_serial_port_open()) -- here in the fixture's TearDown, so a case
-// cannot forget it, and before the resource manager is destroyed, so the shutdown that closes the
-// port cannot hide what the case opened. The driver's default port is the bench adapter's, and the
-// bench servos are on it; a case that forgot the param would drive real motors out of
-// `colcon test`. That default
-// is asserted from the driver's log line in test_load_waveshare_servos, never by configuring, and
-// neither this file nor test/fake_servo_bus.hpp ever spells that device path out, so a grep for
-// it over the two of them comes back empty.
-//
-// Three fixtures:
-//   LifecycleOverPty    configure / activate / read / write / park, over four healthy servos
-//   DropRecoverOverPty  PHASE2_SPEC 10.4: a servo that goes silent mid-run (D7(a)'s deterministic
-//                       replacement for the bench connector pull)
-//   StatusOverPty       PHASE2_SPEC 10.5: synthetic status bytes (D7(b)'s replacement for the
-//                       held-wheel overload test)
-//
-// ResourceManager::set_component_state takes its target state by non-const lvalue reference, so
-// every transition goes through go(), which names one.
+// Full lifecycle over an openpty() fake bus; each case must set its own port (default: bench).
+// See docs/development.md, "Keep tests off the bench".
 
 #include <gmock/gmock.h>
 
@@ -91,9 +66,8 @@ using waveshare_servos_test::robot_description;
 using waveshare_servos_test::sign_magnitude_decode;
 using waveshare_servos_test::state;
 
-// The hardware constants the driver defaults to, spelled out rather than included: this is an
-// end-to-end test, so the numbers it expects have to be derived independently of the header the
-// driver computes them with.
+// Driver defaults written out, not included, so the expected values do not come from the
+// header the driver computes them with.
 constexpr int kEncoderSteps = 4096;
 constexpr double kNmPerKgfCm = 0.0980665;
 constexpr double kCurrentPerCountA = 0.006;
@@ -127,10 +101,8 @@ std::vector<std::string> all_state_interfaces()
     state("temperature"), state("load"), state("status"), state("torque")};
 }
 
-// joint1 and joint2 run servos 1 and 2 to a goal position; joint3 and joint4 are wheels on servos
-// 3 and 4. joint4 is the wheel every command assertion uses: urdf_head gives joint1..joint3 a
-// <limit velocity="0.2">, and test_helpers' joint4 is continuous with no limit at all, so a
-// velocity command reaches the driver unmodified whatever the framework decides to enforce.
+// joint1/2: position servos 1/2; joint3/4: wheels 3/4. Wheel asserts use joint4: urdf_head
+// limits joint1..3 to 0.2 rad/s and joint4 has no limit, so its commands arrive unmodified.
 std::vector<Joint> four_servo_joints(const std::vector<std::string> & states)
 {
   std::vector<Joint> joints;
@@ -192,9 +164,7 @@ size_t count_containing(const std::vector<std::string> & messages, const std::st
       }));
 }
 
-// PHASE3 L4 (4 section 1.3), the frozen WARN of a refused acceleration write. Spelled once here
-// and matched literally in every case that expects it: a frozen log line with no case asserting it
-// is a line that can rot unnoticed, which is the rule 4.T55 exists to enforce.
+// The frozen WARN of a refused acceleration write, matched literally wherever it is expected.
 std::string acc_refused_for(int id)
 {
   return "could not write the acceleration register of motor id '" + std::to_string(id) +
@@ -225,10 +195,8 @@ GoalRecord decode_goal_record(const std::vector<uint8_t> & record)
   return goal;
 }
 
-// One record of a wheel sync-write packet: the goal speed alone, sign-magnitude on bit 15
-// (src/SMS_STS.cpp:122-280). The ACC byte of a wheel does not travel in this record and never did
-// -- the vendored SyncWriteSpe sent it as a separate addressed write to register 41 inside every
-// cycle, which is exactly the transaction Phase 3 item 1 moved to the four edges of PHASE3 1.24.
+// One wheel sync-write record: the goal speed only, sign-magnitude on bit 15. The wheel ACC
+// is written separately. See docs/design.md, "Wheel acceleration".
 int decode_speed_record(const std::vector<uint8_t> & record)
 {
   if (record.size() != 2) {
@@ -237,9 +205,7 @@ int decode_speed_record(const std::vector<uint8_t> & record)
   return sign_magnitude_decode(static_cast<uint16_t>(record[0] | (record[1] << 8)));
 }
 
-// A plain file under the system temp directory, removed however the case that made it ends. One
-// case needs a port that opens but is not a tty; a file is the only such path a test can make for
-// itself.
+// A temp file, removed on scope exit: the only openable non-tty path a test can make.
 class TempFile
 {
 public:
@@ -266,10 +232,7 @@ public:
 
   std::string path() const {return path_.string();}
 
-  // Whether the file is really there. A case that stages "openable but not a tty" with a file it
-  // could not create would silently become a different case -- the driver would refuse the path
-  // for not existing -- so the one case that uses this asserts it first, and a temp directory that
-  // is not writable is reported as the harness failure it is.
+  // Whether the file exists. Assert it first: without it the case tests "no such port".
   bool ok() const {return created_;}
 
 private:
@@ -277,9 +240,8 @@ private:
   bool created_ = false;
 };
 
-// Holds the framework's own writer lock on one state handle for as long as it is in scope, so the
-// driver's non-blocking set_state() finds it busy and leaves the previous sample in place. The
-// handle's mutex is reachable only through the loan's protected member, hence the derived type.
+// Holds a state handle's writer lock, so the driver's non-blocking set_state() finds it busy.
+// Derived because the mutex is a protected member of the loan.
 class BusyStateHandle : public hardware_interface::LoanedStateInterface
 {
 public:
@@ -320,16 +282,11 @@ class PtyFixture : public ::testing::Test
 protected:
   void TearDown() override
   {
-    // The standing rule first, while the component is still alive and still holding whatever it
-    // opened: destroying the resource manager shuts it down and closes the port, so a check placed
-    // after the reset could never catch the one thing this rule exists to catch -- a case that
-    // forgot <param name="port"> and configured against the bench adapter. Nothing in this file
-    // legitimately holds a real serial port at this point: the fake bus is a /dev/pts slave, which
-    // matches none of the prefixes process_has_serial_port_open looks for.
+    // Check before rm_.reset(): shutdown closes the port and would hide a case that opened the
+    // bench adapter. The pty (/dev/pts) matches none of the serial-port prefixes.
     EXPECT_FALSE(process_has_serial_port_open()) << "a case reached a real serial port";
-    // Then the leak checks. Destroying the resource manager shuts every component down, which
-    // parks the servos and closes the port; after that the fixture's own slave descriptor must be
-    // the only one left on the port, and nothing malformed can ever have gone out on the wire.
+    // Then the leak checks: after shutdown only the fixture's slave fd may remain on the port,
+    // and no malformed packet may have gone out.
     rm_.reset();
     EXPECT_FALSE(process_has_serial_port_open());
     EXPECT_EQ(descriptors_on(fake_.port()), 1u) << "the component left the port open";
@@ -344,10 +301,8 @@ protected:
     return "  <param name=\"port\">" + fake_.port() + "</param>\n" + extra;
   }
 
-  // Returns whether the component came up, rather than asserting: a gtest ASSERT_* only returns
-  // from the function it appears in, so an assertion here would let the case carry on and call
-  // configure() on a resource manager that has no `four_servos` component. Every call site says
-  // ASSERT_TRUE(load(...)) instead, which really does stop the case.
+  // Returns success instead of asserting: ASSERT_* would exit only this helper. Callers use
+  // ASSERT_TRUE(load(...)).
   [[nodiscard]] bool load(const std::string & urdf)
   {
     auto params = resource_manager_params(urdf);
@@ -355,6 +310,7 @@ protected:
     return rm_->load_and_initialize_components(params);
   }
 
+  // set_component_state takes the target by non-const reference, so name one.
   hardware_interface::return_type go(uint8_t id, const char * label)
   {
     rclcpp_lifecycle::State target(id, label);
@@ -388,9 +344,7 @@ protected:
   void step_read(double period_seconds = 0.01)
   {
     const rclcpp::Duration period = rclcpp::Duration::from_seconds(period_seconds);
-    // No wait_quiet: every transaction read() makes is synchronous, so the responder has already
-    // seen the request by the time rm_->read() returns -- it either answered it or deliberately
-    // did not.
+    // No wait_quiet(): read() is synchronous, so the fake has handled every request on return.
     std::ignore = rm_->read(now_, period);
     now_ = now_ + period;
   }
@@ -598,7 +552,7 @@ TEST_F(LifecycleOverPty, the_torque_interface_reports_kg_cm_while_effort_reports
   const double effort = state_of("joint1/effort");
   const double torque = state_of("joint1/torque");
   ASSERT_GT(effort, 0.0);
-  // the deprecated alias keeps kg cm, frozen at the Phase 1 value (D2)
+  // the deprecated `torque` alias keeps kg cm, the unit of the original driver
   EXPECT_NEAR(torque / effort, 1.0 / kNmPerKgfCm, 1e-9);
 }
 
@@ -718,10 +672,8 @@ TEST_F(LifecycleOverPty, inverted_flips_the_commanded_position_and_the_wheel_spe
 
 TEST_F(LifecycleOverPty, the_acceleration_record_carries_the_per_joint_max_accel)
 {
-  // 20 acceleration counts and 100 speed counts, written as the rad/s^2 and rad/s the description
-  // declares: counts = value * encoder_steps / (2 pi), with a further /100 for the acceleration
-  // register (PHASE2_SPEC 5.4). This also discharges 5.4's owed coverage -- that the CONVERTED
-  // values reach the wire, not the 6000/150 register defaults.
+  // 20 acc and 100 speed counts, declared in rad/s^2 and rad/s (counts = value * 4096 / 2 pi,
+  // /100 more for acc): the converted values must reach the wire, not the 6000/150 defaults.
   const double max_accel = 20.0 * 100.0 * 2.0 * M_PI / kEncoderSteps;
   const double max_speed = 100.0 * 2.0 * M_PI / kEncoderSteps;
   std::vector<Joint> joints = four_servo_joints(all_state_interfaces());
@@ -742,18 +694,12 @@ TEST_F(LifecycleOverPty, the_acceleration_record_carries_the_per_joint_max_accel
   EXPECT_EQ(last_goal(2).speed, kDefaultMaxSpeedCounts);
 }
 
-// PHASE3 4.T49, and PHASE3 4 section 7 step 0: a characterisation guard on the position write
-// path, captured green against the driver before any Phase 3 code exists. Phase 3 moves the
-// record out of the vendored SMS_STS::SyncWritePosEx and builds it in the wrapper (PHASE3 1.8),
-// so these bytes are the only record of what the vendored builder emitted for these commands;
-// captured after that move the vector would pin whatever the new code does and prove nothing.
-// PHASE3 F1 is the row it guards.
-TEST_F(LifecycleOverPty, the_position_record_is_unchanged_by_phase_three)
+// Golden bytes captured from the vendored SMS_STS::SyncWritePosEx before the wrapper built the
+// record; they pin the wrapper's record builder to the vendored byte format.
+TEST_F(LifecycleOverPty, the_position_record_matches_the_vendored_byte_format)
 {
-  // Both goals sit far enough from the seeded position that the paced speed saturates at the
-  // 6000-count ceiling, so the golden bytes depend on the command alone and not on where the fake
-  // servo started. The negative command still encodes a positive tick: the joint's 1.570796 rad
-  // offset puts its whole command range inside ticks 0..2048.
+  // Both goals saturate the paced speed at 6000, so the bytes depend on the command only. The
+  // 1.570796 rad offset keeps even a negative command at a positive tick.
   struct Golden
   {
     const char * trace;
@@ -779,9 +725,7 @@ TEST_F(LifecycleOverPty, the_position_record_is_unchanged_by_phase_three)
 
     const std::vector<uint8_t> record = last_record(1, kRegAcc);
     EXPECT_THAT(record, ElementsAreArray(golden.record));
-    // The decoded fields as well as the bytes: last_goal() alone would miss a byte-order or width
-    // change that decodes back to the same numbers, and the bytes alone would not name the field
-    // that drifted.
+    // Bytes catch a byte-order or width change; the decoded fields name the field that drifted.
     const GoalRecord goal = decode_goal_record(record);
     EXPECT_EQ(goal.acc, golden.acc);
     EXPECT_EQ(goal.position, golden.position);
@@ -819,10 +763,8 @@ TEST_F(LifecycleOverPty, write_sends_one_sync_write_per_cycle_for_the_position_j
   }
 }
 
-// PHASE3 1.32.23. The behavioural statement of Phase 3 item 1, and the case that fails first if
-// anyone ever puts the acceleration write back on the hot path: SMS_STS::SyncWriteSpe used to send
-// every wheel an addressed genWrite of register 41 and block on its Ack inside every write()
-// (src/SMS_STS.cpp:275), measured at 0.567 ms per wheel per cycle [P2 Q1].
+// Fails if the wheel ACC write returns to the per-cycle path (vendored SyncWriteSpe: one acked
+// register-41 write per wheel per cycle). See docs/design.md, "Wheel acceleration".
 TEST_F(LifecycleOverPty, a_wheel_gets_no_per_cycle_acc_write)
 {
   ASSERT_TRUE(load_four_servos());
@@ -835,24 +777,20 @@ TEST_F(LifecycleOverPty, a_wheel_gets_no_per_cycle_acc_write)
     step_cycle();
   }
 
-  // Not "no register-41 write" but no ADDRESSED write of any kind: the only thing a wheel receives
-  // per cycle now is its 2-byte record inside the broadcast sync write, which is never acked
-  // (src/SCS.cpp:132,268) and so costs no round trip at all.
+  // No addressed write of any kind: a wheel gets only its record in the broadcast sync write,
+  // which is never acked (src/SCS.cpp:132,268).
   EXPECT_EQ(fake_.snapshot(3).writes, before3.writes);
   EXPECT_EQ(fake_.snapshot(4).writes, before4.writes);
   // it is still polled every cycle, so this is a silence on the write path alone
   EXPECT_EQ(fake_.snapshot(3).requests, before3.requests + 20);
 }
 
-// PHASE3 1.32.24 -- site 1 of PHASE3 1.24: build_groups(), which on_configure reaches once the
-// absent-servo gate has passed.
+// Wheel ACC edge 1 of 4: build_groups(), which on_configure reaches after the absent-servo
+// gate.
 TEST_F(LifecycleOverPty, configure_writes_each_wheel_acc_once)
 {
-  // Wheel 4 opts out of the ramp with max_accel="0", the documented "no acceleration limit"
-  // (src/waveshare_servos.cpp:717-719). PHASE3 1.23: that 0 is WRITTEN, not skipped as "unset" --
-  // skipping would leave whatever the servo held from its EPROM default or a previous run and
-  // silently invert the meaning of the parameter. Poison the register first, because an untouched
-  // register file also reads 0 and could not tell the two apart.
+  // max_accel="0" (no ramp) must be written, not skipped. Poison the register first: an
+  // untouched register also reads 0.
   std::vector<Joint> joints = four_servo_joints(all_state_interfaces());
   joints[3].max_accel = "0";
   fake_.set_byte(4, kRegAcc, 99);
@@ -864,29 +802,23 @@ TEST_F(LifecycleOverPty, configure_writes_each_wheel_acc_once)
 
   EXPECT_EQ(fake_.snapshot(3).mem[kRegAcc], kDefaultAccCounts);
   EXPECT_EQ(fake_.snapshot(4).mem[kRegAcc], 0);
-  // Exactly one addressed write per wheel. Both are already in mode 1, so set_mode()'s
-  // read-before-write guard leaves register 33 alone (cpp:1058-1071) and the acceleration write is
-  // the only thing on the wire -- which is also what pins that the ACC write sits INSIDE
-  // build_groups(), after the gate: a configure that failed the gate writes nothing at all, as
-  // configure_does_not_write_the_mode_register_on_the_refusal_path already asserts.
+  // One addressed write per wheel: both are already in mode 1, so set_mode() leaves register
+  // 33 alone and the ACC write is the only write on the wire.
   EXPECT_EQ(fake_.snapshot(3).writes, before3.writes + 1);
   EXPECT_EQ(fake_.snapshot(4).writes, before4.writes + 1);
   EXPECT_EQ(fake_.snapshot(3).mode_writes, 0);
-  // and a position joint gets nothing addressed: its ACC is byte 0 of every goal record (1.21)
+  // and a position joint gets no addressed write: its ACC is byte 0 of every goal record
   EXPECT_EQ(fake_.snapshot(1).writes, 0);
   EXPECT_EQ(fake_.snapshot(2).writes, 0);
 }
 
-// PHASE3 4.T47 -- site 2 of PHASE3 1.24: the on_activate per-joint loop.
+// Wheel ACC edge 2 of 4: the per-joint loop in on_activate.
 TEST_F(LifecycleOverPty, activate_writes_the_acceleration_register_once_per_servo)
 {
   ASSERT_TRUE(load_four_servos());
   ASSERT_EQ(configure(), hardware_interface::return_type::OK);
-  // Cleared behind the driver's back after configure, so what the ACTIVATION does is measured on
-  // its own. PHASE3 3.20's accepted duplicate makes this the only sound way to count: an
-  // activation that also recovers a servo runs build_groups() and this loop, so register 41 is
-  // legitimately written twice in that one transition. Count deltas across a transition, never an
-  // absolute per-activation total.
+  // Cleared after configure so only the activation's writes count. Count deltas: an activation
+  // that recovers a servo writes register 41 twice (edges 1 and 2).
   fake_.set_byte(3, kRegAcc, 0);
   fake_.set_byte(4, kRegAcc, 0);
   const FakeServo before3 = fake_.snapshot(3);
@@ -896,11 +828,8 @@ TEST_F(LifecycleOverPty, activate_writes_the_acceleration_register_once_per_serv
 
   EXPECT_EQ(fake_.snapshot(3).mem[kRegAcc], kDefaultAccCounts);
   EXPECT_EQ(fake_.snapshot(4).mem[kRegAcc], kDefaultAccCounts);
-  // Two addressed writes, one of them the torque enable: with the register observed going from 0
-  // to the right value across that window, the other one was the register-41 write and there was
-  // exactly one of it. The harness records no write order, so what pins PHASE3 1.24's ordering
-  // constraint -- ACC after set_mode, and both before EnableTorque, because writing register 33
-  // clears register 40 on the bench -- is the source order plus that bench measurement, not this.
+  // Two addressed writes: the torque enable and exactly one register-41 write. The fake keeps
+  // no write order. See docs/design.md, "Wheel acceleration".
   EXPECT_EQ(fake_.snapshot(3).writes, before3.writes + 2);
   EXPECT_EQ(fake_.snapshot(3).torque_enable_writes, before3.torque_enable_writes + 1);
   EXPECT_EQ(fake_.snapshot(4).writes, before4.writes + 2);
@@ -916,16 +845,14 @@ TEST_F(LifecycleOverPty, activate_writes_the_acceleration_register_once_per_serv
   EXPECT_EQ(fake_.snapshot(1).mem[kRegAcc], kDefaultAccCounts);
 }
 
-// PHASE3 1.32.25: why site 2 is needed even though site 1 exists.
 TEST_F(LifecycleOverPty, activation_rewrites_the_wheel_acc)
 {
   ASSERT_TRUE(load_four_servos());
   ASSERT_EQ(configure(), hardware_interface::return_type::OK);
   ASSERT_EQ(activate(), hardware_interface::return_type::OK);
   ASSERT_EQ(deactivate(), hardware_interface::return_type::OK);
-  // The power-cycle stand-in. Register 41 is SRAM [P2 Q2], so a servo that restarted while the
-  // component was INACTIVE answers every ping and every read with the register lost. It was never
-  // absent and is never regrouped, so build_groups() is not reached and site 1 cannot cover it.
+  // Power-cycle stand-in: register 41 is SRAM. The servo was never absent, so build_groups()
+  // does not run and only edge 2 restores it.
   fake_.set_byte(3, kRegAcc, 0);
 
   ASSERT_EQ(activate(), hardware_interface::return_type::OK);
@@ -934,14 +861,12 @@ TEST_F(LifecycleOverPty, activation_rewrites_the_wheel_acc)
   EXPECT_THAT(infos(), Not(Contains(HasSubstr("answered on activation; adding it back"))));
 }
 
-// PHASE3 1.32.28 / 1.25: a refused acceleration write is a WARN and nothing more.
 TEST_F(LifecycleOverPty, a_failed_acc_write_warns_and_activation_still_succeeds)
 {
   ASSERT_TRUE(load_four_servos());
   ASSERT_EQ(configure(), hardware_interface::return_type::OK);
-  // Gone from the bus between configure and activate, so present_ is still true and the driver
-  // really attempts the write into silence. Failing the activation instead would be the worse
-  // outcome: a wheel with a stale ramp still takes and executes speed commands (PHASE3 1.25).
+  // Gone between configure and activate, so present_ is true and the driver tries the write.
+  // Not fatal: a wheel with a stale ramp still runs speed commands.
   fake_.set_absent(3, true);
 
   EXPECT_EQ(activate(), hardware_interface::return_type::OK);
@@ -950,11 +875,8 @@ TEST_F(LifecycleOverPty, a_failed_acc_write_warns_and_activation_still_succeeds)
   EXPECT_EQ(count_containing(warnings(), acc_refused_for(4)), 0u);
 }
 
-// PHASE3 1.32.29 / 1.21, the single most misread part of item 1: "write the ACC once" is a WHEEL
-// policy. A position servo's acceleration is byte 0 of the 7-byte record based at register 41
-// (src/SMS_STS.cpp:69-77), so it travels for free in every cycle and a position servo that
-// restarted mid-run repairs it on the next one. Nobody may "optimise" the position path the same
-// way; this is the case that says so.
+// "Write the ACC once" is for wheels only: a position servo's ACC is byte 0 of every goal
+// record, so a restart is repaired next cycle. Do not optimise this path.
 TEST_F(LifecycleOverPty, a_position_joint_still_gets_its_acc_in_every_record)
 {
   ASSERT_TRUE(load_four_servos());
@@ -972,11 +894,8 @@ TEST_F(LifecycleOverPty, a_position_joint_still_gets_its_acc_in_every_record)
   EXPECT_EQ(fake_.snapshot(1).writes, before.writes) << "and it costs no addressed write";
 }
 
-// PHASE3 1.32.31 / 1.16 at the driver level (R13): the driver hands the empty position list
-// straight to the wrapper instead of guarding the call itself, because one guard in one place
-// cannot fall out of step with a second call site. 4.T23 pins the wrapper's half -- an empty list
-// puts no frame on the wire at all -- and this pins the driver's, which is everything a per-servo
-// harness can observe: an empty broadcast carries no records, so no fake servo could ever see one.
+// The driver passes an empty position group to the wrapper, which sends nothing. A fake
+// servo cannot see an empty broadcast, so this checks that no position record arrives.
 TEST_F(LifecycleOverPty, a_group_with_no_position_joints_sends_no_position_packet)
 {
   std::vector<Joint> joints;
@@ -1097,12 +1016,8 @@ TEST_F(LifecycleOverPty, a_servo_that_never_answered_a_feedback_read_gets_no_par
   EXPECT_EQ(record_count(2), healthy_before + 1);
 }
 
-// PHASE3 1.32.30 / 1.28. stop_and_park(true) compacts p_ids_/p_js_ IN PLACE before its single
-// send_commands() (cpp:1401-1411), so the record array outlives the group it describes -- which is
-// why send_commands() resizes from p_ids_.size() at the top of every cycle (PHASE3 1.27). Without
-// that resize the park frame carries a stale trailing record, and the servo that answered receives
-// its goal twice while the silent one is still correctly left out: a bug the "no park goal" case
-// above cannot see, because it only counts the records the SILENT servo got.
+// The park compacts p_ids_ in place, so send_commands() must resize its goals every cycle;
+// without that the answering servo gets a stale duplicate record.
 TEST_F(LifecycleOverPty, the_pruned_park_writes_only_the_servos_that_answered)
 {
   fake_.set_silent_feedback(1, true);
@@ -1121,8 +1036,7 @@ TEST_F(LifecycleOverPty, the_pruned_park_writes_only_the_servos_that_answered)
   EXPECT_EQ(record_count(1), silent_before) << "a made-up goal would have been sent";
   EXPECT_EQ(record_count(2), parked_before + 1) <<
     "one position frame carrying exactly the pruned group, not a stale trailing record";
-  // and the velocity group is never pruned: every wheel still gets its stop, 00 00 with no sign
-  // bit, which is the byte pattern every deactivation depends on (PHASE3 F2)
+  // the velocity group is never pruned: each wheel still gets its stop, 00 00, no sign bit
   EXPECT_EQ(record_count(3), wheel_before + 1);
   EXPECT_EQ(last_speed(3), 0);
   EXPECT_EQ(last_speed(4), 0);
@@ -1202,10 +1116,8 @@ TEST_F(LifecycleOverPty, a_busy_state_handle_keeps_the_previous_sample)
 
 TEST_F(LifecycleOverPty, read_after_activate_seeds_the_unwrapped_position)
 {
-  // PHASE2_SPEC 8.4 and 8.8. joint3 is a wheel, so `unwrap` is on by its default. Its register sits
-  // at the top of the turn when the component activates and wraps to 12 on the next sample: the
-  // published position must step FORWARD by the 13 ticks the servo actually turned (jazzy.md:43's
-  // bench observation), never back to 0.018 rad.
+  // A wheel unwraps by default: 4095 -> 12 must step forward 13 ticks, not back to 0.018 rad.
+  // See docs/configuration.md, "Multi-turn wheel position".
   fake_.set_position(3, 4095);
   ASSERT_TRUE(load_four_servos());
   ASSERT_EQ(configure(), hardware_interface::return_type::OK);
@@ -1226,10 +1138,8 @@ TEST_F(LifecycleOverPty, read_after_activate_seeds_the_unwrapped_position)
 
 TEST_F(LifecycleOverPty, unwrap_false_on_a_wheel_reproduces_the_wrapping_position)
 {
-  // The opt-out, and the exact-equality pin of the chunk: a joint with unwrap=false publishes the
-  // plain register reading, bit for bit what the previous chunk's driver published. joint4 keeps
-  // the default and makes the same motion in the same cycles, so the two are compared against each
-  // other and not only against a constant.
+  // unwrap=false publishes the plain wrapping register; joint4 keeps the default and makes the
+  // same moves, so the two are compared.
   std::vector<Joint> joints = four_servo_joints(all_state_interfaces());
   joints[2].unwrap = "false";
   fake_.set_position(3, 4095);
@@ -1258,12 +1168,10 @@ TEST_F(LifecycleOverPty, unwrap_false_on_a_wheel_reproduces_the_wrapping_positio
 }
 
 // ---------------------------------------------------------------------------------------------
-// PHASE3 C6: the driver's sync-read path (2.59-2.79, 3.23-3.36). One INST_SYNC_READ per cycle
-// instead of one FeedBack() per joint, the activation probe that decides it, the per-servo
-// fallback and the one `bus totals:` line each activation leaves behind.
+// Sync-read path: one INST_SYNC_READ per cycle, the activation probe, fallback, bus totals.
 
-// The nine state interfaces of all four joints, in a fixed order, so two transports can be
-// compared value for value rather than field by field (PHASE3 4.T50, 2.118).
+// The nine state interfaces of all four joints in a fixed order, to compare two transports
+// value for value.
 std::vector<double> all_states_of(
   const std::function<double(const std::string &)> & state_of)
 {
@@ -1278,15 +1186,14 @@ std::vector<double> all_states_of(
   return values;
 }
 
-// PHASE3 L1 (0.4), frozen: the one INFO that says which transport this activation chose.
+// Frozen INFO: the transport this activation chose.
 std::string sync_read_announced(size_t servos)
 {
   return "feedback for " + std::to_string(servos) +
          " servos travels in one sync read per cycle (INST_SYNC_READ)";
 }
 
-// PHASE3 L2 (0.4), frozen: the fallback WARN, with the ids that answered a FeedBack but not the
-// burst spelled out in the same comma-space list the driver builds.
+// Frozen fallback WARN, with the ids that answered FeedBack but not the burst.
 std::string sync_read_fallback_for(const std::string & ids)
 {
   return "sync read went unanswered by motor id(s) " + ids +
@@ -1295,13 +1202,11 @@ std::string sync_read_fallback_for(const std::string & ids)
 
 TEST_F(LifecycleOverPty, read_uses_one_sync_read_for_every_present_servo)
 {
-  // PHASE3 4.T38 / 2.117. The whole point of item 4: four servos, one request, one reply burst.
   ASSERT_TRUE(load_four_servos());
   ASSERT_EQ(configure(), hardware_interface::return_type::OK);
   ASSERT_EQ(activate(), hardware_interface::return_type::OK);
-  // The baseline is taken AFTER activation on purpose: the capability probe of PHASE3 2.74 is one
-  // burst of its own, and the seeding feedback() at on_activate is one INST_READ per joint. Both
-  // are outside the per-cycle claim this case makes.
+  // Baseline after activation: the probe burst and the seeding reads (one INST_READ per
+  // joint) are not per-cycle traffic.
   const uint64_t bursts_before = fake_.sync_read_requests();
   std::array<FakeServo, 5> before{};
   for (uint8_t id = 1; id <= 4; id++) {
@@ -1318,8 +1223,8 @@ TEST_F(LifecycleOverPty, read_uses_one_sync_read_for_every_present_servo)
     SCOPED_TRACE("servo " + std::to_string(static_cast<int>(id)));
     const FakeServo servo = fake_.snapshot(id);
     EXPECT_EQ(servo.sync_reads, before[id].sync_reads + 10);
-    // The counter that makes this Phase 3 rather than Phase 2: no addressed INST_READ at all on
-    // the real-time path, which is also what makes H11's transaction denominator honest (C-b).
+    // No addressed INST_READ on the real-time path; this also keeps bus totals at one
+    // transaction per cycle.
     EXPECT_EQ(servo.reads, before[id].reads);
   }
   EXPECT_THAT(fake_.last_sync_read_ids(), ElementsAreArray(std::vector<uint8_t>{1, 2, 3, 4})) <<
@@ -1330,8 +1235,8 @@ TEST_F(LifecycleOverPty, read_uses_one_sync_read_for_every_present_servo)
 
 TEST_F(LifecycleOverPty, the_sync_read_path_is_announced_once_at_activate)
 {
-  // PHASE3 4.T39. The decision is taken once per activation (2.75), so the line that reports it
-  // is printed once -- a per-cycle INFO would be 100 lines a second.
+  // The transport is chosen once per activation, so it is logged once (per cycle would be 100
+  // lines a second).
   ASSERT_TRUE(load_four_servos());
   ASSERT_EQ(configure(), hardware_interface::return_type::OK);
   ASSERT_EQ(activate(), hardware_interface::return_type::OK);
@@ -1348,9 +1253,8 @@ TEST_F(LifecycleOverPty, the_sync_read_path_is_announced_once_at_activate)
 TEST_F(LifecycleOverPty,
   read_falls_back_to_one_feedback_read_per_servo_when_sync_read_is_unanswered)
 {
-  // PHASE3 4.T40 / 2.124. Firmware that parses 0x82 and answers nothing is exactly the case
-  // jazzy.md item 4 says to keep FeedBack() for, and the fake's set_sync_read_supported(false) is
-  // the only way to reach it without such a firmware on the bench.
+  // Firmware that accepts INST_SYNC_READ (0x82) but never answers is why FeedBack() is kept;
+  // set_sync_read_supported(false) stands in for it.
   fake_.set_sync_read_supported(false);
   ASSERT_TRUE(load_four_servos());
   ASSERT_EQ(configure(), hardware_interface::return_type::OK);
@@ -1380,9 +1284,8 @@ TEST_F(LifecycleOverPty,
 
 TEST_F(LifecycleOverPty, the_fallback_decision_is_taken_once_per_activation_and_retried_on_the_next)
 {
-  // PHASE3 4.T41. Two bursts and no more: the probe, plus the one retry that keeps a single lost
-  // frame from condemning the transport (2.74 step 5). A per-cycle re-probe would pay one whole
-  // io_timeout_ms every cycle on a bus that has already said no.
+  // Two bursts only: the probe and one retry, so one lost frame does not condemn sync read.
+  // Re-probing every cycle would cost one io_timeout_ms per cycle.
   fake_.set_sync_read_supported(false);
   ASSERT_TRUE(load_four_servos());
   ASSERT_EQ(configure(), hardware_interface::return_type::OK);
@@ -1409,10 +1312,10 @@ TEST_F(LifecycleOverPty, the_fallback_decision_is_taken_once_per_activation_and_
   EXPECT_GT(fake_.sync_read_requests(), before_second);
 }
 
-TEST_F(LifecycleOverPty, feedback_mode_per_servo_keeps_the_phase_two_read_path)
+TEST_F(LifecycleOverPty, feedback_mode_per_servo_reads_each_servo_and_sends_no_sync_read)
 {
-  // PHASE3 2.123. The escape hatch, and the A/B baseline the HIL comparison of 5.4 runs on: it
-  // must put NO INST_SYNC_READ on the wire at all, not even the probe (2.74 step 1).
+  // per_servo is the escape hatch and the bench A/B baseline: no INST_SYNC_READ at all, not
+  // even the probe.
   ASSERT_TRUE(load_four_servos("  <param name=\"feedback_mode\">per_servo</param>\n"));
   ASSERT_EQ(configure(), hardware_interface::return_type::OK);
   ASSERT_EQ(activate(), hardware_interface::return_type::OK);
@@ -1430,9 +1333,8 @@ TEST_F(LifecycleOverPty, feedback_mode_per_servo_keeps_the_phase_two_read_path)
 
 TEST_F(LifecycleOverPty, feedback_mode_sync_read_fails_activation_when_the_bus_ignores_sync_read)
 {
-  // PHASE3 2.125. 'sync_read' is the bench-pinning value: it exists so a firmware that ignores
-  // INST_SYNC_READ fails loudly here instead of quietly running the slow path and being measured
-  // as though it were the fast one.
+  // feedback_mode=sync_read pins the fast path: a bus that ignores sync read fails activation
+  // instead of quietly falling back.
   fake_.set_sync_read_supported(false);
   ASSERT_TRUE(load_four_servos("  <param name=\"feedback_mode\">sync_read</param>\n"));
   ASSERT_EQ(configure(), hardware_interface::return_type::OK);
@@ -1445,11 +1347,8 @@ TEST_F(LifecycleOverPty, feedback_mode_sync_read_fails_activation_when_the_bus_i
 
 TEST_F(LifecycleOverPty, a_sync_read_cycle_publishes_exactly_what_the_per_servo_path_publishes)
 {
-  // PHASE3 4.T50. Both transports funnel through apply_feedback() -> the same decode() (2.60,
-  // 2.63), so this compares the new path against the one Phase 2 already trusted. The fake is a
-  // deterministic register file, so exact equality is the right assertion here -- on hardware it
-  // would not be: probe 1 Q2 measured +-1 LSB of the servo's own ADC dither on voltage and
-  // temperature, at the same rate within one path as across the two (F12).
+  // Both transports share decode(), so the states must match exactly. Exact only on the fake:
+  // real servos dither voltage and temperature by +-1 LSB.
   fake_.set_feedback(1, kMidTick + 31, -400, 611, 122, 41, 1, -250);
   fake_.set_feedback(2, kMidTick - 17, 900, -33, 118, 39, 0, 77);
   fake_.set_feedback(3, 3000, -1, 1023, 125, 44, 1, 0);
@@ -1465,8 +1364,8 @@ TEST_F(LifecycleOverPty, a_sync_read_cycle_publishes_exactly_what_the_per_servo_
   const std::vector<double> sync_states = all_states_of(reader);
   ASSERT_GT(fake_.sync_read_requests(), 0u) << "this half did not run on the sync path";
 
-  // on_activate re-seeds from the same unchanged registers after reset_unwrap(), so the unwrapped
-  // value is reproducible across the transition and may be compared exactly too.
+  // A present wheel keeps its count across the cycle and no register changes, so the
+  // unwrapped values must match exactly too.
   ASSERT_EQ(deactivate(), hardware_interface::return_type::OK);
   fake_.set_sync_read_supported(false);
   ASSERT_EQ(activate(), hardware_interface::return_type::OK);
@@ -1481,9 +1380,7 @@ TEST_F(LifecycleOverPty, a_sync_read_cycle_publishes_exactly_what_the_per_servo_
 
 TEST_F(LifecycleOverPty, the_sync_read_path_publishes_exactly_what_the_per_servo_path_publishes)
 {
-  // PHASE3 2.118: the same claim as 4.T50, reached through the PARAMETER rather than through a
-  // firmware that refuses the instruction, because feedback_mode=per_servo is the arm the HIL A/B
-  // of 5.4 actually runs and a mode that published differently would make that comparison a lie.
+  // Same claim through feedback_mode=per_servo, the arm the bench A/B comparison runs.
   fake_.set_feedback(1, kMidTick + 5, -120, 700, 121, 40, 1, -9);
   fake_.set_feedback(2, kMidTick - 9, 33, -12, 117, 37, 0, 4);
   fake_.set_feedback(3, 2047, -2048, 1023, 126, 45, 1, 1);
@@ -1515,11 +1412,8 @@ TEST_F(LifecycleOverPty, the_sync_read_path_publishes_exactly_what_the_per_servo
 
 TEST_F(LifecycleOverPty, a_timeout_below_the_sync_read_floor_is_warned_about_and_takes_the_fallback)
 {
-  // PHASE3 4.T54 (R9, R10). 2 ms is legal (R8's range is [2, 1000]) and is below
-  // min_io_timeout_ms(4) == 3, so the user's number stands -- it is also what one dead servo will
-  // cost per cycle, which is theirs to choose -- and the TRANSPORT moves instead. The WARN itself
-  // is asserted in test_load_waveshare_servos; what can only be seen from here is that nothing
-  // then puts a burst on the wire.
+  // 2 ms is legal but below the 3 ms a 4-servo sync read needs: the value stays and the driver
+  // reads per servo, with no burst. See docs/bus-timing.md, "Timeout floor".
   ASSERT_TRUE(load_four_servos("  <param name=\"io_timeout_ms\">2</param>\n"));
   ASSERT_EQ(configure(), hardware_interface::return_type::OK);
   ASSERT_EQ(activate(), hardware_interface::return_type::OK);
@@ -1542,10 +1436,8 @@ TEST_F(LifecycleOverPty, a_timeout_below_the_sync_read_floor_is_warned_about_and
 
 TEST_F(LifecycleOverPty, on_activate_and_stop_and_park_still_read_per_servo)
 {
-  // PHASE3 2.127 / F22. Both run once, off the real-time path, one joint at a time, and a sync
-  // read of a single id measured 0.755 ms against 0.750 ms for a FeedBack [P1 Q3] -- so there is
-  // nothing to win and a second call shape to test. The activation probe is the one burst that
-  // must appear, and this case accounts for it explicitly.
+  // Activation and park read per servo (a one-id sync read measured 0.755 ms vs 0.750 ms for
+  // FeedBack), so the probe is the only burst.
   ASSERT_TRUE(load_four_servos());
   ASSERT_EQ(configure(), hardware_interface::return_type::OK);
 
@@ -1575,10 +1467,8 @@ TEST_F(LifecycleOverPty, on_activate_and_stop_and_park_still_read_per_servo)
 
 TEST_F(LifecycleOverPty, the_bus_totals_line_is_logged_once_per_activation)
 {
-  // PHASE3 L5 (0.4), 5.14, R16. One INFO in 5.14's exact grammar, emitted AFTER stop_and_park()
-  // so the parking round trips fall inside the window they were issued in, and guarded by
-  // read_stats_reported_ so a deactivate-then-shutdown sequence logs it once. hil_gates.py parses
-  // this line, so its shape is part of the contract and not a convenience.
+  // One bus totals INFO per activation, once even for deactivate then shutdown. hil_gates.py
+  // parses it. See docs/bus-timing.md, "Bus totals line".
   ASSERT_TRUE(load_four_servos());
   ASSERT_EQ(configure(), hardware_interface::return_type::OK);
   ASSERT_EQ(activate(), hardware_interface::return_type::OK);
@@ -1589,10 +1479,8 @@ TEST_F(LifecycleOverPty, the_bus_totals_line_is_logged_once_per_activation)
 
   ASSERT_EQ(deactivate(), hardware_interface::return_type::OK);
 
-  // 50 read() calls, so 50 transactions: `transactions` is the count of the wrapper's own read
-  // round trips, of which the sync path issues exactly one per control cycle whatever the servo
-  // count (PHASE3 5.14; 5.15's `expected = 100.0 * soak` and its 30 000 = "five minutes at 100 Hz"
-  // are the same quantity). Every servo answered and nothing was dropped.
+  // 50 reads, 50 transactions: the sync path is one transaction per cycle, whatever the servo
+  // count.
   EXPECT_EQ(
     count_containing(
       infos(),
@@ -1605,12 +1493,8 @@ TEST_F(LifecycleOverPty, the_bus_totals_line_is_logged_once_per_activation)
 
 TEST_F(LifecycleOverPty, the_per_servo_path_counts_one_transaction_per_unicast_read)
 {
-  // PHASE3 5.14 defines `transactions` as "exactly the wrapper's own read entry points", and on
-  // this path that is one read_feedback_one() per present joint per cycle, not one per cycle. The
-  // distinction is the whole value of the number: the per-servo arm is what 5.6's cand_fallback_r1
-  // run measures and what 5.26 quotes in the README beside the sync arm, and a denominator that
-  // was four times too small there would make the two arms' per-million rates incomparable --
-  // the slow arm would look four times less reliable than an identical bus on the fast one.
+  // Per-servo path: one transaction per unicast read (4 per cycle here), so its per-million
+  // rate is comparable with the sync path's.
   ASSERT_TRUE(load_four_servos("  <param name=\"feedback_mode\">per_servo</param>\n"));
   ASSERT_EQ(configure(), hardware_interface::return_type::OK);
   ASSERT_EQ(activate(), hardware_interface::return_type::OK);
@@ -1640,10 +1524,8 @@ TEST_F(LifecycleOverPty, the_per_servo_path_counts_one_transaction_per_unicast_r
 
 TEST_F(LifecycleOverPty, a_failed_unicast_read_is_one_failed_transaction_out_of_four)
 {
-  // The other half of the counting rule, and the one that fixes the rate: on the per-servo path a
-  // silent servo fails ITS OWN transaction and the other three still succeed, so three cycles of
-  // silence are 3 failures in 12 -- 250 000 per million. Charging the cycle instead (3 in 3) would
-  // report a bus that is losing a quarter of its traffic as one losing all of it.
+  // Per-servo path: a silent servo fails only its own read, so 3 silent cycles are 3 of 12,
+  // 250 000 per million.
   ASSERT_TRUE(load_four_servos("  <param name=\"feedback_mode\">per_servo</param>\n"));
   ASSERT_EQ(configure(), hardware_interface::return_type::OK);
   ASSERT_EQ(activate(), hardware_interface::return_type::OK);
@@ -1663,9 +1545,7 @@ TEST_F(LifecycleOverPty, a_failed_unicast_read_is_one_failed_transaction_out_of_
 
 TEST_F(LifecycleOverPty, a_component_that_never_read_logs_no_bus_totals)
 {
-  // The second of 3.36's two guards, kept by R16: on_error is reachable from INACTIVE, where no
-  // cycle ever ran, and an all-zero line there is noise a grep-based gate would have to learn to
-  // ignore.
+  // No cycle ran, so no bus totals line: an all-zero line is noise for grep-based gates.
   ASSERT_TRUE(load_four_servos());
   ASSERT_EQ(configure(), hardware_interface::return_type::OK);
   ASSERT_EQ(activate(), hardware_interface::return_type::OK);
@@ -1676,27 +1556,17 @@ TEST_F(LifecycleOverPty, a_component_that_never_read_logs_no_bus_totals)
 
 
 // ---------------------------------------------------------------------------------------------
-// WaveshareServosAbsentServo (PHASE2_SPEC 6): the allow_missing_servos configure-time gate.
-//
-// `absent` here, never `silent_feedback`: this is "no servo on the bus at all", the failure the
-// configure-time gate exists for. The runtime drop of a servo that was there and went quiet is
-// DropRecoverOverPty's subject, and the two must not be confused -- an absent servo answers no
-// ping, so it never reaches the read path in the first place.
+// WaveshareServosAbsentServo: the allow_missing_servos configure gate (no servo on the bus).
 
 class WaveshareServosAbsentServo : public PtyFixture
 {
 protected:
-  // 30 ms rather than the 5 ms default (PHASE3 5.19), so a ping to a servo that is not there
-  // costs one generous, known unit; max_read_fails 2 so the one case that needs a runtime drop
-  // pays two of them instead of fifty. 30 is well above min_io_timeout_ms(4) == 3, so these cases
-  // keep the sync-read path without a parameter change; it does draw the dead-servo advisory of
-  // PHASE3 2.85 once per configure(), which every assertion here tolerates because warnings are
-  // matched by substring.
+  // 30 ms (default 5) makes a missing-servo ping one known cost; max_read_fails 2 keeps the
+  // drop case short. Sync read stays on; the dead-servo advisory WARN at load is tolerated.
   static constexpr int kIoTimeoutMs = 30;
   static constexpr int kMaxReadFails = 2;
-  // The timing case's second io timeout, four times the first, and the retry budget both of its
-  // measurements are taken at. 120 ms is inside the parser's 1..1000 range (src/waveshare_servos
-  // .cpp) and three attempts of it is the longest wait in this file: 360 ms, once.
+  // The timing case's slow io timeout (4x) and ping attempts; 3 x 120 ms is the longest wait
+  // in this file.
   static constexpr int kSlowIoTimeoutMs = 120;
   static constexpr int kPingAttempts = 3;
   static constexpr char kAllowMissing[] =
@@ -1712,8 +1582,8 @@ protected:
     fake_.set_position(2, kMidTick);
   }
 
-  // Deliberately without <param name="allow_missing_servos"> unless a case asks for one: the
-  // default the gate is armed with has to come from the driver, not from the description (D1).
+  // No allow_missing_servos param unless the case adds one: the gate's default must come from
+  // the driver.
   [[nodiscard]] bool load_four_servos(const std::string & extra = "")
   {
     return load(
@@ -1725,10 +1595,8 @@ protected:
           extra)));
   }
 
-  // The same four servos with the io timeout and the retry budget named by the case instead of
-  // taken from the fixture's constant. Only the timing case needs this: what it measures is the
-  // cost of a ping to a servo that is not there, and the only way to show that cost tracks
-  // io_timeout_ms is to configure twice with two different values of it.
+  // Io timeout and ping attempts set by the case: the timing case configures with two
+  // timeouts.
   [[nodiscard]] bool load_four_servos_timed(int io_timeout_ms, int ping_attempts)
   {
     return load(
@@ -1753,7 +1621,7 @@ protected:
     return elapsed;
   }
 
-  // the Phase 1 per-servo ping WARN, whose wording is frozen: the bench check greps for it
+  // the per-servo ping WARN, whose wording is frozen: the bench check greps for it
   static std::string skipped(int id)
   {
     const std::string name = "joint" + std::to_string(id);
@@ -1779,11 +1647,10 @@ TEST_F(
       fatals(),
       "2 of 4 servos did not answer: id 1 (joint 'joint1'), id 3 (joint 'joint3'); refusing to "
       "configure because 'allow_missing_servos' is false"), 1u);
-  // and that gate message is the ONE FATAL of the refusal path (PHASE2_SPEC 6.3), not merely one
-  // of several: the bench predicate H5A is worded "exactly one driver FATAL", so it is pinned
-  // here, where the count is deterministic.
+  // and the gate message is the only FATAL of the refusal path: bench scenario H5A expects
+  // exactly one
   EXPECT_EQ(fatals().size(), 1u);
-  // the Phase 1 per-servo WARN still fires, once per missing servo, with its wording unchanged
+  // the per-servo ping WARN still fires once per missing servo, wording unchanged
   EXPECT_THAT(warnings(), Contains(HasSubstr(skipped(1))));
   EXPECT_THAT(warnings(), Contains(HasSubstr(skipped(3))));
   EXPECT_EQ(count_containing(warnings(), "unable to ping motor id"), 2u);
@@ -1798,10 +1665,8 @@ TEST_F(WaveshareServosAbsentServo, configure_closes_the_port_before_returning_fa
   ASSERT_TRUE(load_four_servos());
   ASSERT_EQ(configure(), hardware_interface::return_type::ERROR);
 
-  // Only the fixture's own pty slave is left: neither the library's descriptor nor the bus's lock
-  // descriptor survived. Nothing else could have closed them -- a component refused out of
-  // UNCONFIGURED gets neither on_error nor on_cleanup (PHASE2_SPEC 6.3), so on_configure itself
-  // has to, before it returns.
+  // Only the pty slave is left: a refused on_configure gets no on_error/on_cleanup, so it
+  // must close the port itself.
   EXPECT_EQ(descriptors_on(fake_.port()), 1u);
 
   // and the port is free in fact, not merely uncounted: the same component takes it again the
@@ -1815,11 +1680,8 @@ TEST_F(
   WaveshareServosAbsentServo,
   configure_leaves_no_descriptor_when_the_port_cannot_be_configured)
 {
-  // A plain file is openable but is not a tty, so ServoBus refuses it AFTER its own ::open() has
-  // already succeeded -- the class of open failure in which a descriptor exists to be leaked, and
-  // the one a test can stage. (The tcsetattr refusal whose FATAL says "could not be configured"
-  // verbatim needs a device that vanishes between open and tcsetattr, which no test can arrange;
-  // it reaches the same uniform rule by the same path.)
+  // A plain file opens but is not a tty: ServoBus refuses it after ::open(), when an fd could
+  // leak. A tcsetattr failure takes the same path but cannot be staged.
   const TempFile not_a_tty("waveshare_servos_not_a_tty_" + std::to_string(::getpid()));
   ASSERT_TRUE(not_a_tty.ok()) << "the harness could not create a plain file under the temp dir";
   ASSERT_TRUE(
@@ -1838,10 +1700,7 @@ TEST_F(
   // and this case never went near the pty
   EXPECT_EQ(descriptors_on(fake_.port()), 1u);
 
-  // The observable half of the uniform rule (PHASE2_SPEC 6.3), and the half a descriptor count on
-  // a file cannot see: a component refused at open is left clean enough to configure again, on a
-  // port that works, without a cleanup in between -- exactly what the sibling case
-  // configure_closes_the_port_before_returning_failure asserts for the gate path.
+  // A component refused at open must configure again on a working port without a cleanup.
   ASSERT_TRUE(load_four_servos());
   EXPECT_EQ(configure(), hardware_interface::return_type::OK);
   EXPECT_EQ(descriptors_on(fake_.port()), 3u);
@@ -1877,10 +1736,8 @@ TEST_F(WaveshareServosAbsentServo, configure_succeeds_and_warns_when_missing_is_
 
 TEST_F(WaveshareServosAbsentServo, configure_does_not_write_the_mode_register_on_the_refusal_path)
 {
-  // Servo 3 is a wheel sitting in mode 0, so build_groups() -> set_mode() would unlock EPROM,
-  // rewrite register 33 and lock it again. The gate runs BEFORE build_groups() precisely so a
-  // configuration that is about to be refused never spends one of that cell's write cycles
-  // (PHASE2_SPEC 6.1).
+  // Servo 3 is a wheel in mode 0: the gate runs before build_groups(), so a refused configure
+  // never spends an EPROM write on register 33.
   fake_.set_byte(3, kRegMode, 0);
   fake_.set_absent(1, true);
   ASSERT_TRUE(load_four_servos());
@@ -1935,10 +1792,8 @@ TEST_F(
   WaveshareServosAbsentServo,
   activate_succeeds_with_a_still_silent_servo_even_when_missing_is_not_allowed)
 {
-  // PHASE2_SPEC 6.2: the gate is a configure-time policy and there is deliberately no
-  // activate-time one. This description sets allow_missing_servos nowhere, so the gate is armed --
-  // and a deactivate/activate of a component that has already lost a servo must still come up, or
-  // a robot that has just recovered two servos of three could not be re-armed.
+  // The gate is configure-time only: re-activating after a run-time drop must succeed even
+  // with allow_missing_servos false.
   ASSERT_TRUE(load_four_servos());
   ASSERT_EQ(configure(), hardware_interface::return_type::OK);
   ASSERT_EQ(activate(), hardware_interface::return_type::OK);
@@ -1960,8 +1815,7 @@ TEST_F(
   EXPECT_TRUE(std::isnan(state_of("joint3/status")));
   EXPECT_DOUBLE_EQ(state_of("joint1/position"), rad_of_tick(kMidTick));
 
-  // The other half of 6.2: a fresh configure IS subject to the gate, so the two recovery routes
-  // are not the same route.
+  // A fresh configure is gated, so the two recovery routes differ.
   ASSERT_EQ(deactivate(), hardware_interface::return_type::OK);
   ASSERT_EQ(cleanup(), hardware_interface::return_type::OK);
   EXPECT_EQ(configure(), hardware_interface::return_type::ERROR);
@@ -1976,9 +1830,8 @@ TEST_F(
 
 TEST_F(WaveshareServosAbsentServo, read_mirrors_commands_for_a_dropped_servo)
 {
-  // What the permissive WARN promises: "their joints mirror their commands into their states
-  // until the servos answer". Both ways of losing a servo take the same branch, so both are
-  // checked -- servo 1 was never on the bus, servo 2 was and was dropped mid-run.
+  // The permissive WARN promises mirrored commands. Both ways to lose a servo take that
+  // branch: servo 1 was never there, servo 2 is dropped mid-run.
   fake_.set_absent(1, true);
   ASSERT_TRUE(load_four_servos(kAllowMissing));
   ASSERT_EQ(configure(), hardware_interface::return_type::OK);
@@ -2008,24 +1861,8 @@ TEST_F(WaveshareServosAbsentServo, read_mirrors_commands_for_a_dropped_servo)
 
 TEST_F(WaveshareServosAbsentServo, ping_cost_is_bounded_by_ping_attempts_times_io_timeout)
 {
-  // What this pins: a servo that is not on the bus costs ping_attempts timeouts at configure and
-  // nothing more -- not one timeout per servo on the bus, and not the library's stock 100 ms,
-  // which is what made an absent servo cost a tenth of a second of every control period before
-  // the io timeout was put in force ahead of the first transaction.
-  //
-  // The primary assertion is a count and does not look at a clock at all: a servo that answers is
-  // pinged exactly once whatever ping_attempts says, so the retry budget is spent only on the
-  // servo that is missing.
-  //
-  // The timing check that follows holds ping_attempts at 3 and varies io_timeout_ms instead, so
-  // what it compares are two structurally different costs -- 3 x 30 ms against 3 x 120 ms -- and
-  // not one cost against a scaled copy of itself. It asserts no absolute wall-clock bound
-  // (PHASE2_SPEC 10.3): both measurements come from this case on this machine, the fixed
-  // configure overhead O is the same in both, and the claim is only that the slow one is more
-  // than twice the fast one. With the per-attempt cost tracking io_timeout_ms that reads
-  // O + 360 > 2 x (O + 90), true for any O below 180 ms (O is about 3 ms here). Let the absent
-  // ping revert to the library's stock 100 ms and both configures cost the same O + 300, so the
-  // assertion fails -- which is the regression named above and the only reason this case exists.
+  // A missing servo costs ping_attempts x io_timeout_ms at configure, not the stock 100 ms.
+  // Counts first; the timing check is relative only (slow > 2 x fast), never absolute.
   fake_.set_absent(3, true);
   ASSERT_TRUE(load_four_servos_timed(kIoTimeoutMs, 1));
   ASSERT_EQ(configure(), hardware_interface::return_type::OK);
@@ -2060,11 +1897,8 @@ TEST_F(WaveshareServosAbsentServo, ping_cost_is_bounded_by_ping_attempts_times_i
 
 TEST_F(WaveshareServosAbsentServo, the_absent_servo_is_never_named_in_a_sync_read)
 {
-  // PHASE3 3.38 / F14. build_read_group() filters on present_, so a servo that answered no ping
-  // never enters the id list at all -- which matters because an id in the list that cannot answer
-  // costs one whole io_timeout_ms every cycle [P1 Q5]. sync_read_named is the only counter that
-  // can prove this: every other one is bumped after the absent check, so it cannot tell "the
-  // driver did not name it" from "it was named and stayed silent" (PHASE3 4.H2).
+  // An absent servo is never in the sync-read id list (a silent listed id costs io_timeout_ms
+  // per cycle). Only sync_read_named can tell "not named" from "named and silent".
   fake_.set_absent(1, true);
   ASSERT_TRUE(load_four_servos(kAllowMissing));
   ASSERT_EQ(configure(), hardware_interface::return_type::OK);
@@ -2086,9 +1920,7 @@ TEST_F(WaveshareServosAbsentServo, the_absent_servo_is_never_named_in_a_sync_rea
 }
 
 // ---------------------------------------------------------------------------------------------
-// DropRecoverOverPty (PHASE2_SPEC 10.4): a servo that goes silent mid-run. D7(a)'s deterministic
-// replacement for the bench connector pull -- a fake servo that stops answering on cue, between
-// two driver calls, so "the servo goes silent on cycle N" is the same on every machine.
+// DropRecoverOverPty: a servo goes silent mid-run, on cue between two driver calls.
 
 class DropRecoverOverPty : public PtyFixture
 {
@@ -2106,9 +1938,8 @@ protected:
     fake_.set_position(2, kMidTick);
   }
 
-  // The gap-warning cases (PHASE2_SPEC 10.4 cases 11-13) need a retry budget their silence cannot
-  // reach: twelve failed reads have to produce the "lost revolutions" WARN without dropping the
-  // servo, which is the whole point of a warning driven by elapsed time rather than by the drop.
+  // A drop budget the silence cases cannot reach: 12 failed reads must give the
+  // lost-revolutions WARN without a drop, because that WARN is time-driven.
   static constexpr int kSilenceMaxReadFails = 40;
 
   std::string drop_params(int max_read_fails = kMaxReadFails) const
@@ -2134,12 +1965,8 @@ protected:
     step_read();
   }
 
-  // The gap WARN of PHASE2_SPEC 8.5, with every number computed from the fixture's own parameters
-  // rather than guessed: `cycle` is max(last_period_, io_timeout_ms), last_period_ being 0.01 s
-  // until a write() sets it and these cases never write; `gap` is that cycle times the failed reads
-  // plus the one that recovered; `possible` is the joint's SPEED CEILING over that gap, which is
-  // why the message says "may be". A cycle in which nothing failed is charged no timeout at all --
-  // its gap is the elapsed period, which lost_revolutions_over() below states directly.
+  // The gap WARN from the fixture's parameters: gap = max(period, io timeout) x (missed + 1),
+  // possible = speed ceiling x gap. See docs/design.md, "Position unwrapper".
   static std::string lost_revolutions(int missed, int gaps)
   {
     const double cycle = std::max(0.01, kIoTimeoutMs / 1000.0);
@@ -2185,10 +2012,8 @@ protected:
 
 TEST_F(DropRecoverOverPty, a_silent_servo_raises_its_failure_count_and_warns_once)
 {
-  // A position servo 3 could not have got by accident: read()'s absent branch publishes 0.0 for a
-  // wheel (pos_cmds_ is NaN for a velocity joint, cpp:1224), which is also what an untouched
-  // register file reads back, so a zero here could not tell "held the last good sample" apart from
-  // "was dropped early". 700 ticks can only have come from a real feedback reply.
+  // 700 ticks: the absent branch and an untouched register both give 0, so only a nonzero
+  // value proves the last good sample was held.
   fake_.set_position(3, 700);
   bring_up();
   const double last_good = state_of("joint3/position");
@@ -2216,9 +2041,8 @@ TEST_F(DropRecoverOverPty, a_silent_servo_raises_its_failure_count_and_warns_onc
 
 TEST_F(DropRecoverOverPty, the_failure_warning_is_throttled_to_the_first_and_every_two_hundredth)
 {
-  // One joint only, so no healthy round trip can flake the count, and a 2 ms timeout so 201
-  // failing reads cost about 0.4 s. max_read_fails is far out of reach: this case measures the
-  // throttle and nothing else.
+  // One joint, so nothing else can disturb the count; 2 ms makes 201 failures cost ~0.4 s,
+  // and max_read_fails 1000 is out of reach.
   fake_.set_silent_feedback(1, true);
   ASSERT_TRUE(
     load(
@@ -2246,7 +2070,7 @@ TEST_F(DropRecoverOverPty, the_failure_warning_is_throttled_to_the_first_and_eve
   EXPECT_THAT(errors(), Not(Contains(HasSubstr("stopped answering"))));
 }
 
-TEST_F(DropRecoverOverPty, a_silent_servo_is_dropped_at_max_read_fails_with_the_phase1_messages)
+TEST_F(DropRecoverOverPty, a_silent_servo_is_dropped_at_max_read_fails_and_reported_once)
 {
   bring_up();
   fake_.set_silent_feedback(3, true);
@@ -2256,7 +2080,7 @@ TEST_F(DropRecoverOverPty, a_silent_servo_is_dropped_at_max_read_fails_with_the_
     step_read();
     EXPECT_THAT(errors(), Not(Contains(HasSubstr("stopped answering"))));
   }
-  // cpp:541 is `>=`, not `>`: the drop lands on the 8th failed read, not the 9th
+  // the drop test is `>=`, not `>`: the drop lands on the 8th failed read, not the 9th
   step_read();
   EXPECT_THAT(errors(), Contains(HasSubstr(dropped_after(3, kMaxReadFails))));
   EXPECT_EQ(count_containing(errors(), "stopped answering"), 1u);
@@ -2280,11 +2104,7 @@ TEST_F(DropRecoverOverPty, a_silent_servo_is_dropped_at_max_read_fails_with_the_
 TEST_F(DropRecoverOverPty, a_dropped_servo_gets_no_further_request_on_the_bus)
 {
   bring_up();
-  // Both kinds at once: servo 1 is a position joint and servo 3 is a wheel. Before Phase 3 the
-  // two differed on the wire -- SyncWriteSpe sent every wheel an addressed ACC write before the
-  // broadcast (src/SMS_STS.cpp:275) -- so the claim under test, that a dropped servo costs no
-  // further bus time, was true of both but visible only on servo 1. Item 1 removed that write, so
-  // the two kinds now go equally, completely silent.
+  // A position servo and a wheel at once: after a drop, neither may get any request at all.
   fake_.set_silent_feedback(1, true);
   fake_.set_silent_feedback(3, true);
   for (int cycle = 0; cycle < kMaxReadFails; cycle++) {
@@ -2312,11 +2132,8 @@ TEST_F(DropRecoverOverPty, a_dropped_servo_gets_no_further_request_on_the_bus)
   EXPECT_EQ(dropped_wheel.feedback_reads, dropped_wheel_before.feedback_reads);
   EXPECT_EQ(dropped_wheel.reads, dropped_wheel_before.reads);
   EXPECT_EQ(dropped_wheel.pings, dropped_wheel_before.pings);
-  // PHASE3 4.U1. Item 1 removed SyncWriteSpe's per-servo ACC write (src/SMS_STS.cpp:275): the
-  // wheel's acceleration is written at the four edges of PHASE3 1.24 instead, none of which a
-  // dropped servo reaches, so a dropped wheel now receives nothing at all -- not even an acked
-  // write. The broadcast sync write still reaches it and still costs no addressed request, which
-  // is why `requests` is flat rather than merely small.
+  // A dropped wheel gets no addressed write (no ACC edge reaches it); the broadcast sync
+  // write still reaches it but is not a request.
   EXPECT_EQ(dropped_wheel.writes, dropped_wheel_before.writes);
   EXPECT_EQ(dropped_wheel.requests, dropped_wheel_before.requests);
 
@@ -2327,10 +2144,8 @@ TEST_F(DropRecoverOverPty, a_dropped_servo_gets_no_further_request_on_the_bus)
 
 TEST_F(DropRecoverOverPty, a_dropped_servo_keeps_its_place_in_the_sync_write_groups)
 {
-  // Phase 1 behaviour, deliberately preserved: the drop sets present_ false and nothing else.
-  // build_groups() is not called and send_commands() never consults present_, so a dropped servo
-  // stays in the sync-write groups and still receives its record. Do not "fix" this -- it would
-  // change the packet contents and move the bench's goal_position_raw rows.
+  // Deliberate: a dropped servo stays in the sync-write groups (bytes of an unacked
+  // broadcast). Do not "fix" it: that would change the packet contents.
   bring_up();
   drop_servo_three();
   ASSERT_THAT(errors(), Contains(HasSubstr(dropped_after(3, kMaxReadFails))));
@@ -2349,10 +2164,8 @@ TEST_F(DropRecoverOverPty, a_dropped_servo_keeps_its_place_in_the_sync_write_gro
   }
   EXPECT_EQ(fake_.snapshot(3).sync_writes.back().first, kRegGoalSpeed);
   EXPECT_EQ(fake_.snapshot(3).sync_writes.back().second.size(), 2u);
-  // PHASE3 4.U2. The records cost no addressed round trip of their own: a sync write is a
-  // broadcast to 0xfe and is never acked, the per-cycle ACC write is gone (item 1), and a dropped
-  // servo is no longer read. So it sees no addressed request at all while still receiving every
-  // record.
+  // No round trip: the sync write is an unacked broadcast to 0xfe, and a dropped servo is not
+  // read, so it gets records but no request.
   EXPECT_EQ(fake_.snapshot(3).requests, dropped_before.requests);
   EXPECT_EQ(fake_.snapshot(3).feedback_reads, dropped_before.feedback_reads);
 }
@@ -2387,10 +2200,8 @@ TEST_F(DropRecoverOverPty, a_dropped_servo_stops_costing_a_timeout_per_cycle)
   // machine is doing, a dropped servo is not polled and the healthy ones are.
   EXPECT_EQ(fake_.snapshot(3).feedback_reads, dropped_before.feedback_reads);
   EXPECT_EQ(fake_.snapshot(2).feedback_reads, healthy_before.feedback_reads + 20);
-  // PHASE3 4.T44 / 2.120: the same claim on the sync path, extended here rather than duplicated
-  // in a second case, because the cost being asserted is the same cost. sync_read_named is the
-  // counter that separates "not named in the request" from "named and silent" -- and being named
-  // is exactly what would go on costing one io_timeout_ms a cycle.
+  // Same claim on the sync path: sync_read_named shows the dropped id is not named, which
+  // would otherwise cost io_timeout_ms per cycle.
   EXPECT_EQ(fake_.snapshot(3).sync_read_named, dropped_before.sync_read_named);
   EXPECT_EQ(fake_.snapshot(2).sync_reads, healthy_before.sync_reads + 20);
   EXPECT_EQ(fake_.snapshot(4).sync_reads, fake_.snapshot(2).sync_reads);
@@ -2435,7 +2246,7 @@ TEST_F(DropRecoverOverPty, deactivate_then_activate_re_pings_a_dropped_servo_and
   EXPECT_LE(after.pings, before.pings + 3) << "at most ping_attempts tries";
   // a regroup costs no EPROM write: set_mode only writes register 33 when it differs
   EXPECT_EQ(after.mode_writes, before.mode_writes);
-  // only joints that are absent are re-pinged (cpp:373-375)
+  // only joints that are absent are re-pinged (the re-ping loop of on_activate)
   for (const uint8_t id : {1, 2, 4}) {
     EXPECT_EQ(fake_.snapshot(id).pings, healthy_before[id].pings) << static_cast<int>(id);
   }
@@ -2484,7 +2295,7 @@ TEST_F(DropRecoverOverPty, a_servo_that_answers_again_before_max_read_fails_is_n
   }
   EXPECT_THAT(errors(), Not(Contains(HasSubstr("stopped answering"))));
 
-  // one good read resets the counter to 0 (cpp:554)
+  // one good read resets the counter to 0
   fake_.set_silent_feedback(3, false);
   step_read();
   fake_.set_silent_feedback(3, true);
@@ -2505,17 +2316,14 @@ TEST_F(DropRecoverOverPty, a_servo_that_answers_again_before_max_read_fails_is_n
   EXPECT_DOUBLE_EQ(state_of("joint3/position"), rad_of_tick(900, 0.0));
 }
 
-// PHASE3 4.T48 (= 1.32.26) -- site 3 of PHASE3 1.24: the read-recovery edge, the only place that
-// catches SRAM loss DURING an activation.
+// Wheel ACC edge 3 of 4: read recovery, which catches a power cycle during an activation.
 TEST_F(DropRecoverOverPty, a_servo_that_missed_reads_and_came_back_gets_its_acceleration_rewritten)
 {
   bring_up();
   const FakeServo before = fake_.snapshot(3);
 
-  // Three silent cycles, well below kMaxReadFails, so the servo is never dropped and never
-  // regrouped. A servo power cycle takes far longer than one 10 ms period, so it always shows up
-  // as at least one missed read -- which is what makes this edge the right one to hang the rewrite
-  // on, and 0.594 ms [P2 Q1] on a cycle that was already abnormal is what it costs.
+  // Three misses, below the drop budget. A power cycle always shows as a missed read, so the
+  // recovery edge rewrites the ACC (one 0.594 ms write).
   fake_.set_silent_feedback(3, true);
   for (int cycle = 0; cycle < 3; cycle++) {
     step_read();
@@ -2535,27 +2343,22 @@ TEST_F(DropRecoverOverPty, a_servo_that_missed_reads_and_came_back_gets_its_acce
   EXPECT_THAT(errors(), Not(Contains(HasSubstr("stopped answering"))));
 }
 
-// PHASE3 4.T55: the frozen WARN of L4, asserted literally, and the two halves of PHASE3 1.25 --
-// a write that is attempted and refused warns exactly once, and a write that is never attempted
-// warns not at all.
+// Frozen refused-ACC WARN: an attempted, refused write warns once; a write never attempted
+// does not warn.
 TEST_F(DropRecoverOverPty, a_servo_that_refuses_the_acceleration_write_is_warned_about_once)
 {
   bring_up();
 
-  // Attempted and refused. Servo 3 leaves the bus between the deactivation and the activation, so
-  // present_ is still true -- nothing has dropped it -- and site 2 writes register 41 into
-  // silence. SCS::Ack returns 0 on every failure path and never -1 (src/SCS.cpp:265-295), which is
-  // why ServoBus::write_acc tests `!= 0`; spelled `!= -1`, as the READ side is, this warning would
-  // be unreachable and this case could not pass.
+  // Servo 3 leaves between deactivate and activate, so edge 2 writes into silence. SCS::Ack
+  // returns 0 on failure, never -1, so write_acc tests != 0.
   ASSERT_EQ(deactivate(), hardware_interface::return_type::OK);
   fake_.set_absent(3, true);
   EXPECT_EQ(activate(), hardware_interface::return_type::OK);
 
   EXPECT_EQ(count_containing(warnings(), acc_refused_for(3)), 1u);
 
-  // Never attempted. Eight silent reads drop the servo, and from then on present_ is false:
-  // build_groups() iterates present servos only and write_wheel_acceleration() returns early, so
-  // the re-activation whose ping fails adds no second warning and puts no byte on the bus for it.
+  // Never attempted: after the drop present_ is false, so build_groups() and
+  // write_wheel_acceleration() skip it; re-activation adds no WARN and no byte.
   for (int cycle = 0; cycle < kMaxReadFails; cycle++) {
     step_read();
   }
@@ -2570,11 +2373,8 @@ TEST_F(DropRecoverOverPty, a_servo_that_refuses_the_acceleration_write_is_warned
 
 TEST_F(DropRecoverOverPty, a_dropped_wheel_does_not_jump_back_to_its_activation_position)
 {
-  // PHASE2_SPEC 8.6, the blocker this chunk fixes. read()'s absent branch mirrors pos_cmds_ into
-  // pos_states_, and a `vel` joint's pos_cmds_ was last written at ACTIVATION, because it declares
-  // no position command interface for a controller to refresh. Without the fix a wheel unwrapped
-  // several revolutions out publishes its activation position on the cycle after the drop: an
-  // unbounded backward jump, strictly worse than the bounded 2 pi discontinuity unwrapping removes.
+  // The absent branch mirrors pos_cmds_, which for a wheel dates from activation; the drop
+  // must refresh it or the wheel jumps back by its whole travel.
   bring_up();
   // spin it through two and a half revolutions, 1000 ticks a cycle, so the register wraps twice
   for (int cycle = 1; cycle <= 10; cycle++) {
@@ -2587,8 +2387,8 @@ TEST_F(DropRecoverOverPty, a_dropped_wheel_does_not_jump_back_to_its_activation_
 
   drop_servo_three();
   ASSERT_THAT(errors(), Contains(HasSubstr(dropped_after(3, kMaxReadFails))));
-  // the drop cycle itself still publishes the last good sample: cpp:541-550 sets present_ and
-  // continues, so the absent branch does not run until the next cycle
+  // the drop cycle itself still publishes the last good sample: the dropping branch sets
+  // present_ and continues, so the absent branch runs from the next cycle
   ASSERT_DOUBLE_EQ(state_of("joint3/position"), spun);
 
   step_read();    // the first cycle down read()'s absent branch
@@ -2606,25 +2406,8 @@ TEST_F(DropRecoverOverPty, a_dropped_wheel_does_not_jump_back_to_its_activation_
 
 TEST_F(DropRecoverOverPty, a_component_cycle_keeps_a_present_wheels_multi_turn_count)
 {
-  // Found on the real bench in Phase 4 (hil_check H9.g1c.joint3/joint4) and reproduced outside the
-  // harness on the shipped example.launch.py: `ros2 control set_hardware_component_state <hw>
-  // inactive` then `active` used to ZERO the multi-turn count, so a wheel several revolutions out
-  // jumped backward by exactly the whole turns it had accumulated -- 6.000 turns in H9, 5.000 in
-  // the standalone repro, landing on the raw wrapped register value.
-  //
-  // PHASE2_SPEC 8.4 reset on every activation, on the stated grounds that "the consumer that
-  // integrates wheel position re-zeroes on hardware activation, exactly as it does on controller
-  // activation". That premise is false for a hardware-component cycle: the CONTROLLER stays ACTIVE
-  // across it and is never told it happened, so it has no re-zero to perform. diff_drive_controller
-  // with position_feedback: true simply differences the two sides of the jump and teleports the
-  // odometry by N * 2 pi * wheel_radius -- 0.314 m per accumulated turn at the example's configured
-  // radius -- and 4.42.1 ships no reset service to recover from it.
-  //
-  // So a wheel that stayed PRESENT across the cycle keeps its count. The bridge is bounded to whole
-  // revolutions and is the same envelope every sample gap has; re-seeding instead makes the error
-  // the full travel, which position_unwrapper.hpp's own "Rejected alternatives" already calls
-  // strictly worse. A wheel that was DROPPED still starts a new count, because the drop path
-  // resets it (cpp, the dropping branch of read()) -- pinned by the test below this one.
+  // A deactivate/activate cycle keeps a present wheel's multi-turn count: a reset teleported
+  // diff_drive odometry. See docs/configuration.md, "Multi-turn wheel position".
   bring_up();
   for (int cycle = 1; cycle <= 10; cycle++) {
     fake_.set_position(3, (cycle * 1000) % kEncoderSteps);
@@ -2658,13 +2441,8 @@ TEST_F(DropRecoverOverPty, a_component_cycle_keeps_a_present_wheels_multi_turn_c
 
 TEST_F(DropRecoverOverPty, a_rejoining_wheel_starts_a_new_unwrapped_count)
 {
-  // PHASE2_SPEC 8.4, narrowed in Phase 4 to the case that still holds: a wheel that was DROPPED
-  // reports its plain register reading again rather than carrying an old count forward, because the
-  // drop path reset the accumulator when it stopped believing the servo. joint4 is the control, and
-  // its expectation is the REVERSE of what PHASE2_SPEC 8.4 originally pinned: it stayed present
-  // across the transition, so it carries its count -- see
-  // a_component_cycle_keeps_a_present_wheels_multi_turn_count above for why the old
-  // "every activation starts a new count" rule was wrong.
+  // A dropped wheel starts a new count (the drop reset it); joint4 stayed present and keeps
+  // its count, as in a_component_cycle_keeps_a_present_wheels_multi_turn_count.
   bring_up();
   for (int cycle = 1; cycle <= 10; cycle++) {
     fake_.set_position(3, (cycle * 1000) % kEncoderSteps);
@@ -2687,9 +2465,8 @@ TEST_F(DropRecoverOverPty, a_rejoining_wheel_starts_a_new_unwrapped_count)
   EXPECT_DOUBLE_EQ(state_of("joint3/position"), rad_of_tick(700, 0.0));
   EXPECT_LT(state_of("joint3/position"), 2.0 * M_PI) << "a new count, inside one turn";
   EXPECT_GE(state_of("joint3/position"), 0.0);
-  // joint4 was never silent and never dropped, so it bridges 10000 -> 900 ticks the short way:
-  // 900 - (10000 % 4096) = 900 - 1808 = -908 ticks, i.e. 10000 - 908 = 9092. The point of the row
-  // is that the DROP is what starts a new count, not the activation.
+  // joint4 bridges 10000 -> 900 the short way: 900 - (10000 % 4096) = -908, so 9092 ticks.
+  // The drop starts a new count, not the activation.
   EXPECT_DOUBLE_EQ(state_of("joint4/position"), rad_of_tick(9092, 0.0)) <<
     "a servo that stayed present carries its count across the activation";
   EXPECT_GT(state_of("joint4/position"), 4.0 * M_PI) << "two whole revolutions still on it";
@@ -2700,12 +2477,8 @@ TEST_F(DropRecoverOverPty, a_rejoining_wheel_starts_a_new_unwrapped_count)
 
 TEST_F(DropRecoverOverPty, a_long_silence_that_does_not_reach_the_drop_warns_about_lost_revolutions)
 {
-  // PHASE2_SPEC 8.5 and 10.4 case 11, the warning the manual connector pull was going to produce.
-  // Twelve silent cycles at a 30 ms failed-read cost is 0.39 s, and a wheel at its 9.20 rad/s
-  // ceiling could have turned 3.59 rad in that time -- more than the half revolution the unwrapper
-  // needs to be sure of the direction, so the count MAY now be short by whole revolutions.
-  // max_read_fails is 40, so nothing is dropped: this is the warning path, and it is reachable
-  // only because the warning is driven by elapsed time and not only by the drop rule.
+  // Gap = (12 silent + 1) x 30 ms = 0.39 s; at 9.20 rad/s that is 3.59 rad > pi, so the WARN
+  // fires. max_read_fails 40: no drop, because the WARN is time-driven.
   bring_up(kSilenceMaxReadFails);
   step_read();    // the count is bridged from here on, so a gap has something to be lost from
 
@@ -2729,11 +2502,8 @@ TEST_F(DropRecoverOverPty, a_long_silence_that_does_not_reach_the_drop_warns_abo
 TEST_F(DropRecoverOverPty,
   a_descheduled_cycle_with_no_failed_read_still_warns_about_lost_revolutions)
 {
-  // The other half of PHASE2_SPEC 8.5, and the only case that fails if note_unwrap_gap is moved
-  // inside an `if (missed > 0)` or if read() goes back to discarding its `period`: a control loop
-  // that was descheduled for half a second produces a successful read with missed == 0, and the
-  // wheel could still have turned 4.60 rad unseen. 12-30 ms overruns are recorded on this bench
-  // (jazzy.md:39), so the elapsed-time half of the predicate is not hypothetical.
+  // A 0.5 s deschedule with no failed read must still warn (4.60 rad possible). Fails if the
+  // check needs missed > 0 or read() ignores its period.
   bring_up(kSilenceMaxReadFails);
 
   step_read(0.5);
@@ -2751,10 +2521,7 @@ TEST_F(DropRecoverOverPty,
 
 TEST_F(DropRecoverOverPty, a_short_silence_does_not_warn_about_lost_revolutions)
 {
-  // The negative side of the same predicate (PHASE2_SPEC 10.4 case 12), without which the throttle
-  // of 8.5 could be satisfied by warning about every gap. Three silent cycles is 0.12 s, in which
-  // the same wheel could have turned only 1.10 rad -- well under the half revolution that would
-  // make the count ambiguous.
+  // Negative case: 3 silent cycles = 0.12 s = 1.10 rad at the ceiling, under pi, so no WARN.
   bring_up(kSilenceMaxReadFails);
   step_read();
 
@@ -2775,12 +2542,8 @@ TEST_F(DropRecoverOverPty, a_short_silence_does_not_warn_about_lost_revolutions)
 
 TEST_F(DropRecoverOverPty, a_silence_that_ended_at_the_activation_does_not_warn_after_it)
 {
-  // A gap is only evidence about the count it interrupted, and on_activate starts a new one
-  // (PHASE2_SPEC 8.4). The failure count that the silence left behind must therefore not be
-  // charged to the first read of the NEXT activation: the servo answered on activation, the
-  // unwrapper was re-seeded from that answer, and nothing about the pre-activation silence can
-  // have been lost from a count that did not exist yet. Without the reset the driver reports a
-  // gap that is a whole activation old, in a message the bench check greps for.
+  // A silence that ended at activation must not be reported after it: on_activate clears
+  // read_fails_, so the first read is charged no missed cycles.
   bring_up(kSilenceMaxReadFails);
   step_read();
 
@@ -2801,7 +2564,7 @@ TEST_F(DropRecoverOverPty, a_silence_that_ended_at_the_activation_does_not_warn_
 
   EXPECT_THAT(warnings(), Not(Contains(HasSubstr("without a reading"))));
   EXPECT_THAT(warnings(), Not(Contains(HasSubstr("may be off by whole revolutions"))));
-  // and the new count really is a new count, seeded from the register the servo answered with
+  // 700 either way: a count bridged from tick 0 and a fresh seed give the same value
   EXPECT_DOUBLE_EQ(state_of("joint3/position"), rad_of_tick(700, 0.0));
   // the next cycles are ordinary healthy ones too, so nothing arrives late either
   for (int cycle = 0; cycle < 3; cycle++) {
@@ -2812,12 +2575,8 @@ TEST_F(DropRecoverOverPty, a_silence_that_ended_at_the_activation_does_not_warn_
 
 TEST_F(DropRecoverOverPty, a_healthy_cycle_is_not_charged_a_failed_reads_timeout)
 {
-  // Every read of this case ANSWERED, so the elapsed time between two samples is the control
-  // period, 10 ms, and not the read timeout: a timeout is what a failed round trip costs, and
-  // there were none. io_timeout_ms is a legal 400 here, which is above the 342 ms at which the
-  // ceiling alone reaches half a revolution, so a driver that charged the timeout to a successful
-  // read would report "went 0.400 s without a reading" on every cycle of a healthy 100 Hz loop --
-  // a statement that is simply untrue, and a counter that then re-warns every 200th cycle.
+  // A successful read is charged the period, not the timeout. At io_timeout_ms 400 (> 342 ms,
+  // half a turn at the ceiling) the wrong rule would warn on every healthy cycle.
   ASSERT_TRUE(
     load(
       robot_description(
@@ -2848,12 +2607,8 @@ TEST_F(DropRecoverOverPty, a_healthy_cycle_is_not_charged_a_failed_reads_timeout
 
 TEST_F(DropRecoverOverPty, the_unwrap_accumulator_is_not_advanced_by_a_read_that_did_not_refresh)
 {
-  // PHASE2_SPEC 8.9, made executable. A cycle whose read failed never calls unwrap_ticks() at all,
-  // so the accumulator is advanced only by a sample that actually arrived: the next real delta is
-  // measured against the last REAL raw tick, not against the stale one that was re-published
-  // twelve times. The Phase 1 recordings show exactly this shape across a lifecycle transition --
-  // a run of bit-identical samples and then one catch-up step -- and an accumulator seeded or
-  // advanced from a stale sample would be wrong by exactly the motion that happened meanwhile.
+  // A failed read never reaches unwrap_ticks(): the next delta is from the last real tick,
+  // not from the stale value republished during the silence.
   fake_.set_position(3, 1000);
   bring_up(kSilenceMaxReadFails);
   step_read();
@@ -2882,15 +2637,12 @@ TEST_F(DropRecoverOverPty, the_unwrap_accumulator_is_not_advanced_by_a_read_that
 }
 
 // ---------------------------------------------------------------------------------------------
-// PHASE3 C6 over the drop fixture: the id list the burst asks for is maintained, and one servo's
-// bad reply costs one servo's joint.
+// Sync read with drops: the burst's id list stays current; a bad reply costs only its joint.
 
 TEST_F(DropRecoverOverPty, a_dropped_servo_leaves_the_sync_read_id_list)
 {
-  // PHASE3 4.T42 / 2.119, and the executable form of jazzy.md:205. The reason it matters is
-  // measured: an id in the list that never answers costs one whole io_timeout_ms every cycle,
-  // independent of where it sits and of how many are missing -- +3.56 ms at the 5 ms default, a
-  // 3.23x blow-up, and +18.6 ms at 20 ms [P1 Q5, P3 Q3].
+  // A dropped id must leave the sync-read list: a silent listed id costs one io_timeout_ms
+  // per cycle. See docs/bus-timing.md, "Cost of a silent servo".
   bring_up();
   drop_servo_three();
   ASSERT_THAT(errors(), Contains(HasSubstr(dropped_after(3, kMaxReadFails))));
@@ -2917,10 +2669,8 @@ TEST_F(DropRecoverOverPty, a_dropped_servo_leaves_the_sync_read_id_list)
 
 TEST_F(DropRecoverOverPty, the_sync_read_id_list_is_rebuilt_the_moment_the_drop_fires)
 {
-  // PHASE3 4.T43. Not one cycle later: the rebuild runs at the END of the read() that dropped the
-  // servo (2.65) rather than at the drop site, because the joints after i in the same loop are
-  // still reading r_slot_ and an in-place compaction would re-point them at another servo's
-  // sample. One extra timeout-priced cycle is what a deferred-to-next-cycle rebuild would cost.
+  // The id list is rebuilt at the end of the dropping read() (later joints still index
+  // r_slot_), so the very next cycle asks for three ids.
   bring_up();
   fake_.set_silent_feedback(3, true);
   for (int cycle = 0; cycle < kMaxReadFails - 1; cycle++) {
@@ -2938,9 +2688,8 @@ TEST_F(DropRecoverOverPty, the_sync_read_id_list_is_rebuilt_the_moment_the_drop_
 
 TEST_F(DropRecoverOverPty, a_servo_that_stops_answering_the_sync_read_freezes_only_its_own_joint)
 {
-  // PHASE3 4.T45. A short burst is not one failed transaction: it is one failed SLOT per missing
-  // frame, which is what the bench measured too -- 1200/1200 real decodes in every absent-id case
-  // [P1 Q5]. Treating the burst as atomic would turn one silent servo into four frozen joints.
+  // A short burst fails only the missing servo's slot (the bench decoded the others
+  // 1200/1200); treating it as atomic would freeze all four joints.
   fake_.set_position(2, kMidTick);
   bring_up();
   const double frozen = state_of("joint2/position");
@@ -2966,10 +2715,8 @@ TEST_F(DropRecoverOverPty, a_servo_that_stops_answering_the_sync_read_freezes_on
 
 TEST_F(DropRecoverOverPty, a_partial_reply_is_not_decoded_as_a_short_frame)
 {
-  // PHASE3 4.T46. Ten bytes off the tail of an 84-byte burst leaves servo 4 with eleven bytes of
-  // its 21-byte frame. The walker checks `pos + 21 <= length` before it touches a byte (2.32), so
-  // the remainder is not a frame and is not decoded -- the alternative, believing eleven bytes,
-  // publishes garbage that looks like a measurement.
+  // 10 bytes cut from an 84-byte burst leave servo 4 with 11 of its 21 bytes; the walker
+  // needs a whole frame, so nothing is decoded.
   fake_.set_position(4, 900);
   bring_up();
   const double frozen = state_of("joint4/position");
@@ -2984,9 +2731,8 @@ TEST_F(DropRecoverOverPty, a_partial_reply_is_not_decoded_as_a_short_frame)
   EXPECT_DOUBLE_EQ(state_of("joint1/position"), rad_of_tick(kMidTick + 3));
   EXPECT_EQ(count_containing(warnings(), read_failed_for(4, 1)), 1u);
 
-  // and it recovers on the next whole burst, continuous with the last ACCEPTED tick: a failed
-  // cycle never reaches unwrap_ticks(), so the 500-tick move that happened while the frame was
-  // being cut is one delta and not two (include/position_unwrapper.hpp:54-67).
+  // and it recovers continuous with the last accepted tick: a failed cycle never reaches
+  // unwrap_ticks(), so the 500-tick move is one delta
   fake_.set_sync_read_truncate_bytes(0);
   step_read();
   EXPECT_DOUBLE_EQ(state_of("joint4/position"), rad_of_tick(1400, 0.0));
@@ -2995,11 +2741,8 @@ TEST_F(DropRecoverOverPty, a_partial_reply_is_not_decoded_as_a_short_frame)
 
 TEST_F(DropRecoverOverPty, the_unwrapper_advances_only_for_servos_that_answered_the_burst)
 {
-  // PHASE3 2.121 / F17, in the one shape that can tell the two answers apart. The servo crosses
-  // most of a revolution while it is silent: fed only the samples that ARRIVED, the accumulator
-  // sees one 3800-tick step, reads it as the shorter -296-tick move it must be, and reports a
-  // position BELOW where it started. An accumulator advanced by the intervening samples would see
-  // two legal 1900-tick steps instead and report 3900 -- the same raw tick, a different turn.
+  // Silent across 100 -> 2000 -> 3900: only arrived samples count, so the step reads as -296
+  // ticks (result -196), not two +1900 steps (3900).
   fake_.set_position(3, 100);
   bring_up(kSilenceMaxReadFails);
   ASSERT_DOUBLE_EQ(state_of("joint3/position"), rad_of_tick(100, 0.0));
@@ -3019,10 +2762,8 @@ TEST_F(DropRecoverOverPty, the_unwrapper_advances_only_for_servos_that_answered_
 
 TEST_F(DropRecoverOverPty, the_bus_totals_line_carries_the_failures_and_the_drop)
 {
-  // PHASE3 L5 (0.4) / 5.14 / R16, the half a healthy bus cannot show. jazzy.md:204 asks for the
-  // count PER SERVO, so the bracketed tail is part of the grammar and not a courtesy: it is what
-  // a bug hunt reads, and hil_gates.py's BUS_TOTALS_TAIL parses it so a FAIL can say which ids the
-  // failures fell on.
+  // The per-id tail is part of the format: hil_gates.py parses it (BUS_TOTALS_TAIL) to name
+  // the failing ids. See docs/bus-timing.md, "Bus totals line".
   bring_up();
   drop_servo_three();
   ASSERT_THAT(errors(), Contains(HasSubstr(dropped_after(3, kMaxReadFails))));
@@ -3032,11 +2773,8 @@ TEST_F(DropRecoverOverPty, the_bus_totals_line_carries_the_failures_and_the_drop
 
   ASSERT_EQ(deactivate(), hardware_interface::return_type::OK);
 
-  // 13 cycles in all: bring_up()'s one, the 8 that dropped servo 3, and 4 more. Eight of those
-  // thirteen transactions came back without servo 3's frame, which is what `failed` counts -- the
-  // aggregate is cycle-scoped so it can never exceed `transactions`, while the bracketed tail
-  // stays per servo (PHASE3 5.14, jazzy.md:204). Here they agree, because only one servo ever
-  // failed; on a bus that lost two frames in one burst the tail would sum higher than `failed`.
+  // 13 cycles: 1 + 8 to the drop + 4. `failed` counts bursts, the tail counts per servo;
+  // they differ only when one burst loses two frames.
   EXPECT_EQ(
     count_containing(
       infos(),
@@ -3046,14 +2784,8 @@ TEST_F(DropRecoverOverPty, the_bus_totals_line_carries_the_failures_and_the_drop
 
 TEST_F(DropRecoverOverPty, re_activating_hands_a_still_silent_servo_its_whole_drop_budget_again)
 {
-  // The behavioural half of on_activate's read_fails_ reset, and the one the drop ERROR promises:
-  // "dropping it from the read cycle until the hardware is re-activated". A budget carried across
-  // the transition would spend whatever was left of it on the first failed read of the new window,
-  // so a servo that had been silent for seven of its eight allowed cycles would be dropped one
-  // cycle after coming back INACTIVE->ACTIVE -- before the operator's re-activation had bought it
-  // a single retry. PHASE3 3.35 / R16 do not enumerate read_fails_; this test is why it is reset
-  // anyway, and it is pinned across a deactivate/activate pair so a future tidy-up cannot remove
-  // the line and still be green.
+  // on_activate must reset read_fails_: re-activation gives a still-silent servo its full
+  // drop budget, as the drop ERROR promises.
   bring_up();
   fake_.set_silent_feedback(3, true);
   for (int cycle = 0; cycle < kMaxReadFails - 1; cycle++) {
@@ -3078,12 +2810,8 @@ TEST_F(DropRecoverOverPty, re_activating_hands_a_still_silent_servo_its_whole_dr
 
 TEST_F(DropRecoverOverPty, the_worst_consecutive_run_is_the_worst_run_of_ITS_OWN_activation)
 {
-  // PHASE3 R16 defines `worst consecutive` as the largest value any joint's read_fails_ reached
-  // SINCE ACTIVATION, and 5.14 makes one activation one measurement window. read_fails_ is the
-  // consecutive counter that drives the drop budget as well, so a servo that is still silent when
-  // the component comes back up must start both of them again: otherwise the second window inherits
-  // the first window's run, and the ERROR text's promise that re-activating restores a servo is
-  // worth less than the count it left behind.
+  // `worst consecutive` is per activation: a servo silent across the transition starts a new
+  // run, so the second window reports 1, not 4.
   bring_up();
   fake_.set_silent_feedback(3, true);
   for (int cycle = 0; cycle < 3; cycle++) {
@@ -3111,11 +2839,7 @@ TEST_F(DropRecoverOverPty, the_worst_consecutive_run_is_the_worst_run_of_ITS_OWN
 
 
 // ---------------------------------------------------------------------------------------------
-// StatusOverPty (PHASE2_SPEC 10.5): synthetic status bytes. This proves the decode path end to
-// end -- reply byte -> status_bytes_ -> the `status` interface -> the fault-edge WARN/INFO ->
-// EnableTorque -- without claiming what any bit means on this firmware (PHASE2_SPEC 7.8). What
-// these cases deliberately do NOT assert: that bit 5 is what an overloaded ST3025 raises, or that
-// the packet byte equals register 65. Both are unverified.
+// StatusOverPty: synthetic status bytes; no bit meaning on the ST3025 is asserted.
 
 class StatusOverPty : public PtyFixture
 {
@@ -3189,7 +2913,7 @@ TEST_F(StatusOverPty, a_set_status_byte_is_warned_about_with_its_decoded_names)
 
 TEST_F(StatusOverPty, an_uncited_bit_is_reported_as_unverified_on_the_bus_too)
 {
-  // the honesty rule of D7 reaches the operator's log, not only the header
+  // a bit with no known meaning shows as "meaning unverified" in the log too
   bring_up();
   fake_.set_status(3, 0x50);
   step_read();
@@ -3270,12 +2994,8 @@ TEST_F(StatusOverPty, a_cleared_status_byte_re_enables_torque_exactly_once)
   EXPECT_EQ(fake_.snapshot(3).torque_enable_writes, latched.torque_enable_writes + 1);
 }
 
-// PHASE3 1.32.27 -- site 4 of PHASE3 1.24, adopted by R12 over 3.21's rejection of it. 3.21
-// argued the edge away on an inference: "a fault clear with missed == 0 means the servo never
-// stopped answering, so it never rebooted". A protection trip that resets the controller can clear
-// SRAM with no missed read at all, the inference is not a measurement (UNMEASURED, section 8 Q3),
-// and this branch already pays an EnableTorque round trip -- so the extra 0.594 ms is cheap
-// insurance on a cycle that is abnormal anyway.
+// Wheel ACC edge 4 of 4: fault clear. A protection trip may clear SRAM with no missed read,
+// so edge 3 does not cover it.
 TEST_F(StatusOverPty, a_wheel_that_clears_its_fault_gets_its_acc_back)
 {
   bring_up();
@@ -3285,8 +3005,7 @@ TEST_F(StatusOverPty, a_wheel_that_clears_its_fault_gets_its_acc_back)
   }
   const FakeServo latched = fake_.snapshot(3);
 
-  // Every read of this case ANSWERED, so missed is 0 throughout and the recovery edge of site 3
-  // never fires: this case sees site 4 alone.
+  // Every read answers, so edge 3 never fires: this case sees edge 4 alone.
   fake_.set_byte(3, kRegAcc, 0);
   fake_.set_status(3, 0x00);
   step_read();
@@ -3348,7 +3067,7 @@ TEST_F(StatusOverPty, a_fault_latched_before_a_drop_does_not_fire_a_clear_edge_a
     step_read();
   }
   ASSERT_THAT(errors(), Contains(HasSubstr("stopped answering")));
-  step_read();   // the absent branch clears last_error_ and status_bytes_ (PHASE2_SPEC 7.9)
+  step_read();   // the absent branch clears last_error_ and status_bytes_
 
   fake_.set_silent_feedback(3, false);
   fake_.set_status(3, 0x00);
@@ -3365,14 +3084,8 @@ TEST_F(StatusOverPty, a_fault_latched_before_a_drop_does_not_fire_a_clear_edge_a
 
 TEST_F(StatusOverPty, each_joints_status_byte_comes_from_its_own_frame)
 {
-  // PHASE3 4.T51 / 2.110 / F18. The status byte of a sync read is frame byte 4 of that servo's own
-  // reply, taken out of the frame and never out of SCS::Error: the vendored receive side rewrites
-  // that member per decoded frame (src/SCS.cpp:358) and leaves it ALONE for an id that did not
-  // answer, so a driver reading the member would publish the last frame's byte -- or the previous
-  // cycle's -- on every joint. Proved on the bench by replaying a genuine 84-byte capture with
-  // each frame's status rewritten and its checksum repaired [P1 Q4]; this is the same experiment
-  // against the fake. StatusOverPty's io_timeout_ms is 30, well above min_io_timeout_ms(4) == 3,
-  // so this case really does run on the sync path.
+  // A sync read's status byte is byte 4 of each servo's own frame, never SCS::Error
+  // (rewritten per frame, unchanged for a silent id). See docs/design.md, "Feedback block".
   bring_up();
   const std::array<uint8_t, 4> bytes{0x01, 0x02, 0x20, 0x80};
   for (uint8_t id = 1; id <= 4; id++) {
@@ -3395,11 +3108,8 @@ TEST_F(StatusOverPty, each_joints_status_byte_comes_from_its_own_frame)
 
 TEST_F(StatusOverPty, a_cleared_fault_still_re_enables_torque_once_per_joint)
 {
-  // PHASE3 2.122. Two joints clearing on the SAME cycle is the arrangement that can catch a
-  // cross-attribution: after the restructure every read of the cycle is already done when the
-  // first EnableTorque runs, so that write can no longer land between two servos' reads -- but the
-  // fault edges are still decided inside the joint loop, and each must be decided from its own
-  // status_bytes_ entry.
+  // Two faults clear in one cycle: each edge must use its own status_bytes_ entry, not a
+  // neighbour's.
   bring_up();
   fake_.set_status(1, 0x04);
   fake_.set_status(3, 0x20);

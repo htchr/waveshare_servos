@@ -1,27 +1,5 @@
-// servo_tools -- the bus logic of the Phase 6 tools scan, set_id and calibrate_midpoint (B.3),
-// and of factory_reset, added after Phase 6 (factory_reset_evidence/FACTORY_RESET_SPEC.md).
-//
-// ROS-free and linking servo_bus only, so test/test_servo_tools.cpp drives every function here
-// against the fake bus in-process; the executables add nothing but the parameter parsing and a
-// call into this library. Everything reaches the servos through ServoBus: its open() takes the
-// same exclusive lock the driver takes, and its checked_* transactions check the responder id,
-// count what follows a reply and recognise a late ack (B.4), which the vendored calls cannot.
-//
-// Three rules hold for every run function (C.0):
-//   - on a closed bus it returns kCannotOpen at once, before any vendored call: readSCS would
-//     FD_SET(-1) and abort under _FORTIFY_SOURCE;
-//   - an ack is never proof of anything: every write is verified by reading back;
-//   - from the first write of set_id, calibrate_midpoint or factory_reset to the end of its
-//     sequence the four stop signals are blocked and nothing is printed, so neither a Ctrl-C nor a
-//     closed pipe can stop the tool between an EEPROM unlock and its lock, or between a RESET and
-//     its verification; a stop that came before the unlock or the RESET -- the flag, or a signal
-//     the mask holds pending -- still ends the run there (review fix F7).
-//
-// Output: `out` gets results only (the scan table, a one-line success); `err` gets diagnostics as
-// plain lines. The "<tool>: " prefix is not written here: the executable hands in a stream that
-// adds it to every line, so these functions stay tool-agnostic and the tests read bare messages.
-//
-// Under src/ and not installed, like the driver's own helpers.
+// servo_tools: the ROS-free bus logic of scan, set_id, calibrate_midpoint and factory_reset.
+// See docs/design.md, "Tool structure".
 
 #ifndef SERVO_TOOLS_HPP_
 #define SERVO_TOOLS_HPP_
@@ -42,7 +20,8 @@ namespace waveshare_servos
 namespace tools
 {
 
-// One set of exit codes for the three tools (A.3); 0-3 match test/hil/stop_wheels.cpp.
+// Exit codes shared by the four tools; 0-3 match test/hil/stop_wheels.cpp.
+// See docs/tools.md, "Exit codes".
 enum class Exit : int
 {
   kOk = 0,              // done and verified by reading back
@@ -65,7 +44,7 @@ const char * exit_name(Exit exit) noexcept;
 // SMS_STS_OFS_L and SMS_STS_LOCK, the registers the tools address by these names
 constexpr uint8_t kRegModelL = 3, kRegId = 5, kRegBaud = 6, kRegOffsetL = 31, kRegLock = 55;
 constexpr uint8_t kIdentityFirst = 3, kIdentityBytes = 37;      // registers 3..39, all EEPROM
-constexpr int kScanFirstId = 0, kScanLastId = 253;              // [Q5]
+constexpr int kScanFirstId = 0, kScanLastId = 253;              // 254 is the broadcast id
 constexpr int kMidpointTicks = 2048, kMidpointTolTicks = 3;     // H16 records the real error
 constexpr uint32_t kVerifyWindowMs = 500, kEepromAckMs = 100, kSettleMaxMs = 2000;
 
@@ -76,11 +55,12 @@ struct Session                        // everything a run function needs; no glo
   uint32_t io_timeout_ms;             // io_timeout_ms_for(baudrate): the ack window of SRAM writes
   const volatile std::sig_atomic_t * stop;   // the signal flag; nullptr = never stopped
   std::ostream & out;                 // results only
-  std::ostream & err;                 // diagnostics; buffered during a sequence (C.0)
+  std::ostream & err;                 // diagnostics; buffered during a sequence
 };
 
 // max(defaults::kIoTimeoutMs, ceil(51 * 10 * 1000 / baudrate) + 2): an 8-byte request and the
-// 43-byte reply to the identity block, at 10 bits a byte, plus 2 ms. 5 ms at 1 Mbaud (C.0).
+// 43-byte reply to the identity block, at 10 bits a byte, plus 2 ms. 5 ms at 1 Mbaud.
+// See docs/tools.md, "Tool parameters".
 uint32_t io_timeout_ms_for(int baudrate) noexcept;
 
 // Register 31-32 as the servo stores it: sign-magnitude with the direction on bit 11.
@@ -91,27 +71,26 @@ int offset_from_raw(uint16_t raw) noexcept;
 // left. comm is at most 15 characters, cut by the kernel, so nothing may rely on it.
 std::string holders_text(const std::string & port, int self_pid);
 
-// C.0 step 3: the exit and the message for a failed ServoBus::open(). `holders` is holders_text()
-// for the port. kOk and an empty message for a successful one. Separate from open_bus() only so
-// every status can be pinned without provoking each failure on a real tty.
+// The exit and the message for a failed ServoBus::open(); kOk and "" for a good one. `holders`
+// is holders_text() for the port. Apart from open_bus() so every status is testable without a tty.
 Exit open_failure(
   const OpenResult & opened, const std::string & port, const std::string & holders,
   std::string * message);
 
-// Opens the bus as C.0 describes: the holders are looked up under the canonical path (a
-// /dev/serial/by-id link works), and stdout is pointed at stderr for the length of the open, so
-// the vendored "serial speed N" line never reaches stdout. A refusal before begin() prints no such
-// line at all. Returns kOk with the bus open, or the exit with the reason written to `err`.
+// Opens the bus. Holders are looked up under the canonical path (a /dev/serial/by-id link works),
+// and the vendored "serial speed N" line goes to stderr, never stdout. Returns kOk with the bus
+// open, or the exit with the reason written to `err`.
 Exit open_bus(ServoBus & bus, const std::string & port, int baudrate, std::ostream & err);
 
-// C.0 "late acks": a bare status frame from one of `ids` where another frame was expected -- a
+// A late ack: a bare status frame from one of `ids` where another frame was expected -- a
 // WRONG_ID six-byte frame (a ping caught it) or a STATUS_ONLY one (a read caught it).
+// See docs/design.md, "Late acks".
 bool is_late_ack(const Reply & reply, std::initializer_list<int> ids) noexcept;
 
-// tool_main step 5. port gone: 2 if no write went out (and not 130), else the outcome unchanged
+// After the run: if the port is gone, 2 when no write went out (and not 130), else `outcome`.
 Exit final_exit(Exit outcome, std::size_t writes_sent, bool port_exists) noexcept;
 
-// ---- scan (C.1): read-only, it sends no WRITE, SYNC_WRITE or broadcast ----
+// ---- scan: read-only, it sends no WRITE, SYNC_WRITE or broadcast ----
 
 struct ScanRow
 {
@@ -144,18 +123,16 @@ struct ScanResult
 };
 
 ScanResult scan(Session & session, uint8_t first, uint8_t last);  // executable passes kScan*Id
-// The table on `out` (header, one row per servo, footer; C.1's 11-token contract), then each
-// row's anomalies and notes and the closing hint on `err`.
+// The table on `out` (header, one 11-token row per servo, footer), then each row's anomalies
+// and notes and the closing hint on `err`. See docs/tools.md, "scan".
 void print_scan(
   const ScanResult & result, const std::string & port, int baudrate, std::ostream & out,
   std::ostream & err);
 // 130 interrupted, then 7 any anomaly, then 3 no row, else 0; 2 for a closed bus.
 Exit scan_exit(const ScanResult & result) noexcept;
 
-// ---- set_id (C.2) and calibrate_midpoint (C.3) ----
-// Both reports carry `Exit exit`, `std::size_t writes_sent` (write transactions put on the wire)
-// and `int late_ack_from` (-1 = none). An unmeasured field stays at -1 / nullopt and prints
-// `none` in the detail line.
+// ---- set_id and calibrate_midpoint ----
+// In every report, a field not measured stays -1 / nullopt and prints `none` in the detail line.
 
 struct SetIdReport
 {
@@ -207,10 +184,10 @@ struct CalibrateReport
 
 CalibrateReport calibrate_midpoint(Session & session, uint8_t id);
 
-// ---- factory_reset (factory_reset_evidence/FACTORY_RESET_SPEC.md 2) ----
+// ---- factory_reset ----
 
-// Register 6's factory value is 0, this rate, in every memory table in context/, and a RESET left
-// the ST3025 at it even when it was sent at another rate (FACTORY_RESET_SPEC M3).
+// Register 6's factory value, 0, is this rate; an ST3025 reset at another rate came back at it.
+// See docs/tools.md, "factory_reset".
 constexpr int kFactoryBaudrate = 1000000;
 
 struct FactoryResetReport
@@ -240,10 +217,9 @@ struct FactoryResetReport
   bool signal_deferred = false;
 };
 
-// One servo back to its factory settings through the protocol's RESET (0x06), verified by reading
-// back at the factory rate. The id is kept -- the ST3025 keeps it, and a tool that cannot find the
-// servo afterwards could verify nothing -- so exactly one servo is addressed and nothing is ever
-// broadcast. May leave the bus at kFactoryBaudrate.
+// One servo back to its factory settings with RESET (0x06), verified by reading back at the
+// factory rate. The ST3025 keeps its id, so the tool finds it again; nothing is broadcast.
+// May leave the bus at kFactoryBaudrate.
 FactoryResetReport factory_reset(Session & session, uint8_t id);
 
 // "detail start_id=4 new_id=253 ... verdict=ok": one line of key=value tokens, no newline and no

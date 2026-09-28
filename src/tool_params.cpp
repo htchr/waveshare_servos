@@ -98,8 +98,8 @@ std::string not_a(const std::string & name, const rclcpp::ParameterValue & value
   return "parameter '" + name + "' is " + value_and_type(value) + ", which is not " + what;
 }
 
-// An id with its range, checked as int64 BEFORE any narrowing: 300 would otherwise become 44, 254
-// the broadcast id and -1 the header byte 0xff (A.1, "Name policy").
+// An id with its range, checked as int64 BEFORE any narrowing: 300 would otherwise become 44,
+// 254 the broadcast id and -1 the header byte 0xff.
 void take_id(
   const Overrides & overrides, const std::string & name, int low, const char * range_note,
   int * out, std::vector<Error> * errors)
@@ -156,7 +156,7 @@ ParseResult parse_params(Tool tool, const Overrides & overrides)
   config.port = defaults::kPort;
   config.baudrate = defaults::kBaudrate;
 
-  // Names first. The two Phase 1 names are refused even next to their replacement: a command line
+  // Names first. The 0.1.0 names are refused even next to their replacement: a command line
   // that still says device_port was written for the old tool and may mean something else.
   const std::vector<std::string> accepted = accepted_names(tool);
   for (const auto & entry : overrides) {
@@ -197,8 +197,8 @@ ParseResult parse_params(Tool tool, const Overrides & overrides)
     if (baudrate->second.get_type() != rclcpp::ParameterType::PARAMETER_INTEGER) {
       errors.emplace_back("baudrate", not_a("baudrate", baudrate->second, "an integer"));
     } else {
-      // The int range first, for the driver's reason (waveshare_servos.cpp:197-199): 2^32 + 9600
-      // narrowed to an int is 9600, a rate that IS mapped.
+      // The int range first, as in the driver: 2^32 + 9600 narrowed to an int is 9600, a rate
+      // that IS mapped.
       const int64_t value = baudrate->second.get<int64_t>();
       if (value < std::numeric_limits<int>::min() || value > std::numeric_limits<int>::max() ||
         !ServoBus::is_supported_baudrate(static_cast<int>(value)))
@@ -213,7 +213,7 @@ ParseResult parse_params(Tool tool, const Overrides & overrides)
     }
   }
 
-  // The ids are required [Q4]: the old defaults of 1 made a bare run address servo 1.
+  // The ids are required: the 0.1.0 defaults of 1 made a bare run address servo 1.
   if (tool == Tool::kSetId) {
     const std::size_t before = errors.size();
     take_id(overrides, "start_id", limits::kIdMin0, nullptr, &config.start_id, &errors);
@@ -247,12 +247,8 @@ std::vector<std::string> foreign_override_nodes(
   const std::string & node_fqn,
   const std::map<std::string, std::vector<std::string>> & keys_by_node)
 {
-  // Only the two global patterns and the exact name: reproducing rclcpp's wildcard matching would
-  // be a second implementation of it that could drift from the first (appendix J, #11). rcl keeps
-  // `-p setid:port:=...` under "setid", with no leading slash, hence the normalisation. `/*` is
-  // rclcpp's pattern (/\w+) matched against the whole name, so it reaches a node with ONE path
-  // segment only: under a namespace (`-r __ns:=/robot`) rclcpp drops it, and so it is refused
-  // here like any other name (review fix F11; ToolParamsRclcpp pins rclcpp's side).
+  // Only "/**", the exact name and, for a node with no namespace, "/*" (as rclcpp matches it);
+  // rcl may store a name without its leading '/'. See docs/design.md, "Tool structure".
   const bool top_level = node_fqn.find('/', 1) == std::string::npos;
   std::vector<std::string> refusals;
   for (const auto & entry : keys_by_node) {

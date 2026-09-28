@@ -29,10 +29,8 @@ inline bool process_has_serial_port_open()
   return false;
 }
 
-// How many of this process's descriptors point at `path`, from /proc/self/fd. Immune to the
-// descriptor the directory iterator itself holds, which a plain count of the directory is not.
-// The body of test_lifecycle_over_pty.cpp's file-local copy; that copy and test_servo_bus.cpp's
-// stay where they are, and per-name using-declarations keep the three from clashing.
+// How many of this process's descriptors point at `path` (from /proc/self/fd), not counting
+// the one the directory iterator holds.
 inline size_t descriptors_on(const std::string & path)
 {
   size_t count = 0;
